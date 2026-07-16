@@ -47,7 +47,8 @@ in parallel to the hermes-agent **dashboard service** (default
 |---|---|
 | `/api/analytics/usage?days=N` | daily token chart, totals, top models |
 | `/api/sessions?limit=500&order=recent` | recent sessions card, per-model usage curves |
-| `/api/status` | status line, gateway activity (agents, mode, profiles) |
+| `/api/profiles/sessions?limit=100` | cross-profile active-session detection |
+| `/api/status` | status line, gateway activity (in-flight turns, mode, profiles) |
 | `/api/cron/jobs` | cron count in the gateway activity card |
 | `/api/model/info` | active model in the status line |
 
@@ -58,13 +59,25 @@ is the whole frontend (vanilla JS + SVG, light/dark via
 
 ### Gateway activity & profiles
 
-The activity card reads hermes' `/api/status` topology:
+The activity card combines hermes' `/api/status` topology with a
+cross-profile session scan:
 
-- **`active_agents`** — in-flight gateway turns right now (running agent
-  turns + active cron jobs + active API runs). Drives the **Busy / Idle**
-  badge. Note this is an aggregate count; hermes does not expose a per-agent
-  or per-sub-agent (`delegate_task`) breakdown over HTTP, so individual
-  sub-agents can't be enumerated — only the busy total.
+- **Active sessions** — the reliable "what's running now" signal, from
+  `/api/profiles/sessions` filtered by each row's `is_active` flag. This
+  scans **every** profile, which matters under `gateway_mode: multiple`:
+  a live session on a non-default profile is invisible to the default
+  gateway's own `active_sessions` count, so relying on `/api/status` alone
+  (as the first cut did) shows nothing. Each active session is listed with
+  its profile, model, message count, and age; the badge reads **Active** when
+  any session is live.
+- **In-flight turns** (`active_agents`) — running main gateway turns + cron
+  jobs + API runs; drives the **Busy** badge. **Sub-agents are not counted
+  here.** hermes runs `delegate_task` sub-agents in-process under the parent
+  session — they create no child session rows (`parent_session_id` is never
+  set on the wire) and no endpoint exposes them, so a session busy with
+  sub-agents shows `0` in-flight turns while still appearing as an active
+  session. The card says so explicitly rather than implying the gateway is
+  idle.
 - **`gateway_mode`** — how profiles map to gateway processes:
   | Mode | Meaning |
   |---|---|
@@ -72,11 +85,11 @@ The activity card reads hermes' `/api/status` topology:
   | `multiplex` | One gateway serving several profiles |
   | `multiple` | An independent gateway per profile |
   | `none` | No gateway process running |
-- **Profiles** — every configured profile; those with a live gateway are
-  tagged **live**. The per-gateway detail (`gateways[]`, incl. ports) is only
-  returned on a **loopback / `--insecure`** hermes bind — behind the v0.17+
-  auth gate hermes withholds it, so the card falls back to showing the
-  configured profile names with a note that live detail is hidden.
+- **Profiles** — every configured profile. Those with a live gateway are
+  tagged **live** (from `gateways[]`, only returned on a **loopback /
+  `--insecure`** bind); behind the v0.17+ auth gate that detail is withheld,
+  so the card instead tags profiles that have an **active session** from the
+  cross-profile scan.
 
 ## Run
 

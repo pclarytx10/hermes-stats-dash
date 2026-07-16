@@ -352,13 +352,55 @@ function summarizeCron(cronPayload) {
   return { total: jobs.length, paused, running }
 }
 
+/**
+ * Cross-profile "what's running right now". hermes' /api/status is scoped to
+ * a single gateway/profile, and under gateway_mode "multiple" each profile
+ * has its own gateway — so a live session on a non-default profile never
+ * shows up in the default status's active_sessions count. /api/profiles/sessions
+ * aggregates every profile's session DB and tags each row with `is_active`,
+ * which is the reliable cross-profile signal.
+ *
+ * Caveat surfaced to the UI: hermes does NOT expose individual sub-agents
+ * (`delegate_task` / async delegations) over HTTP — they run in-process under
+ * the parent session, create no child session rows, and are counted by no
+ * endpoint. So this reports active *sessions*, not the sub-agents inside them.
+ */
+function summarizeActiveSessions(payload) {
+  const rows = Array.isArray(payload) ? payload : payload?.sessions
+  if (!Array.isArray(rows)) return null
+  const now = Date.now() / 1000
+  const active = rows
+    .filter((s) => (s?.is_active === true || (s?.is_active == null && !s?.ended_at))
+      && !s?.ended_at
+      && (s?.source || '') !== 'cron')
+    .map((s) => {
+      const lastActive = Number(s.last_active || s.last_active_at || s.started_at || 0)
+      return {
+        profile: s.profile || 'default',
+        model: s.model || null,
+        message_count: Number(s.message_count || 0),
+        source: s.source || null,
+        last_active: lastActive,
+        age_seconds: lastActive ? Math.max(0, Math.round(now - lastActive)) : null,
+        title: s.title || s.display_name || s.preview || s.id || 'session',
+      }
+    })
+    // A session flagged is_active but idle for a long time is likely stale;
+    // keep it but let the client de-emphasize via age.
+    .sort((a, b) => (b.last_active || 0) - (a.last_active || 0))
+  const byProfile = {}
+  for (const s of active) byProfile[s.profile] = (byProfile[s.profile] || 0) + 1
+  return { total: active.length, by_profile: byProfile, sessions: active.slice(0, 12) }
+}
+
 async function buildOverview(days) {
-  const [status, usage, sessions, model, cron] = await Promise.all([
+  const [status, usage, sessions, model, cron, profileSessions] = await Promise.all([
     dashJson('/api/status'),
     dashJson(`/api/analytics/usage?days=${days}`),
     dashJson('/api/sessions?limit=500&order=recent'),
     dashJson('/api/model/info'),
     dashJson('/api/cron/jobs'),
+    dashJson('/api/profiles/sessions?limit=100&order=recent'),
   ])
   return {
     status,
@@ -366,6 +408,7 @@ async function buildOverview(days) {
     sessions,
     model,
     cron: summarizeCron(cron),
+    active: summarizeActiveSessions(profileSessions),
     model_daily: sessions ? aggregateModelDaily(sessions, days) : null,
     meta: {
       dashboard_url: dashboardUrl(),

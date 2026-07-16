@@ -148,6 +148,22 @@
   .act-item .act-sub { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
   .act-item .act-value.text .mode-word { text-transform: capitalize; }
 
+  .active-block { margin-top: 14px; border-top: 1px solid var(--gridline); padding-top: 12px; }
+  .active-block[hidden] { display: none; }
+  .active-block .ab-label { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
+  .active-row {
+    display: flex; align-items: center; gap: 10px; padding: 7px 0;
+    border-bottom: 1px solid var(--gridline);
+  }
+  .active-row:last-child { border-bottom: none; }
+  .active-row .ar-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; }
+  .active-row .ar-dot.stale { background: var(--text-muted); }
+  .active-row .ar-main { min-width: 0; flex: 1; }
+  .active-row .ar-title { color: var(--text-primary); overflow-wrap: anywhere; }
+  .active-row .ar-meta { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
+  .active-row .ar-age { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+  .active-block .ab-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+
   .profiles-block { margin-top: 14px; border-top: 1px solid var(--gridline); padding-top: 12px; }
   .profiles-block .pb-label { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
   .profile-chips { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -234,6 +250,7 @@
         <span class="busy-badge" id="busy-badge"></span>
       </div>
       <div class="activity-grid" id="activity-grid"></div>
+      <div class="active-block" id="active-block"></div>
       <div class="profiles-block" id="profiles-block"></div>
     </div>
 
@@ -307,6 +324,13 @@ function fmtWhen(epoch) {
   const d = new Date(epoch * 1000);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) +
     ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+function fmtAge(seconds) {
+  if (seconds == null) return '—';
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 // DOM helper — data goes in via textContent only (labels are untrusted).
@@ -809,30 +833,41 @@ function actItem(label, value, opts = {}) {
     opts.sub ? el('div', { class: 'act-sub', text: opts.sub }) : null);
 }
 
-function renderActivity(status, cron) {
+// A session is "fresh" (a green dot) if it reported activity recently; an
+// is_active row that's been idle for a while is shown but de-emphasized.
+const ACTIVE_FRESH_SECONDS = 300;
+
+function renderActivity(status, cron, activity) {
   const card = $('activity-card');
   if (!status) { card.style.display = 'none'; return; }
   card.style.display = '';
 
   const running = status.gateway_running !== false;
   const agents = Number(status.active_agents || 0);
-  const busy = !!status.gateway_busy || agents > 0;
+  const active = activity && Array.isArray(activity.sessions) ? activity : { total: 0, sessions: [], by_profile: {} };
+  const activeCount = Number(active.total || 0);
+  // "Busy" = a main turn is generating; "Active" = live sessions exist even
+  // if no turn is mid-flight (e.g. sub-agents working — see the note below).
+  const state = !running ? 'offline' : agents > 0 ? 'busy' : activeCount > 0 ? 'active' : 'idle';
 
-  // Busy badge
   const badge = $('busy-badge');
-  badge.className = 'busy-badge' + (!running ? ' offline' : busy ? ' busy' : '');
-  badge.replaceChildren(
-    el('span', { class: 'dot' }),
-    el('span', { text: !running ? 'Gateway offline' : busy ? 'Busy' : 'Idle' }));
+  const badgeClass = { offline: 'offline', busy: 'busy', active: 'busy', idle: '' }[state];
+  const badgeText = { offline: 'Gateway offline', busy: 'Busy', active: 'Active', idle: 'Idle' }[state];
+  badge.className = 'busy-badge' + (badgeClass ? ' ' + badgeClass : '');
+  badge.replaceChildren(el('span', { class: 'dot' }), el('span', { text: badgeText }));
 
   // Stat grid
   const mode = String(status.gateway_mode || 'unknown');
   const modeInfo = GATEWAY_MODE_INFO[mode] || GATEWAY_MODE_INFO.unknown;
+  const activeProfiles = Object.keys(active.by_profile || {});
   const items = [
-    actItem('Active agents', fmtFull(agents),
-      { sub: 'in-flight gateway turns' }),
-    actItem('Active sessions', fmtFull(status.active_sessions || 0),
-      { sub: 'recently touched' }),
+    actItem('Active sessions', fmtFull(activeCount), {
+      sub: activeProfiles.length ? activeProfiles.join(', ') : 'across all profiles',
+    }),
+    actItem('In-flight turns', fmtFull(agents), {
+      sub: 'main turns · excludes sub-agents',
+      title: 'hermes counts in-flight main gateway turns, cron jobs, and API runs here. delegate_task sub-agents are not reported by the API.',
+    }),
   ];
   if (cron) {
     items.push(actItem('Cron jobs', fmtFull(cron.total), {
@@ -847,9 +882,34 @@ function renderActivity(status, cron) {
   }));
   $('activity-grid').replaceChildren(...items);
 
-  // Active profiles — chips, live gateways highlighted. `gateways[]` is only
-  // present on a loopback bind; behind the auth gate we still have names +
-  // mode, so fall back to marking liveness from mode when we can.
+  // Active sessions list (cross-profile, from /api/profiles/sessions is_active).
+  const ab = $('active-block');
+  if (activeCount > 0) {
+    ab.hidden = false;
+    const rows = active.sessions.map((s) => {
+      const stale = s.age_seconds != null && s.age_seconds > ACTIVE_FRESH_SECONDS;
+      const meta = [s.profile, s.model, s.message_count ? `${fmtFull(s.message_count)} msgs` : null,
+                    s.source].filter(Boolean).join(' · ');
+      return el('div', { class: 'active-row' },
+        el('span', { class: 'ar-dot' + (stale ? ' stale' : '') }),
+        el('div', { class: 'ar-main' },
+          el('div', { class: 'ar-title', text: String(s.title).slice(0, 80) }),
+          el('div', { class: 'ar-meta', text: meta })),
+        el('span', { class: 'ar-age', text: fmtAge(s.age_seconds) }));
+    });
+    ab.replaceChildren(
+      el('div', { class: 'ab-label', text: `Active sessions — live across all profiles` }),
+      ...rows,
+      el('div', { class: 'ab-note',
+        text: 'Note: hermes does not expose individual sub-agents (delegate_task) over its API — they run inside the parent session and are not separately counted.' }));
+  } else {
+    ab.hidden = true;
+    ab.replaceChildren();
+  }
+
+  // Profiles — chips. Prefer live-gateway detail (loopback binds); behind the
+  // auth gate that's withheld, so mark profiles that have an active session
+  // instead (from the cross-profile session scan).
   const block = $('profiles-block');
   const names = Array.isArray(status.profiles) ? status.profiles : [];
   const gateways = Array.isArray(status.gateways) ? status.gateways : [];
@@ -860,25 +920,30 @@ function renderActivity(status, cron) {
     for (const p of served) liveByName.set(String(p), g);
   }
   const gatewaysKnown = gateways.length > 0;
-  const activeDefault = status.active_profile || status.active || null;
+  const activeSet = new Set(activeProfiles);
 
   if (!names.length) { block.style.display = 'none'; return; }
   block.style.display = '';
   const label = gatewaysKnown
     ? `Profiles — ${liveByName.size} with a live gateway`
-    : `Profiles — ${names.length} configured (live detail hidden behind the auth gate)`;
+    : activeSet.size
+      ? `Profiles — ${names.length} configured, ${activeSet.size} with an active session`
+      : `Profiles — ${names.length} configured (live gateway detail hidden behind the auth gate)`;
   const chips = names.map((name) => {
     const gw = liveByName.get(name);
-    const live = !!gw;
+    const hasSession = activeSet.has(name);
+    const live = !!gw || hasSession;
     const ports = gw && gw.ports ? Object.values(gw.ports).filter(Boolean) : [];
+    const title = gw && ports.length ? `ports: ${ports.join(', ')}`
+      : hasSession ? 'active session running' : (gw ? 'live gateway' : 'no live gateway');
     return el('div', {
-      class: 'profile-chip' + (live ? ' live' : '') +
-        (name === activeDefault ? ' active-default' : ''),
-      title: live && ports.length ? `ports: ${ports.join(', ')}` : (live ? 'live gateway' : 'no live gateway'),
+      class: 'profile-chip' + (live ? ' live' : ''),
+      title,
     },
       el('span', { class: 'pc-dot' }),
       el('span', { text: name }),
-      live ? el('span', { class: 'pc-tag', text: 'live' }) : null);
+      hasSession ? el('span', { class: 'pc-tag', text: 'active' })
+        : gw ? el('span', { class: 'pc-tag', text: 'live' }) : null);
   });
   block.replaceChildren(
     el('div', { class: 'pb-label', text: label }),
@@ -921,7 +986,7 @@ async function refresh() {
           el('span', { text: ' to point this app at a remote dashboard and configure auth (v0.17+ dashboards behind the auth gate need a bearer token or session cookie).' })));
     }
     renderStatus(overview.status, overview.model, overview.meta);
-    renderActivity(overview.status, overview.cron);
+    renderActivity(overview.status, overview.cron, overview.active);
     renderTiles(usage?.totals);
     renderChart(usage?.daily || []);
     renderModelChart(overview.model_daily || []);

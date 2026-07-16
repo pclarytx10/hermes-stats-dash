@@ -6,7 +6,8 @@
  * into the root HTML (pre-v0.17 loopback auth), bearer-token enforcement on
  * /api/*, and plausible payload shapes for /api/status (incl. multiplex
  * profile topology + a busy/idle active_agents cycle), /api/analytics/usage,
- * /api/sessions, /api/cron/jobs, and /api/model/info.
+ * /api/sessions, /api/profiles/sessions (cross-profile, with live is_active
+ * rows), /api/cron/jobs, and /api/model/info.
  *
  *   node scripts/mock-hermes.mjs        # listens on :9119
  *
@@ -151,6 +152,32 @@ function sessions(limit) {
   return { sessions: all.slice(0, limit), total: all.length }
 }
 
+// Cross-profile session list. Two profiles have a live (is_active) session so
+// the gateway activity card's active-session detection has something to show.
+function profileSessions(limit) {
+  const now = Math.floor(Date.now() / 1000)
+  const base = sessions(limit).sessions.map((s) => ({
+    ...s, profile: 'default', is_active: false, ended_at: s.started_at + 3600,
+    last_active: s.last_active_at,
+  }))
+  const live = [
+    {
+      id: 'sess_live_1', title: 'Investigate cache-read spike on nightly runs',
+      profile: 'research', model: 'Hermes-4-405B', source: 'desktop',
+      message_count: 132, is_active: true, ended_at: null,
+      started_at: now - 5400, last_active: now - 6,
+    },
+    {
+      id: 'sess_live_2', title: 'Draft Q3 board deck outline',
+      profile: 'work', model: 'claude-sonnet-5', source: 'desktop',
+      message_count: 47, is_active: true, ended_at: null,
+      started_at: now - 1200, last_active: now - 74,
+    },
+  ]
+  const all = [...live, ...base]
+  return { sessions: all.slice(0, limit), total: all.length }
+}
+
 // Multiplex topology: one default gateway serving several profiles, plus a
 // standalone "research" gateway on its own ports.
 const PROFILES = ['default', 'work', 'research', 'sandbox']
@@ -268,6 +295,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/sessions') {
       const limit = Math.max(1, Number(url.searchParams.get('limit')) || 20)
       return send(200, sessions(limit))
+    }
+    if (url.pathname === '/api/profiles/sessions') {
+      const limit = Math.max(1, Number(url.searchParams.get('limit')) || 20)
+      return send(200, profileSessions(limit))
     }
     if (url.pathname === '/api/analytics/usage') {
       const days = Math.max(1, Number(url.searchParams.get('days')) || 30)
