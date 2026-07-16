@@ -199,6 +199,16 @@
   }
   .toggle-btn:hover { color: var(--text-primary); }
 
+  .head-controls { display: flex; align-items: center; gap: 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg-btn {
+    appearance: none; border: none; background: var(--surface-1); cursor: pointer;
+    font: inherit; font-size: 12px; color: var(--text-muted); padding: 4px 10px;
+  }
+  .seg-btn + .seg-btn { border-left: 1px solid var(--border); }
+  .seg-btn:hover { color: var(--text-primary); }
+  .seg-btn[aria-pressed="true"] { background: var(--page); color: var(--text-primary); font-weight: 600; }
+
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; font-weight: 600; color: var(--text-muted); font-size: 12px;
        border-bottom: 1px solid var(--gridline); padding: 4px 8px 6px 0; }
@@ -257,7 +267,13 @@
     <div class="card chart-card">
       <div class="card-head">
         <h2 id="chart-title">Token counts over time</h2>
-        <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
+        <div class="head-controls">
+          <div class="seg" id="token-view-seg" role="group" aria-label="Token chart breakdown">
+            <button class="seg-btn" type="button" data-view="type" aria-pressed="true">By type</button>
+            <button class="seg-btn" type="button" data-view="profile" aria-pressed="false">By profile</button>
+          </div>
+          <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
+        </div>
       </div>
       <div class="chart-holder" id="chart-holder">
         <div id="chart"></div>
@@ -404,30 +420,90 @@ function renderTiles(totals) {
     )));
 }
 
-// ── Token chart (stacked columns, per-day tooltip) ──────────────────
-function renderChart(daily) {
-  const holder = $('chart');
-  const tooltip = $('tooltip');
-  tooltip.style.display = 'none';
+// ── Token chart (stacked columns; view = by token type or by profile) ─
+let tokenView = 'type'; // 'type' | 'profile'
 
-  const rows = filledDaily(daily, days);
-  if (!rows.some((r) => SERIES.some((s) => Number(r[s.key] || 0) > 0))) {
-    holder.replaceChildren(el('div', { class: 'empty', text: 'No token activity in this window.' }));
+const PROFILE_SLOT_VARS = ['--series-1', '--series-2', '--series-3', '--series-4', '--series-5'];
+const PROFILE_CAP = 5;
+const PROFILE_OTHER_KEY = ' other';
+
+// Build per-profile stacked series from overview.usage_by_profile. Top N
+// profiles by total get fixed color slots (assigned by profile identity so
+// the color is stable across date ranges); the rest fold into "Other".
+function buildProfileStacks() {
+  const list = (overview && Array.isArray(overview.usage_by_profile)) ? overview.usage_by_profile : [];
+  const ranked = list.filter((p) => Number(p.total) > 0).sort((a, b) => b.total - a.total);
+  const named = ranked.slice(0, PROFILE_CAP);
+  const rest = ranked.slice(PROFILE_CAP);
+  const slotOrder = named.map((p) => p.profile).sort();
+  const series = named.map((p) => ({
+    key: p.profile, name: p.profile,
+    color: `var(${PROFILE_SLOT_VARS[slotOrder.indexOf(p.profile)] || '--series-5'})`,
+  }));
+  if (rest.length) series.push({ key: PROFILE_OTHER_KEY, name: 'Other', color: 'var(--text-muted)' });
+  const byDay = new Map();
+  const add = (day, key, tok) => { const m = byDay.get(day) || {}; m[key] = (m[key] || 0) + tok; byDay.set(day, m); };
+  for (const p of named) for (const r of (p.daily || [])) add(r.day, p.profile, Number(r.tokens || 0));
+  for (const p of rest) for (const r of (p.daily || [])) add(r.day, PROFILE_OTHER_KEY, Number(r.tokens || 0));
+  return { series, byDay };
+}
+
+// Unified model for the stacked-column chart in either view. Each row is
+// { day, values: {seriesKey: number}, ...extraFields }; `extras` are extra
+// tooltip/table lines pulled from row-level fields (type view only).
+function tokenModel() {
+  const usage = (overview && overview.usage) || {};
+  if (tokenView === 'profile') {
+    const { series, byDay } = buildProfileStacks();
+    const rows = filledDaily([], days).map((r) => ({ day: r.day, values: byDay.get(r.day) || {} }));
+    return { series, rows, extras: [], showTotal: true,
+      aria: `Daily token counts by profile, last ${days} days`, unitLabel: 'tokens' };
+  }
+  const series = SERIES.map((s) => ({ key: s.key, name: s.name, color: `var(${s.cssVar})` }));
+  const rows = filledDaily(usage.daily, days).map((r) => ({
+    day: r.day,
+    values: {
+      input_tokens: Number(r.input_tokens || 0),
+      output_tokens: Number(r.output_tokens || 0),
+      reasoning_tokens: Number(r.reasoning_tokens || 0),
+    },
+    cache_read_tokens: Number(r.cache_read_tokens || 0),
+    sessions: Number(r.sessions || 0),
+  }));
+  return { series, rows, showTotal: false,
+    extras: [
+      { key: 'cache_read_tokens', name: 'Cache read', color: 'var(--text-muted)' },
+      { key: 'sessions', name: 'Sessions', color: 'transparent', integer: true },
+    ],
+    aria: `Stacked daily token counts, last ${days} days`, unitLabel: 'tokens' };
+}
+
+function renderChart() {
+  const holder = $('chart');
+  hideTooltip();
+  const model = tokenModel();
+  const { series, rows } = model;
+  const stackTotal = (row) => series.reduce((a, s) => a + Number(row.values[s.key] || 0), 0);
+
+  if (!series.length || !rows.some((r) => stackTotal(r) > 0)) {
+    holder.replaceChildren(el('div', { class: 'empty',
+      text: tokenView === 'profile'
+        ? 'No per-profile token data in this window.'
+        : 'No token activity in this window.' }));
     $('chart-legend').replaceChildren();
-    renderChartTable(rows);
+    renderChartTable(model);
     return;
   }
   const W = 1000, H = 260, padL = 46, padR = 8, padT = 10, padB = 26;
   const plotW = W - padL - padR, plotH = H - padT - padB;
 
-  const stackTotal = (r) => SERIES.reduce((a, s) => a + Number(r[s.key] || 0), 0);
   const maxV = Math.max(1, ...rows.map(stackTotal));
   // Clean tick ceiling: 1/2/5 × 10^k just above the max.
   const pow = Math.pow(10, Math.floor(Math.log10(maxV)));
   const yMax = [1, 2, 5, 10].map((m) => m * pow).find((v) => v >= maxV);
 
   const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, width: '100%', role: 'img',
-    'aria-label': `Stacked daily token counts, last ${days} days` });
+    'aria-label': model.aria });
 
   // Gridlines + y ticks (hairline, solid, recessive)
   for (let i = 0; i <= 4; i++) {
@@ -450,8 +526,8 @@ function renderChart(daily) {
   rows.forEach((row, i) => {
     const x = padL + i * band + (band - barW) / 2;
     let yCursor = padT + plotH;
-    const segs = SERIES
-      .map((s) => ({ s, v: Number(row[s.key] || 0) }))
+    const segs = series
+      .map((s) => ({ s, v: Number(row.values[s.key] || 0) }))
       .filter((d) => d.v > 0);
     segs.forEach((d, idx) => {
       const hRaw = (d.v / yMax) * plotH;
@@ -463,11 +539,10 @@ function renderChart(daily) {
         // 4px rounded data-end, square at the baseline side
         svg.appendChild(svgEl('path', {
           d: `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + barW - r},${y} Q${x + barW},${y} ${x + barW},${y + r} L${x + barW},${y + h} Z`,
-          fill: `var(${d.s.cssVar})`,
+          fill: d.s.color,
         }));
       } else {
-        svg.appendChild(svgEl('rect', { x, y, width: barW, height: h,
-          fill: `var(${d.s.cssVar})` }));
+        svg.appendChild(svgEl('rect', { x, y, width: barW, height: h, fill: d.s.color }));
       }
       yCursor = y;
     });
@@ -483,7 +558,7 @@ function renderChart(daily) {
     const hit = svgEl('rect', { x: padL + i * band, y: padT, width: band,
       height: plotH, class: 'day-hit', tabindex: '0',
       'aria-label': `${fmtDay(row.day)}: ${fmtFull(stackTotal(row))} tokens` });
-    const show = () => showDayTooltip(row, padL + i * band + band / 2, W);
+    const show = () => showDayTooltip(model, row, padL + i * band + band / 2, W);
     hit.addEventListener('pointerenter', show);
     hit.addEventListener('focus', show);
     hit.addEventListener('pointerleave', hideTooltip);
@@ -493,33 +568,37 @@ function renderChart(daily) {
 
   holder.replaceChildren(svg);
 
-  // Legend (3 series → always present)
-  $('chart-legend').replaceChildren(...SERIES.map((s) =>
+  $('chart-legend').replaceChildren(...series.map((s) =>
     el('span', { class: 'key' },
-      el('span', { class: 'swatch', style: `background:var(${s.cssVar})` }),
-      el('span', { text: s.name + ' tokens' }))));
+      el('span', { class: 'swatch', style: `background:${s.color}` }),
+      el('span', { text: tokenView === 'profile' ? s.name : s.name + ' tokens' }))));
 
-  renderChartTable(rows);
+  renderChartTable(model);
 }
 
-function showDayTooltip(row, cx, viewW) {
+function showDayTooltip(model, row, cx, viewW) {
   const tooltip = $('tooltip');
+  const { series, extras } = model;
   const rowsEls = [el('div', { class: 'tt-title', text: fmtDay(row.day) })];
-  for (const s of SERIES) {
+  for (const s of series) {
     rowsEls.push(el('div', { class: 'tt-row' },
-      el('span', { class: 'tt-key', style: `border-color:var(${s.cssVar})` }),
-      el('span', { class: 'tt-val', text: fmtFull(row[s.key]) }),
+      el('span', { class: 'tt-key', style: `border-color:${s.color}` }),
+      el('span', { class: 'tt-val', text: fmtFull(row.values[s.key] || 0) }),
       el('span', { class: 'tt-name', text: s.name })));
   }
-  rowsEls.push(el('div', { class: 'tt-row' },
-    el('span', { class: 'tt-key', style: 'border-color:var(--text-muted)' }),
-    el('span', { class: 'tt-val', text: fmtFull(row.cache_read_tokens) }),
-    el('span', { class: 'tt-name', text: 'Cache read' })));
-  if (row.sessions) {
+  if (model.showTotal) {
+    const total = series.reduce((a, s) => a + Number(row.values[s.key] || 0), 0);
     rowsEls.push(el('div', { class: 'tt-row' },
       el('span', { class: 'tt-key', style: 'border-color:transparent' }),
-      el('span', { class: 'tt-val', text: fmtFull(row.sessions) }),
-      el('span', { class: 'tt-name', text: 'sessions' })));
+      el('span', { class: 'tt-val', text: fmtFull(total) }),
+      el('span', { class: 'tt-name', text: 'Total' })));
+  }
+  for (const ex of extras || []) {
+    if (ex.integer && !row[ex.key]) continue;
+    rowsEls.push(el('div', { class: 'tt-row' },
+      el('span', { class: 'tt-key', style: `border-color:${ex.color}` }),
+      el('span', { class: 'tt-val', text: fmtFull(row[ex.key] || 0) }),
+      el('span', { class: 'tt-name', text: ex.name })));
   }
   tooltip.replaceChildren(...rowsEls);
   tooltip.style.display = 'block';
@@ -533,21 +612,22 @@ function showDayTooltip(row, cx, viewW) {
 function hideTooltip() { $('tooltip').style.display = 'none'; }
 
 // Table-view twin of the chart (WCAG-clean equivalent)
-function renderChartTable(rows) {
-  const active = rows.filter((r) =>
-    SERIES.some((s) => Number(r[s.key] || 0) > 0) || Number(r.cache_read_tokens || 0) > 0);
+function renderChartTable(model) {
+  const { series, rows, extras } = model;
+  const stackTotal = (row) => series.reduce((a, s) => a + Number(row.values[s.key] || 0), 0);
+  const active = rows.filter((r) => stackTotal(r) > 0 || (extras || []).some((e) => Number(r[e.key] || 0) > 0));
   const holder = $('chart-table');
   if (!active.length) { holder.replaceChildren(el('div', { class: 'empty', text: 'No activity in this window.' })); return; }
   const head = el('tr', {},
     el('th', { text: 'Day' }),
-    ...SERIES.map((s) => el('th', { class: 'num', text: s.name })),
-    el('th', { class: 'num', text: 'Cache read' }),
-    el('th', { class: 'num', text: 'Sessions' }));
+    ...series.map((s) => el('th', { class: 'num', text: s.name })),
+    ...(model.showTotal ? [el('th', { class: 'num', text: 'Total' })] : []),
+    ...(extras || []).map((e) => el('th', { class: 'num', text: e.name })));
   const body = active.map((r) => el('tr', {},
     el('td', { text: fmtDay(r.day) }),
-    ...SERIES.map((s) => el('td', { class: 'num', text: fmtFull(r[s.key]) })),
-    el('td', { class: 'num', text: fmtFull(r.cache_read_tokens) }),
-    el('td', { class: 'num', text: fmtFull(r.sessions) })));
+    ...series.map((s) => el('td', { class: 'num', text: fmtFull(r.values[s.key] || 0) })),
+    ...(model.showTotal ? [el('td', { class: 'num', text: fmtFull(stackTotal(r)) })] : []),
+    ...(extras || []).map((e) => el('td', { class: 'num', text: fmtFull(r[e.key] || 0) }))));
   holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...body)));
 }
 
@@ -994,7 +1074,7 @@ async function refresh() {
     renderStatus(overview.status, overview.model, overview.meta);
     renderActivity(overview.status, overview.cron, overview.active);
     renderTiles(usage?.totals);
-    renderChart(usage?.daily || []);
+    renderChart();
     renderModelChart(overview.model_daily || []);
     renderTopModels(usage?.by_model);
     renderSessions(overview.sessions);
@@ -1029,6 +1109,19 @@ function wireTableToggle(btnId, chartId, legendId, tableId) {
 }
 wireTableToggle('chart-toggle', 'chart', 'chart-legend', 'chart-table');
 wireTableToggle('model-toggle', 'model-chart', 'model-legend', 'model-table');
+
+// Token chart breakdown: by token type vs by profile.
+document.querySelectorAll('#token-view-seg .seg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (tokenView === btn.dataset.view) return;
+    tokenView = btn.dataset.view;
+    document.querySelectorAll('#token-view-seg .seg-btn').forEach((b) =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    $('chart-title').textContent = tokenView === 'profile'
+      ? 'Token counts by profile' : 'Token counts over time';
+    if (overview) renderChart();
+  });
+});
 
 // ── Theme toggle (sun / moon) ───────────────────────────────────────
 const ICON_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';

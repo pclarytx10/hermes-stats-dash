@@ -16,8 +16,10 @@ the full app. That gap is what this project fills: a small, standalone
 statistics dashboard, extracted from hermes-workspace's dashboard
 capability and trimmed to just the stats surface:
 
-- **Token counts over time** — stacked daily input / output / reasoning
-  tokens (cache reads in the tooltip and table view)
+- **Token counts over time** — stacked daily token columns, switchable
+  between **By type** (input / output / reasoning, cache reads in the tooltip)
+  and **By profile** (one segment per profile, tail folded into "Other").
+  Both views share the same daily total and a table-view twin
 - **Usage by model** — smooth per-model curves of daily token volume
   (top models get fixed colors, the tail folds into "Other"); derived from
   the sessions list since the usage endpoint has no model × day breakdown

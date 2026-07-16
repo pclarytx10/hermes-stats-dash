@@ -466,6 +466,23 @@ async function buildOverview(days) {
   const usage = mergeUsage(usages, days)
   const profilesWithData = usages.filter((u) => u && typeof u === 'object').length
 
+  // Per-profile daily token totals for the "by profile" view of the token
+  // chart. Tokens = input + output + reasoning, matching the stack total of
+  // the "by type" view so the two views sum to the same daily height.
+  const usageByProfile = profiles
+    .map((p, i) => {
+      const u = usages[i]
+      if (!u || typeof u !== 'object' || !Array.isArray(u.daily)) return null
+      const daily = u.daily.map((r) => ({
+        day: r.day,
+        tokens: Number(r.input_tokens || 0) + Number(r.output_tokens || 0) + Number(r.reasoning_tokens || 0),
+      }))
+      const total = Number(u.totals?.total_input || 0) + Number(u.totals?.total_output || 0) +
+        Number(u.totals?.total_reasoning || 0)
+      return { profile: p, daily, total }
+    })
+    .filter((x) => x && x.total > 0)
+
   const sessionRows = Array.isArray(profileSessions)
     ? profileSessions
     : profileSessions?.sessions || null
@@ -473,6 +490,7 @@ async function buildOverview(days) {
   return {
     status,
     usage,
+    usage_by_profile: usageByProfile,
     sessions: profileSessions,
     model,
     cron: summarizeCron(cron),
