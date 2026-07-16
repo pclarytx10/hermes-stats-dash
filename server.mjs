@@ -393,27 +393,98 @@ function summarizeActiveSessions(payload) {
   return { total: active.length, by_profile: byProfile, sessions: active.slice(0, 12) }
 }
 
+/**
+ * Merge per-profile `/api/analytics/usage` payloads into one aggregate. Each
+ * hermes profile has its own session DB (and under gateway_mode "multiple",
+ * its own gateway), and `/api/analytics/usage` is single-profile — so the
+ * whole-workspace picture is the sum across profiles. Summing hermes'
+ * authoritative rollups (computed by SQL over each full DB) is more accurate
+ * than re-deriving from a capped session list. Nulls (a profile that failed
+ * or has no DB yet) are skipped, so a partial fan-out still aggregates.
+ */
+const DAILY_FIELDS = ['input_tokens', 'output_tokens', 'cache_read_tokens',
+  'reasoning_tokens', 'estimated_cost', 'actual_cost', 'sessions', 'api_calls']
+const MODEL_FIELDS = ['input_tokens', 'output_tokens', 'estimated_cost', 'sessions', 'api_calls']
+const TOTAL_FIELDS = ['total_input', 'total_output', 'total_cache_read', 'total_reasoning',
+  'total_estimated_cost', 'total_actual_cost', 'total_sessions', 'total_api_calls']
+
+function mergeUsage(usages, days) {
+  const valid = usages.filter((u) => u && typeof u === 'object' && !Array.isArray(u))
+  if (!valid.length) return null
+
+  const dailyMap = new Map()
+  for (const u of valid) {
+    for (const row of u.daily || []) {
+      if (!row?.day) continue
+      const cur = dailyMap.get(row.day) || { day: row.day }
+      for (const f of DAILY_FIELDS) cur[f] = (cur[f] || 0) + Number(row[f] || 0)
+      dailyMap.set(row.day, cur)
+    }
+  }
+  const daily = [...dailyMap.values()].sort((a, b) => (a.day < b.day ? -1 : 1))
+
+  const modelMap = new Map()
+  for (const u of valid) {
+    for (const m of u.by_model || []) {
+      const key = m?.model || 'unknown'
+      const cur = modelMap.get(key) || { model: key }
+      for (const f of MODEL_FIELDS) cur[f] = (cur[f] || 0) + Number(m[f] || 0)
+      modelMap.set(key, cur)
+    }
+  }
+  const by_model = [...modelMap.values()].sort(
+    (a, b) => b.input_tokens + b.output_tokens - (a.input_tokens + a.output_tokens),
+  )
+
+  const totals = {}
+  for (const u of valid) {
+    for (const f of TOTAL_FIELDS) totals[f] = (totals[f] || 0) + Number(u.totals?.[f] || 0)
+  }
+  return { daily, by_model, totals, period_days: days }
+}
+
 async function buildOverview(days) {
-  const [status, usage, sessions, model, cron, profileSessions] = await Promise.all([
+  // Phase 1: everything that doesn't depend on the profile list.
+  const [status, model, cron, profileSessions] = await Promise.all([
     dashJson('/api/status'),
-    dashJson(`/api/analytics/usage?days=${days}`),
-    dashJson('/api/sessions?limit=500&order=recent'),
     dashJson('/api/model/info'),
     dashJson('/api/cron/jobs'),
-    dashJson('/api/profiles/sessions?limit=100&order=recent'),
+    // Large enough sample to cover the per-model chart window across profiles.
+    dashJson('/api/profiles/sessions?limit=500&order=recent'),
   ])
+
+  // Phase 2: fan out usage per profile and merge. Fall back to the default
+  // (unscoped) call if the profile list is unavailable.
+  const profiles =
+    Array.isArray(status?.profiles) && status.profiles.length ? status.profiles : ['default']
+  const usages = await Promise.all(
+    profiles.length === 1 && profiles[0] === 'default'
+      ? [dashJson(`/api/analytics/usage?days=${days}`)]
+      : profiles.map((p) =>
+          dashJson(`/api/analytics/usage?days=${days}&profile=${encodeURIComponent(p)}`)),
+  )
+  const usage = mergeUsage(usages, days)
+  const profilesWithData = usages.filter((u) => u && typeof u === 'object').length
+
+  const sessionRows = Array.isArray(profileSessions)
+    ? profileSessions
+    : profileSessions?.sessions || null
+
   return {
     status,
     usage,
-    sessions,
+    sessions: profileSessions,
     model,
     cron: summarizeCron(cron),
     active: summarizeActiveSessions(profileSessions),
-    model_daily: sessions ? aggregateModelDaily(sessions, days) : null,
+    model_daily: sessionRows ? aggregateModelDaily(profileSessions, days) : null,
     meta: {
       dashboard_url: dashboardUrl(),
       days,
       auth_mode: authMode(),
+      profiles_total: profiles.length,
+      profiles_with_data: profilesWithData,
+      aggregated_across_profiles: profiles.length > 1,
       generated_at: new Date().toISOString(),
     },
   }

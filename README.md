@@ -38,16 +38,15 @@ Zero runtime dependencies. Node ≥ 18.
 
 ## How it works
 
-`server.mjs` is a ~200-line port of hermes-workspace's server-side
+`server.mjs` is a single-file port of hermes-workspace's server-side
 `dashboard-aggregator`: one `GET /api/overview?days=N` endpoint that fans out
 in parallel to the hermes-agent **dashboard service** (default
 `http://127.0.0.1:9119`):
 
 | Upstream endpoint | Feeds |
 |---|---|
-| `/api/analytics/usage?days=N` | daily token chart, totals, top models |
-| `/api/sessions?limit=500&order=recent` | recent sessions card, per-model usage curves |
-| `/api/profiles/sessions?limit=100` | cross-profile active-session detection |
+| `/api/analytics/usage?days=N&profile=P` | daily token chart, totals, top models — **one call per profile, merged** |
+| `/api/profiles/sessions?limit=500` | recent sessions card, per-model usage curves, active-session detection |
 | `/api/status` | status line, gateway activity (in-flight turns, mode, profiles) |
 | `/api/cron/jobs` | cron count in the gateway activity card |
 | `/api/model/info` | active model in the status line |
@@ -56,6 +55,23 @@ Each section is independent — a failed upstream call nulls that section and
 the UI hides the card, same as the workspace dashboard. `public/index.html`
 is the whole frontend (vanilla JS + SVG, light/dark via
 `prefers-color-scheme`).
+
+### Cross-profile aggregation
+
+Every hermes profile has its own session DB, and `/api/analytics/usage` is
+single-profile — so on a multi-profile install the default-scoped numbers
+undercount the whole workspace. `buildOverview` reads the profile list from
+`/api/status`, fans out one `usage` call **per profile**, and sums hermes'
+authoritative rollups (daily token rows, per-model breakdown, and totals).
+Summing the server-side SQL rollups is more accurate than re-deriving from a
+capped session list, and a profile that errors or has no DB yet is simply
+skipped, so a partial fan-out still aggregates. The status line shows
+`stats across N/M profiles`, and the recent-sessions + per-model views draw
+from the cross-profile `/api/profiles/sessions` list (each row tagged with
+its owning profile). The one dimension hermes has no endpoint for —
+per-day-**per-model** volume — is still derived from that session list, so it
+is an approximation over the sampled window while the token totals and
+per-model totals come from the authoritative rollups.
 
 ### Gateway activity & profiles
 

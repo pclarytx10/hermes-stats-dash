@@ -43,7 +43,11 @@ function rand(seed) {
   return x - Math.floor(x)
 }
 
-function dailyRows(days) {
+// Per-profile weight so fanned-out usage sums to a plausible whole rather than
+// N copies of the same data. Profiles not listed contribute nothing.
+const PROFILE_WEIGHT = { default: 1, work: 0.6, research: 0.45, sandbox: 0.15 }
+
+function dailyRows(days, weight = 1) {
   const rows = []
   const now = new Date()
   for (let i = days - 1; i >= 0; i--) {
@@ -51,7 +55,7 @@ function dailyRows(days) {
     d.setDate(now.getDate() - i)
     const seed = Math.floor(d.getTime() / 86400000)
     if (rand(seed) < 0.18) continue // some idle days
-    const busy = 0.4 + rand(seed + 1) * (d.getDay() % 6 === 0 ? 0.4 : 1.6)
+    const busy = (0.4 + rand(seed + 1) * (d.getDay() % 6 === 0 ? 0.4 : 1.6)) * weight
     rows.push({
       day: d.toISOString().slice(0, 10),
       input_tokens: Math.round(220_000 * busy),
@@ -67,8 +71,16 @@ function dailyRows(days) {
   return rows
 }
 
-function usage(days) {
-  const daily = dailyRows(days)
+function usage(days, profile = null) {
+  const weight = profile == null ? 1 : (PROFILE_WEIGHT[profile] || 0)
+  if (weight === 0) {
+    // An empty profile: hermes returns zeroed rollups, not an error.
+    return { daily: [], by_model: [], totals: {
+      total_input: 0, total_output: 0, total_cache_read: 0, total_reasoning: 0,
+      total_estimated_cost: 0, total_actual_cost: 0, total_sessions: 0, total_api_calls: 0,
+    }, period_days: days }
+  }
+  const daily = dailyRows(days, weight)
   const sum = (k) => daily.reduce((a, r) => a + r[k], 0)
   const by_model = MODELS.map((m, i) => {
     const share = 1 / (i + 1.3)
@@ -302,7 +314,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/analytics/usage') {
       const days = Math.max(1, Number(url.searchParams.get('days')) || 30)
-      return send(200, usage(days))
+      return send(200, usage(days, url.searchParams.get('profile')))
     }
     return send(404, { detail: 'Not Found' })
   }

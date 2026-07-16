@@ -798,14 +798,15 @@ function renderSessions(sessions) {
   const rows = sessionRows(sessions).slice(0, 8);
   if (!rows.length) { holder.replaceChildren(el('div', { class: 'empty', text: 'No sessions.' })); return; }
   const body = rows.map((s) => {
-    const name = s.name || s.title || s.first_message_preview || s.id || s.session_id || 'session';
+    const name = s.title || s.name || s.display_name || s.preview || s.first_message_preview || s.id || s.session_id || 'session';
     const tokens = Number(s.input_tokens || 0) + Number(s.output_tokens || 0);
+    const sub = [s.profile, s.model || s.source].filter(Boolean).join(' · ');
     return el('tr', {},
       el('td', {},
         el('div', { class: 'cell-main', text: String(name).slice(0, 60) }),
-        el('div', { class: 'cell-sub', text: s.model || s.source || '' })),
+        el('div', { class: 'cell-sub', text: sub })),
       el('td', { class: 'num', text: tokens ? fmtCompact(tokens) : '—' }),
-      el('td', { class: 'num cell-sub', text: fmtWhen(s.last_active_at || s.updated_at || s.started_at || s.created_at) }));
+      el('td', { class: 'num cell-sub', text: fmtWhen(s.last_active || s.last_active_at || s.updated_at || s.started_at || s.created_at) }));
   });
   holder.replaceChildren(el('table', {},
     el('thead', {}, el('tr', {},
@@ -962,7 +963,12 @@ function renderStatus(status, model, meta) {
   const m = model || {};
   if (m.model || m.current_model) bits.push(m.provider ? `${m.provider} / ${m.model || m.current_model}` : (m.model || m.current_model));
   const platforms = status?.gateway_platforms || status?.platforms;
-  if (Array.isArray(platforms) && platforms.length) bits.push(`${platforms.length} platform${platforms.length > 1 ? 's' : ''}`);
+  const platformCount = Array.isArray(platforms) ? platforms.length
+    : (platforms && typeof platforms === 'object') ? Object.keys(platforms).length : 0;
+  if (platformCount) bits.push(`${platformCount} platform${platformCount > 1 ? 's' : ''}`);
+  if (meta?.aggregated_across_profiles) {
+    bits.push(`stats across ${meta.profiles_with_data}/${meta.profiles_total} profiles`);
+  }
   if (meta?.auth_mode && meta.auth_mode !== 'none') bits.push(`auth: ${meta.auth_mode}`);
   text.textContent = bits.join(' · ') || 'connected';
 }
