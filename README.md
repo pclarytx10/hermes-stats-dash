@@ -74,10 +74,29 @@ environment:
 | Env var | Default | Purpose |
 |---|---|---|
 | `PORT` | `8788` | Port for this app |
+| `HOST` | `127.0.0.1` | Bind address (see below) |
 | `HERMES_DASHBOARD_URL` | `http://127.0.0.1:9119` | hermes-agent dashboard service |
 | `HERMES_DASHBOARD_TOKEN` | – | Bearer token (v0.17+ token-auth seam) |
 | `HERMES_DASHBOARD_COOKIE` | – | Session cookie (v0.17+ interactive auth) |
 | `HERMES_DASHBOARD_USERNAME` / `_PASSWORD` | – | Password-provider login (v0.17+) |
+
+### Local vs. remote access
+
+By default the server binds **`127.0.0.1`** — reachable only from the same
+machine. To let other devices reach it, open the bind address:
+
+```sh
+npm start -- --remote            # bind 0.0.0.0 (all interfaces)
+npm start -- --host 100.x.y.z    # bind a specific address, e.g. a Tailscale IP
+HOST=0.0.0.0 npm start           # same via env var
+```
+
+Precedence: `--host` › `--remote`/`-r` › `HOST` › loopback default.
+
+> ⚠ This server has **no authentication of its own** and can hold the
+> upstream dashboard credentials you configure. When bound to a non-loopback
+> address it prints a warning — only expose it on a trusted network (a
+> Tailscale/VPN address, not `0.0.0.0` on a public interface).
 
 ## Authentication — the v0.17 change
 

@@ -47,6 +47,26 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.PORT || 8788)
 const UPSTREAM_TIMEOUT_MS = 10_000
 
+// Bind host. Loopback-only by default so the stats server — which proxies
+// upstream credentials and has no auth of its own — isn't reachable off the
+// machine unless explicitly opened up.
+//   --remote / -r          → bind 0.0.0.0 (all interfaces)
+//   --host <addr> / HOST   → bind a specific address
+const argv = process.argv.slice(2)
+function argValue(...names) {
+  for (const name of names) {
+    const i = argv.indexOf(name)
+    if (i !== -1 && argv[i + 1]) return argv[i + 1]
+  }
+  return null
+}
+const HOST =
+  argValue('--host') ||
+  (argv.includes('--remote') || argv.includes('-r') ? '0.0.0.0' : null) ||
+  process.env.HOST ||
+  '127.0.0.1'
+const isLoopback = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1'
+
 function trimSlash(u) {
   return String(u || '').trim().replace(/\/+$/, '')
 }
@@ -621,8 +641,16 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(405).end()
 })
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`hermes-stats-dash listening on http://127.0.0.1:${PORT}`)
+server.listen(PORT, HOST, () => {
+  const shown = isLoopback ? '127.0.0.1' : HOST
+  console.log(`hermes-stats-dash listening on http://${shown}:${PORT} (bind ${HOST})`)
   console.log(`  upstream dashboard: ${dashboardUrl()} (${urlSource()})`)
   console.log(`  auth: ${authMode()}`)
+  if (!isLoopback) {
+    console.log(
+      '  ⚠ remote mode: bound to a non-loopback address. This server has ' +
+        'no auth of its own and can hold upstream credentials — only expose ' +
+        'it on a trusted network (e.g. Tailscale), never the public internet.',
+    )
+  }
 })
