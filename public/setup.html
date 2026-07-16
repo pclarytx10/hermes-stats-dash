@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hermes Stats — Setup</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:          #f9f9f7;
+    --surface-1:     #fcfcfb;
+    --text-primary:  #0b0b0b;
+    --text-secondary:#52514e;
+    --text-muted:    #898781;
+    --gridline:      #e1e0d9;
+    --baseline:      #c3c2b7;
+    --border:        rgba(11,11,11,0.10);
+    --good:          #0ca30c;
+    --good-text:     #006300;
+    --critical:      #d03b3b;
+    --accent:        #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page:          #0d0d0d;
+      --surface-1:     #1a1a19;
+      --text-primary:  #ffffff;
+      --text-secondary:#c3c2b7;
+      --text-muted:    #898781;
+      --gridline:      #2c2c2a;
+      --baseline:      #383835;
+      --border:        rgba(255,255,255,0.10);
+      --good:          #0ca30c;
+      --good-text:     #0ca30c;
+      --critical:      #d03b3b;
+      --accent:        #3987e5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 660px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 20px; font-weight: 650; margin: 0; }
+  header a { margin-left: auto; font-size: 13px; color: var(--text-secondary); }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; margin-top: 16px;
+  }
+  .card h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 0 0 12px; }
+
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .field input[type="text"], .field input[type="url"], .field input[type="password"] {
+    width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--baseline); background: var(--page);
+    color: var(--text-primary); font: inherit;
+  }
+  .field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  .hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .hint code { background: var(--page); padding: 0 4px; border-radius: 4px; }
+  .clear-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .clear-row[hidden] { display: none; }
+
+  .actions { display: flex; gap: 10px; margin-top: 4px; }
+  button {
+    appearance: none; font: inherit; font-size: 13px; cursor: pointer;
+    border-radius: 8px; padding: 8px 16px; border: 1px solid var(--border);
+    background: var(--surface-1); color: var(--text-primary);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: 0.55; cursor: default; }
+  .link-btn { border: none; background: none; padding: 2px 0; color: var(--text-muted); text-decoration: underline; }
+
+  .result-row { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--gridline); }
+  .result-row:last-child { border-bottom: none; }
+  .result-icon { flex: none; width: 18px; font-weight: 700; }
+  .result-icon.ok { color: var(--good-text); }
+  .result-icon.fail { color: var(--critical); }
+  .result-icon.skip { color: var(--text-muted); }
+  .result-label { font-weight: 600; }
+  .result-detail { color: var(--text-secondary); font-size: 13px; }
+
+  .state-line { font-size: 13px; color: var(--text-secondary); }
+  .state-line .pill {
+    display: inline-block; border: 1px solid var(--border); border-radius: 999px;
+    padding: 1px 9px; font-size: 12px; color: var(--text-muted); margin-left: 4px;
+  }
+  .save-note { font-size: 13px; margin-left: 4px; align-self: center; }
+  .save-note.ok { color: var(--good-text); }
+  .save-note.fail { color: var(--critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Setup</h1>
+    <a href="/">← Dashboard</a>
+  </header>
+
+  <div class="card">
+    <h2>Hermes connection</h2>
+
+    <div class="field">
+      <label for="url">Dashboard URL</label>
+      <input type="url" id="url" placeholder="http://127.0.0.1:9119" spellcheck="false" />
+      <div class="hint">The hermes-agent dashboard service — local or remote (e.g. a Tailscale address). Currently: <span id="cur-url">…</span></div>
+    </div>
+
+    <div class="field">
+      <label for="username">Username <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <!-- autocomplete="off" is ignored by password managers on fields that
+           look like a login form; "new-password" (below) plus a non-login
+           name is the reliable way to keep them from autofilling browser
+           credentials into this config form. -->
+      <input type="text" id="username" name="hsd-upstream-user" autocomplete="off" spellcheck="false" />
+    </div>
+
+    <div class="field">
+      <label for="password">Password <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <input type="password" id="password" name="hsd-upstream-pass" autocomplete="new-password" />
+      <div class="hint">For dashboards behind the hermes ≥ 0.17 auth gate with a password provider. This app logs in via <code>/auth/password-login</code>, caches the session cookie, and re-logs-in when it expires.</div>
+      <div class="clear-row" id="password-clear-row" hidden>
+        <input type="checkbox" id="clear-password" /><label for="clear-password" style="font-weight:400;display:inline">clear the saved username &amp; password</label>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="token">Bearer token <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <input type="password" id="token" name="hsd-bearer" autocomplete="new-password" spellcheck="false" />
+      <div class="hint">hermes ≥ 0.17 service token (the <code>dashboard_auth</code> token seam).</div>
+      <div class="clear-row" id="token-clear-row" hidden>
+        <input type="checkbox" id="clear-token" /><label for="clear-token" style="font-weight:400;display:inline">clear the saved token</label>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="cookie">Session cookie <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <input type="password" id="cookie" name="hsd-cookie" autocomplete="new-password" spellcheck="false" placeholder="hermes_session=…" />
+      <div class="hint">Copied from a browser after logging in through a hermes ≥ 0.17 auth provider (Nous OAuth / OIDC / password) — needed for non-loopback dashboards behind the auth gate.</div>
+      <div class="clear-row" id="cookie-clear-row" hidden>
+        <input type="checkbox" id="clear-cookie" /><label for="clear-cookie" style="font-weight:400;display:inline">clear the saved cookie</label>
+      </div>
+    </div>
+
+    <div class="hint" style="margin-bottom:14px">Precedence: bearer token → session cookie → username/password → loopback scrape. Leave everything blank for a loopback dashboard: the ephemeral session token is scraped from the dashboard's root HTML automatically and cached until it rotates.</div>
+
+    <div class="actions">
+      <button id="test-btn">Test connection</button>
+      <button id="save-btn" class="primary">Save</button>
+      <span class="save-note" id="save-note"></span>
+    </div>
+  </div>
+
+  <div class="card" id="result-card" hidden>
+    <h2>Test result</h2>
+    <div id="result-rows"></div>
+  </div>
+
+  <div class="card">
+    <h2>Current state</h2>
+    <div class="state-line" id="state-line">Loading…</div>
+    <div style="margin-top:8px">
+      <button class="link-btn" id="forget-btn" hidden>Forget cached session token / login cookie</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+let settings = null;
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'text') node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of children) if (c) node.appendChild(c);
+  return node;
+}
+
+async function loadSettings() {
+  const res = await fetch('/api/settings');
+  settings = await res.json();
+  $('cur-url').textContent = `${settings.dashboard_url} (${settings.url_source})`;
+  if (!$('url').value) $('url').value = settings.dashboard_url;
+  $('token').placeholder = settings.has_token
+    ? `saved (${settings.token_source}) — leave blank to keep` : '';
+  $('token-clear-row').hidden = settings.token_source !== 'saved';
+  $('cookie').placeholder = settings.has_cookie
+    ? `saved (${settings.cookie_source}) — leave blank to keep` : 'hermes_session=…';
+  $('cookie-clear-row').hidden = settings.cookie_source !== 'saved';
+  if (!$('username').value && settings.username) $('username').value = settings.username;
+  $('password').placeholder = settings.has_password
+    ? `saved (${settings.password_source}) — leave blank to keep` : '';
+  $('password-clear-row').hidden = settings.password_source !== 'saved';
+
+  const bits = [];
+  bits.push(`URL: ${settings.dashboard_url}`);
+  bits.push(`auth mode: ${settings.auth_mode}`);
+  bits.push(`token: ${settings.has_token ? 'set (' + settings.token_source + ')' : 'none'}`);
+  bits.push(`cookie: ${settings.has_cookie ? 'set (' + settings.cookie_source + ')' : 'none'}`);
+  bits.push(`login: ${settings.has_password ? (settings.username || '?') + ' (' + settings.password_source + ')' : 'none'}`);
+  bits.push(`cached session token: ${settings.has_cached_session_token ? 'yes' : 'no'}`);
+  bits.push(`cached login cookie: ${settings.has_cached_login_cookie ? 'yes' : 'no'}`);
+  const line = $('state-line');
+  line.replaceChildren(
+    ...bits.map((b) => el('span', { class: 'pill', text: b })),
+    el('div', { class: 'hint', text: `Saved to ${settings.config_file}` }));
+  $('forget-btn').hidden =
+    !settings.has_cached_session_token && !settings.has_cached_login_cookie;
+}
+
+function formBody() {
+  return {
+    dashboardUrl: $('url').value.trim(),
+    token: $('token').value,
+    cookie: $('cookie').value,
+    username: $('username').value,
+    password: $('password').value,
+    clearToken: $('clear-token').checked,
+    clearCookie: $('clear-cookie').checked,
+    clearPassword: $('clear-password').checked,
+  };
+}
+
+function resultRow(state, label, detail) {
+  const icon = state === 'ok' ? '✓' : state === 'fail' ? '✗' : '·';
+  return el('div', { class: 'result-row' },
+    el('span', { class: `result-icon ${state}`, text: icon }),
+    el('span', { class: 'result-label', text: label }),
+    detail ? el('span', { class: 'result-detail', text: detail }) : null);
+}
+
+$('test-btn').addEventListener('click', async () => {
+  const btn = $('test-btn');
+  btn.disabled = true; btn.textContent = 'Testing…';
+  $('save-note').textContent = '';
+  try {
+    const res = await fetch('/api/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(formBody()),
+    });
+    const r = await res.json();
+    const rows = [];
+    if (r.error && !r.reachable) {
+      rows.push(resultRow('fail', 'Reachable', r.error));
+    } else {
+      rows.push(resultRow(r.reachable ? 'ok' : 'fail', 'Reachable',
+        [r.url, r.version ? `hermes ${r.version}` : null, r.latency_ms != null ? `${r.latency_ms} ms` : null]
+          .filter(Boolean).join(' · ')));
+    }
+    if (r.reachable) {
+      rows.push(resultRow(r.auth?.ok ? 'ok' : 'fail', 'Authenticated',
+        [r.auth?.mode, r.auth?.detail].filter(Boolean).join(' — ') || 'no'));
+      if (r.login_cookie_cached || r.auth?.mode === 'password-login') {
+        rows.push(resultRow(r.login_cookie_cached ? 'ok' : 'skip', 'Login cookie cached',
+          r.login_cookie_cached ? 'session cookies saved; re-login happens automatically on expiry' : ''));
+      } else {
+        rows.push(resultRow(r.token_cached ? 'ok' : 'skip', 'Session token cached',
+          r.token_cached ? 'scraped from root HTML and saved for reuse'
+            : (r.auth?.mode === 'bearer-token' || r.auth?.mode === 'session-cookie')
+              ? 'not needed — explicit credentials in use'
+              : r.auth?.mode === 'open' ? 'not needed — endpoint is open' : ''));
+      }
+    }
+    $('result-rows').replaceChildren(...rows);
+    $('result-card').hidden = false;
+    loadSettings();
+  } catch (err) {
+    $('result-rows').replaceChildren(resultRow('fail', 'Test failed', String(err?.message || err)));
+    $('result-card').hidden = false;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test connection';
+  }
+});
+
+$('save-btn').addEventListener('click', async () => {
+  const btn = $('save-btn');
+  btn.disabled = true;
+  const note = $('save-note');
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(formBody()),
+    });
+    const r = await res.json();
+    if (r.error) { note.className = 'save-note fail'; note.textContent = r.error; }
+    else {
+      note.className = 'save-note ok'; note.textContent = 'Saved';
+      $('token').value = ''; $('cookie').value = ''; $('password').value = '';
+      $('clear-token').checked = false; $('clear-cookie').checked = false;
+      $('clear-password').checked = false;
+      loadSettings();
+    }
+  } catch (err) {
+    note.className = 'save-note fail'; note.textContent = String(err?.message || err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('forget-btn').addEventListener('click', async () => {
+  await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clearCachedToken: true }),
+  });
+  loadSettings();
+});
+
+loadSettings();
+</script>
+</body>
+</html>

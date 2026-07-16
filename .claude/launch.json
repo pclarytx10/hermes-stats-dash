@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "hermes-stats-dash",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["server.mjs"],
+      "port": 8788
+    },
+    {
+      "name": "mock-hermes",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/mock-hermes.mjs"],
+      "port": 9119
+    },
+    {
+      "name": "mock-hermes-gated",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/mock-hermes.mjs", "password"],
+      "port": 9119
+    }
+  ]
+}

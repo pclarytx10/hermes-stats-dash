@@ -1,0 +1,14 @@
+{
+  "name": "hermes-stats-dash",
+  "version": "0.1.0",
+  "description": "Standalone statistics dashboard for a running hermes-agent: token counts over time, sessions, top models.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
