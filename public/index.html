@@ -4,6 +4,14 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hermes Stats</title>
+<script>
+  // Apply a saved theme choice before first paint to avoid a flash. No saved
+  // choice → leave data-theme unset so the OS preference (media query) wins.
+  try {
+    var t = localStorage.getItem('hsd-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+</script>
 <style>
   :root {
     color-scheme: light;
@@ -23,8 +31,12 @@
     --series-4:      #008300;
     --series-5:      #4a3aa7;
   }
+  /* Dark palette, shared by the OS-preference media query and the explicit
+     data-theme override. The media query yields to an explicit light choice
+     (:not([data-theme="light"])); an explicit dark choice wins even on an
+     OS-light machine. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       color-scheme: dark;
       --page:          #0d0d0d;
       --surface-1:     #1a1a19;
@@ -41,6 +53,22 @@
       --series-5:      #9085e9;
     }
   }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:          #0d0d0d;
+    --surface-1:     #1a1a19;
+    --text-primary:  #ffffff;
+    --text-secondary:#c3c2b7;
+    --text-muted:    #898781;
+    --gridline:      #2c2c2a;
+    --baseline:      #383835;
+    --border:        rgba(255,255,255,0.10);
+    --series-1:      #3987e5;
+    --series-2:      #199e70;
+    --series-3:      #c98500;
+    --series-4:      #008300;
+    --series-5:      #9085e9;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -53,6 +81,15 @@
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 20px; font-weight: 650; margin: 0; }
   header .setup-link { margin-left: auto; font-size: 13px; color: var(--text-secondary); }
+  .theme-toggle {
+    appearance: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-1); color: var(--text-secondary);
+    align-self: center;
+  }
+  .theme-toggle:hover { color: var(--text-primary); border-color: var(--baseline); }
+  .theme-toggle svg { width: 16px; height: 16px; display: block; }
   .status-line { color: var(--text-secondary); font-size: 13px; display: flex; align-items: center; gap: 6px; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
   .status-dot.up { background: var(--good); }
@@ -178,6 +215,7 @@
       <span class="status-dot" id="status-dot"></span><span id="status-text">connecting…</span>
     </div>
     <a class="setup-link" href="/setup.html">Setup</a>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
   </header>
 
   <div class="filters" role="group" aria-label="Date range">
@@ -920,6 +958,32 @@ function wireTableToggle(btnId, chartId, legendId, tableId) {
 }
 wireTableToggle('chart-toggle', 'chart', 'chart-legend', 'chart-table');
 wireTableToggle('model-toggle', 'model-chart', 'model-legend', 'model-table');
+
+// ── Theme toggle (sun / moon) ───────────────────────────────────────
+const ICON_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const ICON_SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+const themeMq = window.matchMedia('(prefers-color-scheme: dark)');
+function storedTheme() { try { return localStorage.getItem('hsd-theme'); } catch { return null; } }
+function effectiveTheme() { return storedTheme() || (themeMq.matches ? 'dark' : 'light'); }
+function applyTheme() {
+  const s = storedTheme();
+  if (s === 'light' || s === 'dark') document.documentElement.setAttribute('data-theme', s);
+  else document.documentElement.removeAttribute('data-theme');
+  const dark = effectiveTheme() === 'dark';
+  const btn = $('theme-toggle');
+  // Show the icon of the mode you'd switch TO (moon = go dark, sun = go light).
+  btn.innerHTML = dark ? ICON_SUN : ICON_MOON;
+  btn.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  btn.setAttribute('title', dark ? 'Switch to light theme' : 'Switch to dark theme');
+}
+$('theme-toggle').addEventListener('click', () => {
+  const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem('hsd-theme', next); } catch {}
+  applyTheme();
+});
+// Follow OS changes only while the user hasn't made an explicit choice.
+themeMq.addEventListener('change', () => { if (!storedTheme()) applyTheme(); });
+applyTheme();
 
 refresh();
 setInterval(refresh, 30_000);

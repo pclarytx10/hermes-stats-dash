@@ -30,6 +30,9 @@ capability and trimmed to just the stats surface:
 - **Setup page** (`/setup.html`) — point the app at a local or remote
   hermes, test the connection/auth, and persist everything to
   `~/.hermes-stats-dash/config.json` (mode `0600`)
+- **Light / dark toggle** — a sun/moon switch in the header; follows the OS
+  preference until you pick one, then remembers the choice (shared across
+  both pages, applied before first paint to avoid a flash)
 
 Zero runtime dependencies. Node ≥ 18.
 

@@ -4,6 +4,14 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hermes Stats — Setup</title>
+<script>
+  // Honor the theme chosen on the dashboard (shared localStorage key), applied
+  // before first paint. No saved choice → OS preference (media query) wins.
+  try {
+    var t = localStorage.getItem('hsd-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+</script>
 <style>
   :root {
     color-scheme: light;
@@ -21,7 +29,7 @@
     --accent:        #2a78d6;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       color-scheme: dark;
       --page:          #0d0d0d;
       --surface-1:     #1a1a19;
@@ -37,6 +45,21 @@
       --accent:        #3987e5;
     }
   }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:          #0d0d0d;
+    --surface-1:     #1a1a19;
+    --text-primary:  #ffffff;
+    --text-secondary:#c3c2b7;
+    --text-muted:    #898781;
+    --gridline:      #2c2c2a;
+    --baseline:      #383835;
+    --border:        rgba(255,255,255,0.10);
+    --good:          #0ca30c;
+    --good-text:     #0ca30c;
+    --critical:      #d03b3b;
+    --accent:        #3987e5;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--page); color: var(--text-primary);
@@ -46,6 +69,14 @@
   header { display: flex; align-items: baseline; gap: 12px; }
   header h1 { font-size: 20px; font-weight: 650; margin: 0; }
   header a { margin-left: auto; font-size: 13px; color: var(--text-secondary); }
+  .theme-toggle {
+    appearance: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0; cursor: pointer; align-self: center;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-1); color: var(--text-secondary);
+  }
+  .theme-toggle:hover { color: var(--text-primary); border-color: var(--baseline); }
+  .theme-toggle svg { width: 16px; height: 16px; display: block; }
 
   .card {
     background: var(--surface-1); border: 1px solid var(--border);
@@ -100,6 +131,7 @@
   <header>
     <h1>Setup</h1>
     <a href="/">← Dashboard</a>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
   </header>
 
   <div class="card">
@@ -318,6 +350,30 @@ $('forget-btn').addEventListener('click', async () => {
 });
 
 loadSettings();
+
+// ── Theme toggle (sun / moon), shares the dashboard's stored preference ──
+const ICON_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const ICON_SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+const themeMq = window.matchMedia('(prefers-color-scheme: dark)');
+function storedTheme() { try { return localStorage.getItem('hsd-theme'); } catch { return null; } }
+function effectiveTheme() { return storedTheme() || (themeMq.matches ? 'dark' : 'light'); }
+function applyTheme() {
+  const s = storedTheme();
+  if (s === 'light' || s === 'dark') document.documentElement.setAttribute('data-theme', s);
+  else document.documentElement.removeAttribute('data-theme');
+  const dark = effectiveTheme() === 'dark';
+  const btn = $('theme-toggle');
+  btn.innerHTML = dark ? ICON_SUN : ICON_MOON;
+  btn.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  btn.setAttribute('title', dark ? 'Switch to light theme' : 'Switch to dark theme');
+}
+$('theme-toggle').addEventListener('click', () => {
+  const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem('hsd-theme', next); } catch {}
+  applyTheme();
+});
+themeMq.addEventListener('change', () => { if (!storedTheme()) applyTheme(); });
+applyTheme();
 </script>
 </body>
 </html>
