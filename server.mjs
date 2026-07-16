@@ -331,18 +331,41 @@ function aggregateModelDaily(sessionsPayload, days) {
   })
 }
 
+/**
+ * Compact cron rollup for the activity card. Mirrors the field-name
+ * tolerance of the workspace aggregator: jobs may arrive as a bare array or
+ * `{jobs: [...]}`, and state lives under `state` or `status`.
+ */
+function summarizeCron(cronPayload) {
+  let jobs = cronPayload
+  if (cronPayload && !Array.isArray(cronPayload) && Array.isArray(cronPayload.jobs)) {
+    jobs = cronPayload.jobs
+  }
+  if (!Array.isArray(jobs)) return null
+  let paused = 0
+  let running = 0
+  for (const j of jobs) {
+    const state = String(j?.state ?? j?.status ?? '').toLowerCase()
+    if (state === 'paused') paused += 1
+    else if (state === 'running') running += 1
+  }
+  return { total: jobs.length, paused, running }
+}
+
 async function buildOverview(days) {
-  const [status, usage, sessions, model] = await Promise.all([
+  const [status, usage, sessions, model, cron] = await Promise.all([
     dashJson('/api/status'),
     dashJson(`/api/analytics/usage?days=${days}`),
     dashJson('/api/sessions?limit=500&order=recent'),
     dashJson('/api/model/info'),
+    dashJson('/api/cron/jobs'),
   ])
   return {
     status,
     usage,
     sessions,
     model,
+    cron: summarizeCron(cron),
     model_daily: sessions ? aggregateModelDaily(sessions, days) : null,
     meta: {
       dashboard_url: dashboardUrl(),

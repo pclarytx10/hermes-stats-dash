@@ -21,6 +21,9 @@ capability and trimmed to just the stats surface:
 - **Usage by model** — smooth per-model curves of daily token volume
   (top models get fixed colors, the tail folds into "Other"); derived from
   the sessions list since the usage endpoint has no model × day breakdown
+- **Gateway activity** — live busy/idle badge, in-flight `active_agents`,
+  active sessions, cron jobs, gateway mode (explained below), and the set of
+  configured profiles with their live gateways highlighted
 - **Totals** — tokens, sessions, API calls, cost for the selected window
 - **Top models** — token volume, sessions, and API calls per model
 - **Recent sessions** — latest activity with model and token counts
@@ -40,14 +43,37 @@ in parallel to the hermes-agent **dashboard service** (default
 | Upstream endpoint | Feeds |
 |---|---|
 | `/api/analytics/usage?days=N` | daily token chart, totals, top models |
-| `/api/sessions?limit=10&order=recent` | recent sessions card |
-| `/api/status` | status line |
+| `/api/sessions?limit=500&order=recent` | recent sessions card, per-model usage curves |
+| `/api/status` | status line, gateway activity (agents, mode, profiles) |
+| `/api/cron/jobs` | cron count in the gateway activity card |
 | `/api/model/info` | active model in the status line |
 
 Each section is independent — a failed upstream call nulls that section and
 the UI hides the card, same as the workspace dashboard. `public/index.html`
 is the whole frontend (vanilla JS + SVG, light/dark via
 `prefers-color-scheme`).
+
+### Gateway activity & profiles
+
+The activity card reads hermes' `/api/status` topology:
+
+- **`active_agents`** — in-flight gateway turns right now (running agent
+  turns + active cron jobs + active API runs). Drives the **Busy / Idle**
+  badge. Note this is an aggregate count; hermes does not expose a per-agent
+  or per-sub-agent (`delegate_task`) breakdown over HTTP, so individual
+  sub-agents can't be enumerated — only the busy total.
+- **`gateway_mode`** — how profiles map to gateway processes:
+  | Mode | Meaning |
+  |---|---|
+  | `single` | One gateway serving one profile |
+  | `multiplex` | One gateway serving several profiles |
+  | `multiple` | An independent gateway per profile |
+  | `none` | No gateway process running |
+- **Profiles** — every configured profile; those with a live gateway are
+  tagged **live**. The per-gateway detail (`gateways[]`, incl. ports) is only
+  returned on a **loopback / `--insecure`** hermes bind — behind the v0.17+
+  auth gate hermes withholds it, so the card falls back to showing the
+  configured profile names with a note that live detail is hidden.
 
 ## Run
 

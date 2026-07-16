@@ -4,8 +4,9 @@
  *
  * Mimics the pieces this app consumes: the ephemeral session token injected
  * into the root HTML (pre-v0.17 loopback auth), bearer-token enforcement on
- * /api/*, and plausible payload shapes for /api/status,
- * /api/analytics/usage, /api/sessions, and /api/model/info.
+ * /api/*, and plausible payload shapes for /api/status (incl. multiplex
+ * profile topology + a busy/idle active_agents cycle), /api/analytics/usage,
+ * /api/sessions, /api/cron/jobs, and /api/model/info.
  *
  *   node scripts/mock-hermes.mjs        # listens on :9119
  *
@@ -150,10 +151,37 @@ function sessions(limit) {
   return { sessions: all.slice(0, limit), total: all.length }
 }
 
-const STATUS = {
-  running: true,
-  gateway_platforms: ['api_server', 'telegram', 'discord'],
-  version: '0.18.2-mock',
+// Multiplex topology: one default gateway serving several profiles, plus a
+// standalone "research" gateway on its own ports.
+const PROFILES = ['default', 'work', 'research', 'sandbox']
+
+function statusPayload() {
+  // Alternate busy/idle on a ~20s cycle so both states are observable.
+  const agents = Math.floor(Date.now() / 1000) % 20 < 8 ? 2 : 0
+  return {
+    version: '0.18.2-mock',
+    gateway_running: true,
+    gateway_state: 'running',
+    gateway_platforms: { api_server: {}, telegram: {}, discord: {} },
+    active_agents: agents,
+    gateway_busy: agents > 0,
+    gateway_drainable: true,
+    active_sessions: 3 + (agents ? 1 : 0),
+    profiles: PROFILES,
+    gateway_mode: 'multiplex',
+    gateways: [
+      { profile: 'default', ports: { api_server: 9119 }, served_profiles: ['default', 'work', 'sandbox'] },
+      { profile: 'research', ports: { api_server: 9120 } },
+    ],
+  }
+}
+
+function cronJobs() {
+  return [
+    { id: 'j1', name: 'nightly-memory-consolidation', state: 'idle', schedule: '0 3 * * *' },
+    { id: 'j2', name: 'hourly-inbox-sweep', state: 'running', schedule: '0 * * * *' },
+    { id: 'j3', name: 'weekly-digest', state: 'paused', schedule: '0 9 * * 1' },
+  ]
 }
 
 const MODEL_INFO = {
@@ -234,8 +262,9 @@ const server = http.createServer(async (req, res) => {
     if (!authed) {
       return send(401, { error: 'unauthenticated', detail: 'Unauthorized' })
     }
-    if (url.pathname === '/api/status') return send(200, STATUS)
+    if (url.pathname === '/api/status') return send(200, statusPayload())
     if (url.pathname === '/api/model/info') return send(200, MODEL_INFO)
+    if (url.pathname === '/api/cron/jobs') return send(200, cronJobs())
     if (url.pathname === '/api/sessions') {
       const limit = Math.max(1, Number(url.searchParams.get('limit')) || 20)
       return send(200, sessions(limit))

@@ -89,6 +89,41 @@
 
   .chart-card { margin-top: 14px; }
   .chart-holder { position: relative; }
+
+  /* ── Gateway activity card ── */
+  .activity-card { margin-top: 14px; }
+  .busy-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
+  }
+  .busy-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .busy-badge.busy { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+  .busy-badge.busy .dot { background: var(--good); animation: pulse 1.6s ease-in-out infinite; }
+  .busy-badge.offline { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, transparent); }
+  .busy-badge.offline .dot { background: var(--critical); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .activity-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 14px; }
+  .act-item .act-label { font-size: 12px; color: var(--text-muted); }
+  .act-item .act-value { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .act-item .act-value.text { font-size: 15px; font-variant-numeric: normal; }
+  .act-item .act-sub { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
+  .act-item .act-value.text .mode-word { text-transform: capitalize; }
+
+  .profiles-block { margin-top: 14px; border-top: 1px solid var(--gridline); padding-top: 12px; }
+  .profiles-block .pb-label { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
+  .profile-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .profile-chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px;
+    font-size: 13px; color: var(--text-secondary);
+  }
+  .profile-chip .pc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .profile-chip.live { color: var(--text-primary); border-color: var(--baseline); }
+  .profile-chip.live .pc-dot { background: var(--good); }
+  .profile-chip .pc-tag { font-size: 11px; color: var(--text-muted); }
+  .profile-chip.active-default { font-weight: 600; }
   .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; }
   .legend .key { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
   .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
@@ -154,6 +189,15 @@
 
   <div id="content">
     <div class="grid tiles" id="tiles"></div>
+
+    <div class="card activity-card" id="activity-card">
+      <div class="card-head">
+        <h2>Gateway activity</h2>
+        <span class="busy-badge" id="busy-badge"></span>
+      </div>
+      <div class="activity-grid" id="activity-grid"></div>
+      <div class="profiles-block" id="profiles-block"></div>
+    </div>
 
     <div class="card chart-card">
       <div class="card-head">
@@ -708,6 +752,101 @@ function renderSessions(sessions) {
 }
 
 // ── Status line ─────────────────────────────────────────────────────
+// ── Gateway activity (agents busy, mode, active profiles) ───────────
+
+// What each gateway_mode value means, per hermes /api/status topology.
+const GATEWAY_MODE_INFO = {
+  multiplex: 'One gateway serving several profiles',
+  single:    'One gateway, one profile',
+  multiple:  'Independent gateway per profile',
+  none:      'No gateway process running',
+  unknown:   'Topology unavailable',
+};
+
+function actItem(label, value, opts = {}) {
+  return el('div', { class: 'act-item' },
+    el('div', { class: 'act-label', text: label }),
+    el('div', { class: 'act-value' + (opts.text ? ' text' : ''), title: opts.title || '' },
+      opts.node || document.createTextNode(value)),
+    opts.sub ? el('div', { class: 'act-sub', text: opts.sub }) : null);
+}
+
+function renderActivity(status, cron) {
+  const card = $('activity-card');
+  if (!status) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const running = status.gateway_running !== false;
+  const agents = Number(status.active_agents || 0);
+  const busy = !!status.gateway_busy || agents > 0;
+
+  // Busy badge
+  const badge = $('busy-badge');
+  badge.className = 'busy-badge' + (!running ? ' offline' : busy ? ' busy' : '');
+  badge.replaceChildren(
+    el('span', { class: 'dot' }),
+    el('span', { text: !running ? 'Gateway offline' : busy ? 'Busy' : 'Idle' }));
+
+  // Stat grid
+  const mode = String(status.gateway_mode || 'unknown');
+  const modeInfo = GATEWAY_MODE_INFO[mode] || GATEWAY_MODE_INFO.unknown;
+  const items = [
+    actItem('Active agents', fmtFull(agents),
+      { sub: 'in-flight gateway turns' }),
+    actItem('Active sessions', fmtFull(status.active_sessions || 0),
+      { sub: 'recently touched' }),
+  ];
+  if (cron) {
+    items.push(actItem('Cron jobs', fmtFull(cron.total), {
+      sub: [cron.running ? `${cron.running} running` : null,
+            cron.paused ? `${cron.paused} paused` : null]
+        .filter(Boolean).join(' · ') || 'none active',
+    }));
+  }
+  items.push(actItem('Gateway mode', null, {
+    text: true, title: modeInfo, sub: modeInfo,
+    node: el('span', { class: 'mode-word', text: mode }),
+  }));
+  $('activity-grid').replaceChildren(...items);
+
+  // Active profiles — chips, live gateways highlighted. `gateways[]` is only
+  // present on a loopback bind; behind the auth gate we still have names +
+  // mode, so fall back to marking liveness from mode when we can.
+  const block = $('profiles-block');
+  const names = Array.isArray(status.profiles) ? status.profiles : [];
+  const gateways = Array.isArray(status.gateways) ? status.gateways : [];
+  const liveByName = new Map();
+  for (const g of gateways) {
+    const served = Array.isArray(g.served_profiles) && g.served_profiles.length
+      ? g.served_profiles : [g.profile];
+    for (const p of served) liveByName.set(String(p), g);
+  }
+  const gatewaysKnown = gateways.length > 0;
+  const activeDefault = status.active_profile || status.active || null;
+
+  if (!names.length) { block.style.display = 'none'; return; }
+  block.style.display = '';
+  const label = gatewaysKnown
+    ? `Profiles — ${liveByName.size} with a live gateway`
+    : `Profiles — ${names.length} configured (live detail hidden behind the auth gate)`;
+  const chips = names.map((name) => {
+    const gw = liveByName.get(name);
+    const live = !!gw;
+    const ports = gw && gw.ports ? Object.values(gw.ports).filter(Boolean) : [];
+    return el('div', {
+      class: 'profile-chip' + (live ? ' live' : '') +
+        (name === activeDefault ? ' active-default' : ''),
+      title: live && ports.length ? `ports: ${ports.join(', ')}` : (live ? 'live gateway' : 'no live gateway'),
+    },
+      el('span', { class: 'pc-dot' }),
+      el('span', { text: name }),
+      live ? el('span', { class: 'pc-tag', text: 'live' }) : null);
+  });
+  block.replaceChildren(
+    el('div', { class: 'pb-label', text: label }),
+    el('div', { class: 'profile-chips' }, ...chips));
+}
+
 function renderStatus(status, model, meta) {
   const dot = $('status-dot'), text = $('status-text');
   if (!status && !model) {
@@ -744,6 +883,7 @@ async function refresh() {
           el('span', { text: ' to point this app at a remote dashboard and configure auth (v0.17+ dashboards behind the auth gate need a bearer token or session cookie).' })));
     }
     renderStatus(overview.status, overview.model, overview.meta);
+    renderActivity(overview.status, overview.cron);
     renderTiles(usage?.totals);
     renderChart(usage?.daily || []);
     renderModelChart(overview.model_daily || []);
