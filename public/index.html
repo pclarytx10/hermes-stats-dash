@@ -129,6 +129,10 @@
   .tab-btn:hover { color: var(--text-primary); }
   .tab-btn[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--text-primary); }
   [role="tabpanel"][hidden] { display: none; }
+  .attribution-note {
+    font-size: 12px; color: var(--text-muted); margin: 10px 0 0; line-height: 1.5;
+  }
+  .attribution-note strong { color: var(--text-secondary); font-weight: 600; }
 
   .filters { display: flex; gap: 8px; align-items: center; margin: 18px 0 16px; }
   .filters .label { color: var(--text-muted); font-size: 13px; margin-right: 4px; }
@@ -323,6 +327,12 @@
     <button class="tab-btn" id="tab-engine-btn" role="tab" type="button"
       aria-selected="false" aria-controls="tab-engine">Engine</button>
   </div>
+
+  <p class="attribution-note">
+    <strong>Usage</strong> counts what hermes sent through this endpoint, from hermes' own records.
+    <strong>Engine</strong> counts everything the endpoint processed, including any other client on the
+    network — hermes is one consumer among possibly several. Neither total is a subset of the other.
+  </p>
 
   <div id="tab-usage" role="tabpanel" aria-labelledby="tab-usage-btn">
     <div class="filters" role="group" aria-label="Date range">
@@ -2079,7 +2089,9 @@ function renderEngineBadge(health) {
   btn.hidden = false;
   btn.dataset.state = state;
   btn.replaceChildren(el('span', { class: 'dot' }), el('span', { text: visible }));
-  btn.setAttribute('aria-label', `llama.cpp @ ${host} — ${ariaTail} Click to open the Engine tab.`);
+  const fullText = `llama.cpp @ ${host} — ${ariaTail} Click to open the Engine tab.`;
+  btn.setAttribute('aria-label', fullText);
+  btn.title = fullText;
 }
 
 async function pollEngineBadge() {

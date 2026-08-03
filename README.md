@@ -10,11 +10,32 @@ simple-key auth and onto the `dashboard_auth` provider framework (OAuth /
 OIDC / password) in v0.17.
 
 What the desktop client doesn't cover is a lightweight, always-on view of
-usage stats — token counts over time, sessions, top models — the kind of
-thing you want open in a tab or on a second screen rather than tucked inside
-the full app. That gap is what this project fills: a small, standalone
-statistics dashboard, extracted from hermes-workspace's dashboard
-capability and trimmed to just the stats surface:
+**hermes' usage** — token counts over time, sessions, top models — or of
+**the llama.cpp engine underneath it** — live throughput, slot occupancy,
+whether requests are queueing. That gap is what this project fills: a small,
+standalone two-tab dashboard.
+
+- **Usage** — demand-side accounting from hermes' own rollups: what hermes
+  sent, extracted from hermes-workspace's dashboard capability and trimmed
+  to the stats surface.
+- **Engine** — supply-side telemetry read straight from a llama.cpp server's
+  `/metrics`, `/slots`, and `/props`, plus recorded history from a small
+  companion collector.
+
+**These are different populations, not two views of the same number.**
+llama.cpp sees every client on the endpoint, hermes included; hermes sees
+models Usage cannot, including ones not served by this llama.cpp instance at
+all. The dashboard says so explicitly (a one-line note above the tabs, and
+in the Engine header badge's wording) rather than implying one is a subset
+of the other — see [§1 of the design
+doc](docs/engine-telemetry-plan.md#1-project-statement) for the full
+reasoning.
+
+Zero runtime dependencies. Node ≥ 18.
+
+## What this shows
+
+### Usage tab
 
 - **Token counts over time** — stacked daily token columns, switchable
   between **By type** (input / output / reasoning, cache reads in the tooltip)
@@ -29,34 +50,83 @@ capability and trimmed to just the stats surface:
 - **Totals** — tokens, sessions, API calls, cost for the selected window
 - **Top models** — token volume, sessions, and API calls per model
 - **Recent sessions** — latest activity with model and token counts
-- **Setup page** (`/setup.html`) — point the app at a local or remote
-  hermes, test the connection/auth, and persist everything to
-  `~/.hermes-stats-dash/config.json` (mode `0600`)
-- **Light / dark toggle** — a sun/moon switch in the header; follows the OS
-  preference until you pick one, then remembers the choice (shared across
-  both pages, applied before first paint to avoid a flash)
 
-Zero runtime dependencies. Node ≥ 18.
+### Engine tab
+
+- **Live panel** — prefill and generation throughput (both a short live
+  reading off `/slots` progress and a settled on-completion figure from
+  `/metrics` counters), prompt-cache reuse, server state (idle / prefilling
+  / generating / queued), a per-slot table, and an endpoint + model identity
+  line (URL, model file, build, `n_ctx`)
+- **History panel** — a range picker (15m/1h/6h/24h/7d/all) over data the
+  collector has recorded, a canvas strip chart, a window summary (average
+  throughput, token volumes, mean busy slots, sample coverage), and a CSV
+  export. A server restart mid-window renders as a break, not a false spike;
+  a collector outage renders as a visible gap, not a silent zero
+- **Multi-engine** — an engine picker when more than one is configured;
+  switching discards in-memory state, since neither counters nor epochs are
+  comparable across endpoints
+- **Honest degradation** — llama.cpp builds vary: some `/slots` responses
+  omit prompt-token fields entirely, some report `next_token` as a
+  one-element array instead of an object. The server feature-detects both
+  per poll and the UI says so (e.g. "Unavailable: this build's `/slots` does
+  not report `n_prompt_tokens_cache`") rather than silently showing a zero
+
+### Engine health badge
+
+A small badge in the shared header, visible from the Usage tab, answering
+one question: *is the engine underneath currently a bottleneck?* It's keyed
+on `requests_deferred`, not slot occupancy — a fully-busy engine is normal
+(**Full**, amber); a *queueing* engine (**Queued**, red, shows the count) is
+the one state that actually explains a slow session. Other states: **Idle**,
+**Active**, **Not responding** (a `/metrics` timeout — itself weak evidence
+of load, reported as its own state), **Unreachable**, and **Stale** (no
+successful poll in 90s — shown rather than a confidently wrong old state).
+Hidden entirely with no engine configured. Wording never says "your
+requests" — it names the endpoint and notes load may include other clients.
+Clicking it opens the Engine tab.
+
+Zero collector dependency: the badge's route (`GET /api/engine/health`)
+reads only `llamaUrl`, so it works even with the collector not installed —
+only the History panel needs the collector.
+
+Both light and dark themes; the light/dark toggle is shared across both
+pages and both tabs.
 
 ## How it works
 
-`server.mjs` is a single-file port of hermes-workspace's server-side
-`dashboard-aggregator`: one `GET /api/overview?days=N` endpoint that fans out
-in parallel to the hermes-agent **dashboard service** (default
-`http://127.0.0.1:9119`):
+`server.mjs` is a single-file server: static file serving plus a handful of
+JSON API routes, all fanning out in parallel to upstreams and nulling a
+section on failure rather than failing the whole request.
 
-| Upstream endpoint | Feeds |
+### Usage routes
+
+| Route | Fans out to |
 |---|---|
-| `/api/analytics/usage?days=N&profile=P` | daily token chart, totals, top models — **one call per profile, merged** |
-| `/api/profiles/sessions?limit=500` | recent sessions card, per-model usage curves, active-session detection |
-| `/api/status` | status line, gateway activity (in-flight turns, mode, profiles) |
-| `/api/cron/jobs` | cron count in the gateway activity card |
-| `/api/model/info` | active model in the status line |
+| `GET /api/overview?days=N` | `/api/analytics/usage` (once per profile, merged), `/api/profiles/sessions`, `/api/status`, `/api/cron/jobs`, `/api/model/info` — see [Cross-profile aggregation](#cross-profile-aggregation) below |
+| `GET /api/settings` / `POST /api/settings` | reads/writes `~/.hermes-stats-dash/config.json` |
+| `POST /api/test` | probes a hermes dashboard URL + credentials, used by the Setup page |
 
-Each section is independent — a failed upstream call nulls that section and
-the UI hides the card, same as the workspace dashboard. `public/index.html`
-is the whole frontend (vanilla JS + SVG, light/dark via
-`prefers-color-scheme`).
+### Engine routes
+
+| Route | Behaviour |
+|---|---|
+| `GET /api/engine/live?engine=<id>` | Fans out to the engine's `/metrics`, `/slots`, `/props` in parallel. Parses the Prometheus text server-side (so the frontend never touches raw upstream shapes) and returns feature-detection flags (`hasPromptFields`, `nextTokenShape`) alongside the parsed data. Each of the three sections nulls independently on failure |
+| `GET /api/engine/history?engine=<id>&from=&to=&points=` | Validated, clamped proxy to the collector's `/history` |
+| `GET /api/engine/range?engine=<id>` | Proxy to the collector's `/range`, for the "all" range button |
+| `GET /api/engine/health?engine=<id>` | The badge's data source. `/metrics` only, 3s timeout, `total_slots` cached from `/props` for 5 minutes |
+| `GET /api/engines` | `[{id, label}, ...]` for the tab's engine picker |
+| `POST /api/engine/test` | Ad-hoc reachability probe for the Setup page's per-engine row (llama-server + collector, independent of saved config) |
+
+Every upstream call uses a short timeout (`UPSTREAM_TIMEOUT_MS`, 10s for
+Usage and the live/history/range engine routes; 3s for the health badge) so
+a stalled upstream degrades a section to null rather than hanging the
+request — `/metrics` and `/slots` are answered off llama-server's own task
+queue and can block for seconds under heavy decode.
+
+`public/index.html` is the whole frontend for both tabs (vanilla JS + SVG
+for the Usage charts, canvas for the Engine strip charts — 400+ columns is
+more than SVG wants to redraw every poll). No build step.
 
 ### Cross-profile aggregation
 
@@ -116,7 +186,8 @@ npm start          # serves http://127.0.0.1:8788
 ```
 
 With a hermes-agent dashboard running locally on the default port, that's
-it. For a remote or auth-gated hermes, open `/setup.html`.
+it for the Usage tab. For a remote or auth-gated hermes, or to configure an
+Engine tab, open `/setup.html`.
 
 No hermes handy? `node scripts/mock-hermes.mjs` fakes one on :9119
 (`node scripts/mock-hermes.mjs password` simulates a v0.17+ auth-gated
@@ -124,12 +195,15 @@ dashboard — credentials `admin` / `hermes`).
 
 ## Configuration
 
-Everything is configurable from the **Setup page** (`/setup.html`): remote
-URL, credentials, a **Test connection** button that reports reachability /
-auth mode / whether a credential was cached, and a way to forget cached
-tokens. Saved settings live in `~/.hermes-stats-dash/config.json`
-(owner-only `0600` — it can hold credentials) and take precedence over the
-environment:
+Everything is configurable from the **Setup page** (`/setup.html`), saved to
+`~/.hermes-stats-dash/config.json` (owner-only `0600` — it can hold hermes
+credentials; engine entries hold none).
+
+### Hermes connection (Usage tab)
+
+Remote URL, credentials, a **Test connection** button that reports
+reachability / auth mode / whether a credential was cached, and a way to
+forget cached tokens. Saved settings take precedence over the environment:
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -140,7 +214,158 @@ environment:
 | `HERMES_DASHBOARD_COOKIE` | – | Session cookie (v0.17+ interactive auth) |
 | `HERMES_DASHBOARD_USERNAME` / `_PASSWORD` | – | Password-provider login (v0.17+) |
 
-### Local vs. remote access
+### Engines (Engine tab)
+
+A **list** — the real deployment this was built for has two llama.cpp
+servers with different models, builds, and context sizes. Each entry:
+
+```json
+{
+  "engines": [
+    { "id": "nfcmini",   "label": "nfcmini · Qwen3.6-35B",
+      "llamaUrl": "http://127.0.0.1:8080",
+      "collectorUrl": "http://127.0.0.1:8081" },
+    { "id": "mini795s7", "label": "mini795s7 · Gemma-4-E4B",
+      "llamaUrl": "http://10.0.0.65:8080",
+      "collectorUrl": "http://10.0.0.65:8081" }
+  ]
+}
+```
+
+`llamaUrl` is required; `collectorUrl` is optional — without it the Engine
+tab's live panel and health badge still work, but the History panel shows an
+install prompt instead of a chart. The Setup page's **Engines** card lets
+you add/remove/edit rows and **Test connection** each one (reachability,
+whether `/metrics` is enabled, whether the collector answers) before saving.
+
+For a single-engine deployment with no saved config, these two env vars are
+an equivalent fallback:
+
+| Env var | Purpose |
+|---|---|
+| `LLAMA_SERVER_URL` | e.g. `http://127.0.0.1:8080` |
+| `LLAMA_COLLECTOR_URL` | e.g. `http://127.0.0.1:8081` (optional) |
+
+**Address choice for a remote engine:** prefer a LAN IP over mDNS
+(`*.local`) — mDNS resolution costs ~100ms per call, negligible for a human
+clicking a page but wasteful for something polled every few seconds.
+Tailscale would be preferable (authenticated, encrypted) if it works between
+the two hosts; if not, a plaintext LAN hop is what this dashboard assumes.
+
+## Engine tab prerequisite: the telemetry collector
+
+The Engine tab's **live** panel and the **health badge** need only
+`llamaUrl` — a llama.cpp server started with `--metrics` is enough. The
+**History** panel additionally needs a collector: a small, dependency-free
+Python process that polls `/metrics` and `/slots` on an interval, writes one
+row per poll to SQLite, and serves a read-only JSON API (`/range`,
+`/history`) that this dashboard proxies.
+
+A reference copy of the collector lives at [`docs/collect.py`](docs/collect.py)
+(see [`docs/engine-telemetry-plan.md`](docs/engine-telemetry-plan.md) for
+the full design rationale). It is **not** run by `server.mjs` — deploy it
+separately, once per llama.cpp host:
+
+```sh
+mkdir -p ~/llamacpp-telemetry
+cp docs/collect.py ~/llamacpp-telemetry/collect.py
+python3 ~/llamacpp-telemetry/collect.py \
+  --db ~/llamacpp-telemetry/telemetry.db \
+  --server http://127.0.0.1:8080 \
+  --interval 5 \
+  --port 8081
+```
+
+Stdlib only, no dependencies, works on any Python 3. In production, run it
+as a **systemd user unit** so it survives logout and restarts on crash:
+
+```ini
+# ~/.config/systemd/user/llamacpp-telemetry.service
+[Unit]
+Description=llama-server telemetry collector
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/llamacpp-telemetry/collect.py \
+  --db %h/llamacpp-telemetry/telemetry.db \
+  --server http://127.0.0.1:8080 \
+  --interval 5 \
+  --port 8081
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now llamacpp-telemetry.service
+loginctl enable-linger "$USER"   # keeps user units running after logout
+```
+
+### Collector bind address (`--bind`)
+
+This is a **per-collector deployment choice**, independent of anything this
+dashboard does. This dashboard reaches a collector through its own proxy
+regardless of the collector's bind address — a collector open to the LAN is
+still reachable through the proxy, it's just *also* directly reachable,
+which matters if anything besides this dashboard needs it:
+
+- **`--bind 0.0.0.0`** (default) — reachable from any host on the LAN.
+  Needed if a standalone telemetry page, another dashboard instance, or any
+  other direct client should be able to reach it.
+- **`--bind 127.0.0.1`** — reachable only from the same host. Appropriate
+  once this dashboard is the collector's only caller and it runs on the same
+  machine as the collector (the common case for the "local" engine in a
+  multi-engine setup — see the example config above, where the co-located
+  engine dials `127.0.0.1` and the remote one dials a LAN IP).
+
+The collector has **no authentication of its own**. `--bind 0.0.0.0` means
+anything on the LAN can read the recorded history; `127.0.0.1` avoids that
+at the cost of the flexibility above. Neither this dashboard nor
+`docs/collect.py` enforces one choice — pick per deployment.
+
+Verify a collector is up: `curl http://<collector-host>:8081/range` should
+return `{"from":..., "to":..., "rows":N, ...}`.
+
+## Running this dashboard as a service
+
+`npm start` is fine for trying it out, but it dies with the terminal
+session it started in. To keep it running:
+
+```ini
+# ~/.config/systemd/user/hermes-stats-dash.service
+[Unit]
+Description=hermes-stats-dash
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hermes-stats-dash
+ExecStart=/usr/bin/node %h/hermes-stats-dash/server.mjs --remote
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-stats-dash.service
+```
+
+Drop `--remote` from `ExecStart` (or change it to `--host <addr>`) to bind
+somewhere other than every interface — see [Local vs. remote
+access](#local-vs-remote-access) below.
+
+## Local vs. remote access
 
 By default the server binds **`127.0.0.1`** — reachable only from the same
 machine. To let other devices reach it, open the bind address:
@@ -158,7 +383,7 @@ Precedence: `--host` › `--remote`/`-r` › `HOST` › loopback default.
 > address it prints a warning — only expose it on a trusted network (a
 > Tailscale/VPN address, not `0.0.0.0` on a public interface).
 
-## Authentication — the v0.17 change
+## Authentication — the hermes v0.17 change
 
 hermes-agent **v0.17** replaced the dashboard's simple-key login with the
 `dashboard_auth` provider framework. This app supports both worlds, resolved
@@ -184,6 +409,11 @@ in this order:
    once on a 401 (the token rotates every dashboard restart). No
    configuration needed.
 
+This auth model applies to the Usage tab's hermes connection only. The
+Engine tab's llama.cpp and collector connections have no auth of their own
+(see [Collector bind address](#collector-bind-address---bind) above) —
+that is a property of the upstream, not something this app adds.
+
 ## Provenance
 
 - Aggregation pattern, endpoint list, and loopback token scrape:
@@ -193,3 +423,9 @@ in this order:
 - Upstream API shapes and auth model: `hermes-agent/hermes_cli/web_server.py`
   (`/api/analytics/usage`, `/api/sessions`) and
   `hermes-agent/hermes_cli/dashboard_auth/`
+- Engine tab: direct successor to a standalone `llamacpp-telemetry.html`
+  page (kept in service, unmodified, alongside this tab — see
+  [`docs/engine-telemetry-plan.md`](docs/engine-telemetry-plan.md) §1).
+  Live-rate math (slot-progress differencing, prompt-cache reuse tracking,
+  decode-counter fallback) and the collector (`docs/collect.py`) are ported
+  from that page and its companion service.
