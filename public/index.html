@@ -324,17 +324,28 @@
   <div class="tabs" role="tablist" aria-label="Dashboard sections">
     <button class="tab-btn" id="tab-usage-btn" role="tab" type="button"
       aria-selected="true" aria-controls="tab-usage">Usage</button>
+    <button class="tab-btn" id="tab-hermes-btn" role="tab" type="button"
+      aria-selected="false" aria-controls="tab-hermes">Hermes</button>
     <button class="tab-btn" id="tab-engine-btn" role="tab" type="button"
       aria-selected="false" aria-controls="tab-engine">Engine</button>
   </div>
 
-  <p class="attribution-note">
-    <strong>Usage</strong> counts what hermes sent through this endpoint, from hermes' own records.
-    <strong>Engine</strong> counts everything the endpoint processed, including any other client on the
-    network — hermes is one consumer among possibly several. Neither total is a subset of the other.
-  </p>
-
   <div id="tab-usage" role="tabpanel" aria-labelledby="tab-usage-btn">
+    <p class="attribution-note">
+      <strong>Usage</strong> reconciles the other two tabs into one picture. <strong>Hermes</strong>
+      counts what hermes did, from hermes' own records. <strong>Engine</strong> counts everything the
+      llama.cpp endpoint processed, including any other client on the network — hermes is one consumer
+      among possibly several. Neither total is a subset of the other, and the part they share is
+      counted once here: hermes' engine-hosted tokens are subtracted from the engine's total, so
+      <strong>Hermes + Engine · other clients = Total</strong>.
+    </p>
+
+    <div class="card" id="unified-placeholder" style="margin-top:14px">
+      <div class="empty">Unified reporting lands in a later phase of this branch.</div>
+    </div>
+  </div>
+
+  <div id="tab-hermes" role="tabpanel" aria-labelledby="tab-hermes-btn" hidden>
     <div class="filters" role="group" aria-label="Date range">
       <span class="label">Range</span>
       <button class="range-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
@@ -1354,20 +1365,39 @@ $('theme-toggle').addEventListener('click', () => {
 themeMq.addEventListener('change', () => { if (!storedTheme()) applyTheme(); });
 applyTheme();
 
-refresh();
-setInterval(refresh, 30_000);
+// The Hermes tab's recurring poll. Idempotent, so syncTabTimers() can call it
+// on every tab switch and visibility change without stacking intervals.
+let hermesPollTimer = null;
+const HERMES_POLL_MS = 30_000;
+function startHermesPoll() {
+  if (hermesPollTimer) return;
+  refresh(); // arriving on the tab, whatever is on screen may be minutes old
+  hermesPollTimer = setInterval(refresh, HERMES_POLL_MS);
+}
+function stopHermesPoll() {
+  if (hermesPollTimer) { clearInterval(hermesPollTimer); hermesPollTimer = null; }
+}
 
 // ── Tabs ────────────────────────────────────────────────────────────
-// Usage owns `days` and the date-range filter above; Engine has its own
-// time domain and poll cadence (added in later phases) — they are
-// deliberately not shared state.
-const TAB_IDS = ['usage', 'engine'];
+// Three views over two populations. Usage reconciles the other two into one
+// picture; Hermes owns `days` and the date-range filter; Engine has its own
+// time domain and poll cadence. None of that state is shared — each tab's
+// window means something different.
+const TAB_IDS = ['usage', 'hermes', 'engine'];
 let activeTab = 'usage';
+
+// One place decides which timers run: the visible tab's, and only while the
+// browser tab itself is in the foreground. An idle window must not poll
+// llama-server (or hermes) forever.
+function syncTabTimers() {
+  const live = !document.hidden;
+  if (live && activeTab === 'hermes') startHermesPoll(); else stopHermesPoll();
+  if (live && activeTab === 'engine') startEnginePoll(); else stopEnginePoll();
+}
 
 function setActiveTab(tab, opts) {
   opts = opts || {};
   if (!TAB_IDS.includes(tab)) tab = 'usage';
-  const changed = tab !== activeTab;
   activeTab = tab;
   for (const id of TAB_IDS) {
     $(`tab-${id}-btn`).setAttribute('aria-selected', String(id === tab));
@@ -1377,20 +1407,13 @@ function setActiveTab(tab, opts) {
     const hash = tab === 'usage' ? '' : `#${tab}`;
     if (location.hash !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
   }
-  if (changed) {
-    if (tab === 'engine') startEnginePoll(); else stopEnginePoll();
-  }
+  syncTabTimers();
 }
-$('tab-usage-btn').addEventListener('click', () => setActiveTab('usage'));
-$('tab-engine-btn').addEventListener('click', () => setActiveTab('engine'));
+TAB_IDS.forEach((id) =>
+  $(`tab-${id}-btn`).addEventListener('click', () => setActiveTab(id)));
 window.addEventListener('hashchange', () =>
   setActiveTab(location.hash.replace('#', ''), { skipHash: true }));
-// A tab switch stops the engine poll; a backgrounded browser tab should too,
-// so an idle window doesn't poll llama-server forever.
-document.addEventListener('visibilitychange', () => {
-  if (activeTab !== 'engine') return;
-  if (document.hidden) stopEnginePoll(); else startEnginePoll();
-});
+document.addEventListener('visibilitychange', syncTabTimers);
 
 // ── Engine tab ──────────────────────────────────────────────────────
 let engineList = [];
@@ -2010,7 +2033,7 @@ async function pollEngineLive() {
 }
 
 function startEnginePoll() {
-  stopEnginePoll();
+  if (enginePollTimer) return;
   if (!engineList.length) { loadEngineList(); return; }
   if (engineHistLoadedFor !== currentEngineId) {
     engineHistLoadedFor = currentEngineId;
@@ -2135,6 +2158,9 @@ document.addEventListener('visibilitychange', () => {
 
 loadEngineList();
 setActiveTab(location.hash.replace('#', '') || 'usage', { skipHash: true });
+// The header status line (model, platforms, auth mode) is fed by /api/overview,
+// which the Hermes tab's poll owns. Landing anywhere else still needs it once.
+if (activeTab !== 'hermes') refresh();
 </script>
 </body>
 </html>
