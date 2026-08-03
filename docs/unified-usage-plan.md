@@ -62,9 +62,12 @@ non-zero and is worth watching in its own right. It is labelled
 1. the model map attributes a hermes model to this engine that does not run
    there (fix the map);
 2. the collector has gaps in the window, so `E` is undercounted (coverage
-   strip shows this);
-3. the prefill denominator problem in §3 — the most likely cause, and the
-   reason the clamp exists at all.
+   strip shows this) — the most likely cause on a deployment whose collector
+   holds days of history against a 30- or 90-day window;
+3. a profile dropped out of the hermes fan-out, so `H_e` is wrong in the other
+   direction (reported as `hermes.complete: false`);
+4. the two denominators have drifted apart after an upgrade on either side —
+   see §3, which rests on a measurement rather than a contract.
 
 The UI raises a named reconciliation warning naming the most probable cause
 rather than silently showing zero.
@@ -76,37 +79,42 @@ rather than silently showing zero.
 | Lane | hermes counts | llama.cpp counts | Reconcilable |
 |---|---|---|---|
 | Generation / output | tokens the model produced | `tokens_predicted_total` | **Exactly** |
-| Prefill / input | the whole prompt it sent | `prompt_tokens_total` — only tokens it actually *prefilled* | **Approximately** |
+| Prefill / input | `input_tokens` — prompt tokens actually processed | `prompt_tokens_total` — tokens actually prefilled | **Yes, measured** |
 
-llama.cpp's internal KV-prefix reuse means a request whose prompt is 90% shared
-with the previous turn advances `prompt_tokens_total` by roughly the 10% it had
-to process. hermes, one layer up, counted the whole prompt as input. Same
-traffic, two honest numbers, ~10× apart on a cache-friendly workload.
+### What this section originally said, and why it was wrong
 
-**The correction applied:** hermes' prefill contribution is
-`input_tokens − cache_read_tokens`, which is the right correction in principle.
+The plan assumed hermes' `input_tokens` was a whole billed prompt, cache hits
+included, and that llama.cpp's KV-prefix reuse would leave the engine counting
+~10× less for identical traffic. The prescribed correction was
+`input_tokens − cache_read_tokens`.
 
-**Its known limitation:** hermes records `cache_read_tokens` from the provider's
-usage response. A `custom:` llama.cpp provider does not report cached prompt
-tokens in an OpenAI-compatible `usage` block, so this correction is expected to
-be a **no-op** for exactly the models it matters most for. The hermes prefill
-figure will therefore read high against the engine's for identical traffic.
+The live data refuted the premise on the first run of `/api/usage/unified`.
+Over a 7-day window this deployment reports **24.6M input tokens against 374.5M
+cache reads** — fifteen times larger. `cache_read_tokens` is a sibling field,
+not a component of `input_tokens`; hermes reports input already net of whatever
+the provider served from cache. Applying the planned correction clamps every
+prefill figure to zero and destroys the lane.
+
+**What is implemented instead: no correction at all.** Both sides already count
+tokens actually processed — hermes excludes what the provider served from
+cache, llama.cpp excludes what its prefix reuse skipped. They are on the same
+denominator by construction.
+
+A useful side effect: hermes evidently *does* receive cached-token accounting
+from this llama.cpp provider, which is what makes the two counters comparable.
 
 **Consequences for the UI:**
 
-- The generation lane is labelled **exact**; the prefill lane is labelled
-  **approximate** with the reason one click away.
-- The combined default view carries the approximation. It is still the most
-  useful default — the shape and the order of magnitude are right — but the tab
-  never claims precision it does not have.
-- A negative prefill residual is reported as the cache-accounting artefact it
-  probably is, not as a data error.
+- Both lanes are labelled exact. The tab reports measured agreement between
+  hermes' engine-attributed prefill and the collector's `prompt_tokens_total`
+  for the same window, so drift is visible rather than assumed away.
+- Cache reads remain on the tab as their own figure. On this deployment they
+  are the largest number in the system and saying nothing about them would be
+  the misleading choice.
 
-**Optional later fix (Phase 7):** `collect.py` can sum `n_prompt_tokens_cache`
-across slots per poll into a new column. That makes the engine's prefill
-comparable to hermes' billed input directly, for data recorded from that point
-forward. It requires a collector schema migration and redeploy on every host, so
-it is out of the v1 scope and does not block anything.
+**Phase 7 is no longer needed for correctness.** Recording
+`n_prompt_tokens_cache` in `collect.py` would let the tab show the engine's own
+cache-hit rate next to hermes' — a nice-to-have, not a fix.
 
 ---
 
@@ -128,8 +136,9 @@ Resolution, in order of authority:
    totals by construction.
 3. A day with no session rows falls back to the window-level mix and is flagged
    `estimated`.
-4. `cache_read_tokens` is only available per-day, not per-model, so the prefill
-   correction is apportioned by the same ratio.
+4. `cache_read_tokens` and `reasoning_tokens` exist only per-day, not
+   per-model, so they are apportioned between the two sides by the same ratio
+   and reported alongside the lanes rather than inside them.
 
 The session list is capped (`limit=500`), so on a 90-day window it may not reach
 the window start. The route reports `attribution_coverage` — oldest session
@@ -234,7 +243,8 @@ plausible model surfaces a dismissible hint on the Usage tab.
 - [ ] `by_model` split into `H_e` / `H_o` using the map. Authoritative totals.
 - [ ] Daily series apportioned from the session model mix, `estimated` flag per
       day, sums equal to the totals.
-- [ ] Prefill correction (`input − cache_read`) apportioned by the same ratio.
+- [ ] Prefill lane = `input_tokens` unmodified (see §3); `cache_read_tokens`
+      apportioned alongside it as its own reported figure.
 - [ ] `attribution_coverage` reported.
 
 **Acceptance:** with the engine side stubbed out, hermes totals on the unified
@@ -277,8 +287,9 @@ and the UI alone, which lane is exact and why the engine number shrank.
 
 ### Phase 7 — Optional, not in v1
 
-- [ ] `collect.py` records `n_prompt_tokens_cache`; prefill becomes exact for
-      data recorded after the migration.
+- [ ] `collect.py` records `n_prompt_tokens_cache`, so the engine's own
+      cache-hit rate can sit next to hermes'. No longer a correctness fix —
+      see §3.
 
 ---
 
@@ -300,7 +311,7 @@ and the UI alone, which lane is exact and why the engine number shrank.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Prefill lane read as exact | High — it is the default view | Lane labelled approximate at the point of display, reason one click away, generation lane marked exact |
+| Prefill denominators drift apart after a hermes or llama.cpp upgrade | Moderate — §3 rests on a measurement, not a contract | Tab reports measured hermes-vs-collector agreement for the window, so drift shows up as a widening gap instead of a silent error |
 | Model map drifts as models are renamed or moved | Moderate | Map is explicit and editable; unmapped-but-plausible models surface a hint rather than failing silently |
 | Session cap truncates the 90-day daily split | Certain at high volume | `attribution_coverage` reported and stated in the UI; window totals stay authoritative regardless |
 | 90-day collector scan is slow on the shared refresh cycle | Moderate | Closed days immutable and cached; only the current day re-fetches |
