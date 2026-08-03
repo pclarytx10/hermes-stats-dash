@@ -46,6 +46,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const PORT = Number(process.env.PORT || 8788)
 const UPSTREAM_TIMEOUT_MS = 10_000
+// /api/analytics/usage is a SQL aggregation over a whole profile's session DB
+// and gets slower the wider the window: on a large default profile a 90-day
+// call routinely passes 10s. It needs its own budget, because a dropped
+// profile is not a cosmetic gap — the unified tab subtracts hermes' tokens
+// from the engine's total, so an undercounted profile silently inflates the
+// "other clients" residual.
+const ANALYTICS_TIMEOUT_MS = 45_000
 
 // Bind host. Loopback-only by default so the stats server — which proxies
 // upstream credentials and has no auth of its own — isn't reachable off the
@@ -140,7 +147,27 @@ function sanitizeEngineEntry(e) {
     label: String(e.label || '').trim() || id,
     llamaUrl,
     collectorUrl: /^https?:\/\//.test(collectorUrl) ? collectorUrl : '',
+    // hermes model names served by this engine. Nothing is attributed to an
+    // engine without an explicit entry here — the suggester proposes, the
+    // operator decides. Deduped case-insensitively; order is not meaningful.
+    models: dedupeModels(e.models),
   }
+}
+
+function dedupeModels(raw) {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set()
+  const out = []
+  for (const m of raw) {
+    const name = String(m || '').trim()
+    if (!name || name.length > 200) continue
+    const k = name.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(name)
+    if (out.length >= 32) break
+  }
+  return out
 }
 
 function engines() {
@@ -317,17 +344,17 @@ function authMode() {
  * a fresh root-HTML scrape in loopback mode. Returns parsed JSON or null —
  * never throws.
  */
-async function dashJson(apiPath, { retried = false } = {}) {
+async function dashJson(apiPath, { retried = false, timeoutMs } = {}) {
   const base = dashboardUrl()
   try {
     const res = await fetch(`${base}${apiPath}`, {
       headers: { accept: 'application/json', ...(await authHeaders(base)) },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs ?? UPSTREAM_TIMEOUT_MS),
     })
     if (res.status === 401 && !staticToken() && !staticCookie() && !retried) {
       storeLoginCookie(base, '')
       if (!(staticUsername() && staticPassword())) storeSessionToken(base, '')
-      return dashJson(apiPath, { retried: true })
+      return dashJson(apiPath, { retried: true, timeoutMs })
     }
     if (!res.ok) {
       console.warn(`[upstream] ${apiPath} -> ${res.status}`)
@@ -487,6 +514,28 @@ function mergeUsage(usages, days) {
   return { daily, by_model, totals, period_days: days }
 }
 
+/**
+ * Fan out `/api/analytics/usage` across every profile in the status payload.
+ * Each hermes profile has its own session DB, and the endpoint is
+ * single-profile, so the whole-workspace picture is the sum. Returns the
+ * profile list alongside the per-profile payloads (index-aligned, null where a
+ * profile failed) — callers that only want the aggregate pass the payloads
+ * straight to mergeUsage().
+ */
+async function fetchProfileUsages(days, status) {
+  const profiles =
+    Array.isArray(status?.profiles) && status.profiles.length ? status.profiles : ['default']
+  const opts = { timeoutMs: ANALYTICS_TIMEOUT_MS }
+  const usages = await Promise.all(
+    profiles.length === 1 && profiles[0] === 'default'
+      ? [dashJson(`/api/analytics/usage?days=${days}`, opts)]
+      : profiles.map((p) =>
+          dashJson(`/api/analytics/usage?days=${days}&profile=${encodeURIComponent(p)}`, opts)),
+  )
+  const missing = profiles.filter((_, i) => !usages[i] || typeof usages[i] !== 'object')
+  return { profiles, usages, missing, complete: missing.length === 0 }
+}
+
 async function buildOverview(days) {
   // Phase 1: everything that doesn't depend on the profile list.
   const [status, model, cron, profileSessions] = await Promise.all([
@@ -499,14 +548,7 @@ async function buildOverview(days) {
 
   // Phase 2: fan out usage per profile and merge. Fall back to the default
   // (unscoped) call if the profile list is unavailable.
-  const profiles =
-    Array.isArray(status?.profiles) && status.profiles.length ? status.profiles : ['default']
-  const usages = await Promise.all(
-    profiles.length === 1 && profiles[0] === 'default'
-      ? [dashJson(`/api/analytics/usage?days=${days}`)]
-      : profiles.map((p) =>
-          dashJson(`/api/analytics/usage?days=${days}&profile=${encodeURIComponent(p)}`)),
-  )
+  const { profiles, usages } = await fetchProfileUsages(days, status)
   const usage = mergeUsage(usages, days)
   const profilesWithData = usages.filter((u) => u && typeof u === 'object').length
 
@@ -810,6 +852,827 @@ async function testEngine(body) {
   return out
 }
 
+// ── Model → engine attribution ──────────────────────────────────────
+//
+// The unified Usage tab has to know which hermes models ran on which engine,
+// because that overlap is the only part of the two token populations that
+// would otherwise be double-counted. hermes names a model however its provider
+// config says; llama-server reports a filesystem path. Nothing infers the link
+// at request time — an operator saves it once, helped by the suggester below.
+
+/**
+ * Reduce a model name to a comparison key: last path segment (hermes writes
+ * `provider/model`, llama.cpp writes an absolute path), no `.gguf`, no
+ * punctuation. "…/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" → "qwen3 6 35b a3b ud q4 k m".
+ */
+function modelKey(name) {
+  return String(name || '')
+    .split(/[\\/]/)
+    .pop()
+    .replace(/\.gguf$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+/**
+ * 0..1 similarity between two model keys. Exact match and containment are
+ * scored above token overlap so a quantisation or suffix difference ranks
+ * below a true match but still surfaces as a candidate.
+ */
+function modelMatchScore(a, b) {
+  const ka = modelKey(a)
+  const kb = modelKey(b)
+  if (!ka || !kb) return 0
+  if (ka === kb) return 1
+  if (ka.includes(kb) || kb.includes(ka)) return 0.8
+  const ta = new Set(ka.split(' '))
+  const tb = new Set(kb.split(' '))
+  let shared = 0
+  for (const t of ta) if (tb.has(t)) shared++
+  const union = ta.size + tb.size - shared
+  return union > 0 ? 0.7 * (shared / union) : 0
+}
+
+const MODEL_SUGGEST_FLOOR = 0.3
+
+/**
+ * Rank the hermes models this workspace has actually used against the model
+ * file a llama-server reports at /props. Takes URLs from the request body, not
+ * saved config, so Setup can suggest for an engine row before it is saved.
+ */
+async function suggestEngineModels(body) {
+  const llamaUrl = trimSlash(body.llamaUrl || '')
+  if (!/^https?:\/\//.test(llamaUrl)) {
+    return { error: 'URL must start with http:// or https://' }
+  }
+  const [{ props, error }, status] = await Promise.all([
+    fetchProps({ llamaUrl }, 5_000),
+    dashJson('/api/status'),
+  ])
+  if (error) return { error: `llama-server ${error}`, model_path: null, candidates: [] }
+  const modelPath = props?.model_path || null
+  if (!modelPath) {
+    return { error: 'this server does not report a model path at /props', model_path: null, candidates: [] }
+  }
+
+  // A wide window on purpose: a model that hasn't been used this month is
+  // exactly the one an operator forgets to map.
+  const { usages, missing } = await fetchProfileUsages(90, status)
+  const merged = mergeUsage(usages, 90)
+  const known = merged?.by_model || []
+  // A profile that failed took its models with it, so "no match" would be a
+  // lie about what hermes has run. Say which profiles are missing instead.
+  const partial = missing.length
+    ? `${missing.length} profile${missing.length === 1 ? '' : 's'} did not answer (${missing.join(', ')}) — ` +
+      'a model used only there will not appear below'
+    : null
+  if (!known.length) {
+    return {
+      model_path: modelPath,
+      candidates: [],
+      note: partial || 'hermes reported no model usage in the last 90 days to match against',
+    }
+  }
+
+  const candidates = known
+    .map((m) => ({
+      model: m.model || 'unknown',
+      score: Number(modelMatchScore(m.model, modelPath).toFixed(3)),
+      tokens: Number(m.input_tokens || 0) + Number(m.output_tokens || 0),
+    }))
+    .filter((c) => c.score >= MODEL_SUGGEST_FLOOR)
+    .sort((a, b) => b.score - a.score || b.tokens - a.tokens)
+    .slice(0, 5)
+
+  return { model_path: modelPath, candidates, note: partial }
+}
+
+/**
+ * model key → engine id, over every configured engine. A model mapped to two
+ * engines is kept on the first (config order): its tokens must be subtracted
+ * from exactly one engine's total or the reconciliation double-counts.
+ */
+function engineModelIndex() {
+  const index = new Map()
+  for (const e of engines()) {
+    for (const m of e.models || []) {
+      const k = modelKey(m)
+      if (k && !index.has(k)) index.set(k, e.id)
+    }
+  }
+  return index
+}
+
+// ── Unified usage: the hermes side ──────────────────────────────────
+//
+// See docs/unified-usage-plan.md §3–4. Two rules govern everything here:
+//
+//   1. Window totals are authoritative (hermes' own SQL rollups). The daily
+//      series is apportioned, then scaled so it sums to those totals — a chart
+//      that disagrees with the tile above it is worse than no chart.
+//   2. Both lanes count tokens actually processed. hermes' input_tokens is
+//      already net of cache reads (cache_read_tokens is a separate, much
+//      larger field) and llama.cpp's prompt_tokens_total is already net of KV
+//      prefix reuse — see finishSide() for the measurement that settled this.
+
+const COMPARATOR_DEFAULT = {
+  model: 'Gemini 3.5 Flash',
+  input_per_m: 1.5,
+  output_per_m: 9.0,
+  cached_input_per_m: 0.15,
+  source: 'https://ai.google.dev/gemini-api/docs/pricing',
+  verified: '2026-08',
+}
+
+function comparator() {
+  const c = config.comparator && typeof config.comparator === 'object' ? config.comparator : {}
+  const num = (v, def) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : def)
+  const custom =
+    c.model != null || c.input_per_m != null || c.output_per_m != null || c.cached_input_per_m != null
+  return {
+    model: String(c.model || '').trim() || COMPARATOR_DEFAULT.model,
+    input_per_m: num(c.input_per_m, COMPARATOR_DEFAULT.input_per_m),
+    output_per_m: num(c.output_per_m, COMPARATOR_DEFAULT.output_per_m),
+    cached_input_per_m: num(c.cached_input_per_m, COMPARATOR_DEFAULT.cached_input_per_m),
+    source: custom ? null : COMPARATOR_DEFAULT.source,
+    verified: custom ? null : COMPARATOR_DEFAULT.verified,
+    is_default: !custom,
+  }
+}
+
+// UTC day keys for the window, oldest first. UTC because the engine side is
+// built by folding epoch-stamped collector rows into days, and the two series
+// have to line up index-for-index.
+function windowDays(days) {
+  const now = new Date()
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  const out = []
+  for (let i = days - 1; i >= 0; i--) {
+    out.push(new Date(end - i * 86400_000).toISOString().slice(0, 10))
+  }
+  return out
+}
+
+// A hermes model name that looks like a local weights file but is mapped to no
+// engine. Not proof of anything — it drives a "you may want to map this" hint,
+// never an attribution.
+function looksLocallyHosted(name) {
+  const n = String(name || '')
+  return /\.gguf$/i.test(n) || /\bq[2-8][_-]?k?(_[a-z]+)?\b/i.test(n)
+}
+
+const emptySide = () => ({ input: 0, output: 0, reasoning: 0, cache_read: 0, cost: 0 })
+
+function finishSide(s) {
+  // Prefill is input_tokens as hermes reports it, with no cache correction.
+  //
+  // The plan's §3 assumed hermes' input_tokens was a full billed prompt that
+  // had to have cache reads subtracted to reach llama.cpp's denominator. The
+  // live data says otherwise: over 7 days this deployment reports 24.6M input
+  // against 374.5M cache reads — 15× larger, so cache_read_tokens is plainly a
+  // sibling field, not a component of input. Subtracting it clamps every
+  // prefill figure to zero and destroys the lane.
+  //
+  // Both sides therefore already count "tokens actually processed": hermes
+  // excludes what its provider served from cache, llama.cpp excludes what its
+  // KV prefix reuse skipped. Same denominator, no correction. Phase 4 checks
+  // that empirically against the collector's own prompt_tokens counter.
+  const prefill = s.input
+  const generation = s.output + s.reasoning
+  return {
+    input: Math.round(s.input),
+    output: Math.round(s.output),
+    reasoning: Math.round(s.reasoning),
+    cache_read: Math.round(s.cache_read),
+    prefill: Math.round(prefill),
+    generation: Math.round(generation),
+    tokens: Math.round(prefill + generation),
+    cost: Number(s.cost.toFixed(4)),
+  }
+}
+
+/**
+ * Split hermes' usage into engine-hosted and everything else.
+ *
+ * `usage` is the merged multi-profile rollup; `sessions` is the cross-profile
+ * session list, used only to derive the per-day mix between the two sides —
+ * the daily rollup has no model dimension and by_model has no day dimension,
+ * so neither alone can produce a split daily series.
+ */
+function buildHermesSide(days, usage, sessions) {
+  const index = engineModelIndex()
+  const dayList = windowDays(days)
+
+  // 1. Authoritative window split, from by_model.
+  const engTot = emptySide()
+  const othTot = emptySide()
+  const byEngine = new Map()
+  const unmapped = []
+  for (const m of usage?.by_model || []) {
+    const name = m.model || 'unknown'
+    const input = Number(m.input_tokens || 0)
+    const output = Number(m.output_tokens || 0)
+    const engineId = index.get(modelKey(name))
+    const target = engineId ? engTot : othTot
+    target.input += input
+    target.output += output
+    target.cost += Number(m.estimated_cost || 0)
+    if (engineId) {
+      const cur = byEngine.get(engineId) || { engine_id: engineId, input: 0, output: 0, models: [] }
+      cur.input += input
+      cur.output += output
+      cur.models.push(name)
+      byEngine.set(engineId, cur)
+    } else if (looksLocallyHosted(name) && input + output > 0) {
+      unmapped.push({ model: name, tokens: input + output })
+    }
+  }
+  // by_model fixes the *ratio* between the two sides; hermes' `totals` block
+  // fixes the *magnitude*. They are separately computed upstream and disagree
+  // by ~1% on this deployment — and `totals` is what the Hermes tab's hero
+  // tile shows, so anchoring to it keeps the two tabs from contradicting each
+  // other over the same window. Falls back to by_model if totals is absent.
+  const shareOf = (a, b) => (a + b > 0 ? a / (a + b) : 0)
+  const shareIn = shareOf(engTot.input, othTot.input)
+  const shareOut = shareOf(engTot.output, othTot.output)
+  const T = usage?.totals || {}
+  const totalIn = Number(T.total_input || 0) || engTot.input + othTot.input
+  const totalOut = Number(T.total_output || 0) || engTot.output + othTot.output
+  const authEngineIn = totalIn * shareIn
+  const authOtherIn = totalIn * (1 - shareIn)
+  const authEngineOut = totalOut * shareOut
+  const authOtherOut = totalOut * (1 - shareOut)
+  const grand = totalIn + totalOut
+  const windowShare = grand > 0 ? (authEngineIn + authEngineOut) / grand : 0
+
+  // Per-engine rows ride the same anchoring, so they sum to the engine side.
+  const scaleIn = engTot.input > 0 ? authEngineIn / engTot.input : 0
+  const scaleOut = engTot.output > 0 ? authEngineOut / engTot.output : 0
+
+  // 2. Per-day mix, from session-level model attribution.
+  const mix = new Map()
+  for (const r of aggregateModelDaily(sessions, days)) {
+    const cur = mix.get(r.day) || { engine: 0, other: 0 }
+    if (index.has(modelKey(r.model))) cur.engine += r.tokens
+    else cur.other += r.tokens
+    mix.set(r.day, cur)
+  }
+
+  // 3. Apportion the authoritative daily rollup by that mix.
+  const src = new Map((usage?.daily || []).map((r) => [r.day, r]))
+  const rows = dayList.map((day) => {
+    const d = src.get(day) || {}
+    const m = mix.get(day)
+    const mTotal = m ? m.engine + m.other : 0
+    const share = mTotal > 0 ? m.engine / mTotal : windowShare
+    const input = Number(d.input_tokens || 0)
+    const output = Number(d.output_tokens || 0)
+    const reasoning = Number(d.reasoning_tokens || 0)
+    const cache = Number(d.cache_read_tokens || 0)
+    return {
+      day,
+      // No session rows for this day: the split is the window's, not the
+      // day's. Flagged so the UI can mark it rather than imply it was measured.
+      estimated: !(mTotal > 0),
+      engine: { input: input * share, output: output * share,
+        reasoning: reasoning * share, cache_read: cache * share },
+      other: { input: input * (1 - share), output: output * (1 - share),
+        reasoning: reasoning * (1 - share), cache_read: cache * (1 - share) },
+    }
+  })
+
+  // 4. Scale the apportioned series onto the authoritative totals, so the
+  //    chart and the tiles cannot disagree. Factors sit near 1 — they correct
+  //    misattribution between the two sides, not magnitude.
+  const sum = (side, field) => rows.reduce((a, r) => a + r[side][field], 0)
+  const factor = (side, field, target) => {
+    const have = sum(side, field)
+    return have > 0 ? target / have : 0
+  }
+  const scales = {
+    engine: { input: factor('engine', 'input', authEngineIn), output: factor('engine', 'output', authEngineOut) },
+    other: { input: factor('other', 'input', authOtherIn), output: factor('other', 'output', authOtherOut) },
+  }
+  for (const r of rows) {
+    for (const side of ['engine', 'other']) {
+      r[side].input *= scales[side].input
+      r[side].output *= scales[side].output
+    }
+  }
+
+  // 5. Totals come back out of the scaled rows, so one number feeds both.
+  const acc = { engine: emptySide(), other: emptySide() }
+  for (const r of rows) {
+    for (const side of ['engine', 'other']) {
+      acc[side].input += r[side].input
+      acc[side].output += r[side].output
+      acc[side].reasoning += r[side].reasoning
+      acc[side].cache_read += r[side].cache_read
+    }
+  }
+  acc.engine.cost = engTot.cost
+  acc.other.cost = othTot.cost
+
+  const daily = rows.map((r) => ({
+    day: r.day,
+    estimated: r.estimated,
+    engine: finishSide({ ...r.engine, cost: 0 }),
+    other: finishSide({ ...r.other, cost: 0 }),
+  }))
+
+  const engineTotals = finishSide(acc.engine)
+  const cmp = comparator()
+  const avoided =
+    (engineTotals.input / 1e6) * cmp.input_per_m + (engineTotals.output / 1e6) * cmp.output_per_m
+
+  return {
+    days: dayList,
+    daily,
+    totals: { engine: engineTotals, other: finishSide(acc.other) },
+    by_engine: [...byEngine.values()].map((e) => ({
+      ...e,
+      input: Math.round(e.input * scaleIn),
+      output: Math.round(e.output * scaleOut),
+      tokens: Math.round(e.input * scaleIn + e.output * scaleOut),
+    })),
+    unmapped_local_models: unmapped.sort((a, b) => b.tokens - a.tokens).slice(0, 8),
+    cost_avoided: { amount: Number(avoided.toFixed(2)), comparator: cmp },
+  }
+}
+
+/**
+ * How far back the session list actually reaches. The per-day split is derived
+ * from it, so a window wider than the list is a window whose early days are
+ * split by the window-level ratio — which the UI has to say out loud.
+ */
+function attributionCoverage(sessions, days, limit) {
+  const rows = Array.isArray(sessions) ? sessions : sessions?.sessions
+  if (!Array.isArray(rows)) return { available: false }
+  let oldest = null
+  for (const s of rows) {
+    const t = Number(s.started_at || s.created_at || 0)
+    if (t > 0 && (oldest === null || t < oldest)) oldest = t
+  }
+  const windowStart = Date.now() / 1000 - days * 86400
+  return {
+    available: true,
+    sessions_seen: rows.length,
+    capped: rows.length >= limit,
+    oldest_session: oldest,
+    covers_window: oldest !== null && oldest <= windowStart,
+    covered_days: oldest === null ? 0 : Math.min(days, Math.ceil((Date.now() / 1000 - oldest) / 86400)),
+  }
+}
+
+// ── Unified usage: the engine side ──────────────────────────────────
+//
+// Daily token totals per engine, differenced out of the collector's monotonic
+// counters. Deliberately different from the Engine tab's history panel, which
+// renders *rates* and therefore drops any pair spanning a restart: totals want
+// the tokens, so a restart is counted and flagged rather than discarded.
+
+const DAY_MS = 86400_000
+const dayStartSec = (day) => Date.parse(`${day}T00:00:00Z`) / 1000
+const dayOf = (sec) => new Date(sec * 1000).toISOString().slice(0, 10)
+const shiftDay = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10)
+
+// Closed UTC days can never change, so they are computed once per engine and
+// kept. Only the current day is recomputed on each request.
+const engineDayCache = new Map() // engine id -> Map(day -> row)
+const ENGINE_DAY_CACHE_MAX = 400
+
+// Keyed on the collector URL as well as the engine id: repointing an engine at
+// a different collector in Setup makes every cached day meaningless.
+function cacheForEngine(engine) {
+  const key = `${engine.id} ${engine.collectorUrl}`
+  let m = engineDayCache.get(key)
+  if (!m) { m = new Map(); engineDayCache.set(key, m) }
+  return m
+}
+
+const emptyDay = (day) => ({
+  day, prefill: 0, generation: 0, buckets: 0, missing_buckets: 0, restarts: 0,
+  metrics: false, partial: false,
+})
+
+/**
+ * One engine's per-day tokens over `dayList`, plus what the collector actually
+ * has. Returns { available, error, daily: Map(day -> row), range }.
+ */
+async function engineDailyTokens(engine, dayList) {
+  if (!engine.collectorUrl) {
+    return { available: false, error: 'no collector configured', daily: new Map(), range: null }
+  }
+  const rangeRes = await proxyCollectorJson(engine, '/range')
+  if (rangeRes.status !== 200) {
+    return { available: false, error: rangeRes.body?.error || 'collector unavailable', daily: new Map(), range: null }
+  }
+  const range = rangeRes.body || {}
+  const cache = cacheForEngine(engine)
+  const today = dayList[dayList.length - 1]
+
+  // Today always recomputes; closed days come from cache when present. Days
+  // the collector demonstrably predates are settled as uncovered without a
+  // query — that is most of a 90-day window on a young collector.
+  const firstSample = Number(range.from || 0)
+  const firstRecordedDay = firstSample > 0 ? dayOf(firstSample) : null
+  const needed = dayList.filter(
+    (d) => d === today || (!cache.has(d) && (!firstRecordedDay || d >= firstRecordedDay)),
+  )
+  if (!needed.length) {
+    return { available: true, error: null, range, daily: pickCached(cache, dayList) }
+  }
+
+  // Query starts one day early: the delta for the first needed day needs the
+  // counter value as it stood at that day's midnight, which is the last bucket
+  // of the day before.
+  const anchorDay = shiftDay(needed[0], -1)
+  const from = dayStartSec(anchorDay)
+  const to = dayStartSec(today) + 86400
+  const wantPoints = Math.round((to - from) / 3600) // hourly, so buckets land on UTC hours
+  const points = Math.min(4000, Math.max(10, wantPoints))
+  const res = await proxyCollectorJson(engine, '/history', `from=${from}&to=${to}&points=${points}`)
+  if (res.status !== 200) {
+    return { available: false, error: res.body?.error || 'collector history failed', daily: new Map(), range }
+  }
+  const hist = res.body || {}
+  const C = {}
+  ;(hist.cols || []).forEach((name, i) => { C[name] = i })
+  const rows = Array.isArray(hist.rows) ? hist.rows : []
+  const haveMetrics = !!hist.metrics
+
+  const out = new Map()
+  const touch = (day) => {
+    if (!out.has(day)) out.set(day, emptyDay(day))
+    return out.get(day)
+  }
+  let prev = null
+  for (const r of rows) {
+    const ts = Number(r[C.ts])
+    if (!Number.isFinite(ts)) continue
+    const day = dayOf(ts)
+    const bucket = touch(day)
+    bucket.buckets++
+    // MAX() over a bucket of ok=0 rows yields NULL — the collector was down,
+    // so this bucket anchors nothing. Never treat it as a zero reading.
+    const prompt = r[C.prompt_tokens]
+    const predicted = r[C.predicted_tokens]
+    const slotGen = Number(r[C.gen_delta] || 0)
+    if (prompt === null && predicted === null) {
+      bucket.missing_buckets++
+      if (slotGen > 0) bucket.generation += slotGen // slots still recorded progress
+      continue
+    }
+    const epoch = Number(r[C.epoch] || 0)
+    const promptV = Number(prompt || 0)
+    const predictedV = Number(predicted || 0)
+    if (prev && prev.epoch === epoch) {
+      bucket.prefill += Math.max(0, promptV - prev.prompt)
+      bucket.generation += haveMetrics ? Math.max(0, predictedV - prev.predicted) : slotGen
+      prev = { epoch, prompt: promptV, predicted: predictedV }
+    } else if (prev) {
+      // llama-server restarted inside this bucket, and the bucket's counters
+      // are MAX() over rows from *both* epochs — so the reported value is
+      // normally the pre-restart peak, not a post-restart total. Differencing
+      // it recovers the pre-restart tail; the post-restart volume is hidden
+      // under that MAX, so re-anchor at zero and let the next bucket's
+      // cumulative reading account for everything since the restart.
+      bucket.restarts++
+      bucket.partial = true
+      bucket.prefill += Math.max(0, promptV - prev.prompt)
+      // gen_delta is a per-sample sum rather than a counter, so it survives a
+      // restart intact — prefer it here even when metrics are available.
+      bucket.generation += slotGen || Math.max(0, predictedV - prev.predicted)
+      prev = { epoch, prompt: 0, predicted: 0 }
+    } else {
+      // First reading of the query window: an anchor, not a measurement.
+      prev = { epoch, prompt: promptV, predicted: predictedV }
+    }
+    bucket.metrics = bucket.metrics || haveMetrics
+  }
+
+  // A day the collector only partly witnessed is not a day with less traffic,
+  // and must not be compared against a full day of hermes. Flag the day the
+  // recording started, and any day with buckets the collector missed.
+  const firstTs = Number(range.from || 0)
+  for (const [day, row] of out) {
+    if (row.missing_buckets > 0) row.partial = true
+    if (firstTs > 0 && firstTs > dayStartSec(day) && firstTs < dayStartSec(day) + 86400) {
+      row.partial = true
+      row.starts_mid_day = true
+    }
+  }
+
+  // The anchor day is incomplete by construction — its first bucket was spent
+  // establishing the baseline, so that hour's delta (and any restart inside
+  // it) is not in `out`. It must never be cached or returned: doing so
+  // overwrote a correct cached day with a partial recompute on every
+  // subsequent request, quietly eroding history the longer the server ran.
+  const usable = (day) => day !== anchorDay
+  for (const [day, row] of out) {
+    if (usable(day) && day !== today && dayList.includes(day)) cache.set(day, row)
+  }
+  while (cache.size > ENGINE_DAY_CACHE_MAX) cache.delete(cache.keys().next().value)
+
+  const daily = pickCached(cache, dayList)
+  for (const day of dayList) if (usable(day) && out.has(day)) daily.set(day, out.get(day))
+  return { available: true, error: null, range, daily }
+}
+
+function pickCached(cache, dayList) {
+  const m = new Map()
+  for (const d of dayList) if (cache.has(d)) m.set(d, cache.get(d))
+  return m
+}
+
+/**
+ * Every configured engine's daily tokens, summed. Counts sum across engines
+ * even though the Engine tab's rates deliberately do not — see
+ * docs/unified-usage-plan.md §4.
+ */
+async function buildEngineSide(dayList) {
+  const list = engines()
+  if (!list.length) {
+    return { available: false, reason: 'no_engines', daily: [], totals: null, by_engine: [], coverage: null }
+  }
+  const results = await Promise.all(list.map((e) => engineDailyTokens(e, dayList)))
+
+  const summed = new Map(dayList.map((d) => [d, { ...emptyDay(d), covered: false }]))
+  const byEngine = []
+  let anyAvailable = false
+  let firstSample = null
+
+  list.forEach((engine, i) => {
+    const r = results[i]
+    let prefill = 0
+    let generation = 0
+    let coveredDays = 0
+    for (const day of dayList) {
+      const row = r.daily.get(day)
+      if (!row) continue
+      prefill += row.prefill
+      generation += row.generation
+      coveredDays++
+      const agg = summed.get(day)
+      agg.prefill += row.prefill
+      agg.generation += row.generation
+      agg.missing_buckets += row.missing_buckets
+      agg.restarts += row.restarts
+      agg.covered = true
+      // Partial for any engine is partial for the sum: the day is not a
+      // like-for-like comparison against a full day of hermes.
+      agg.partial = agg.partial || row.partial
+    }
+    if (r.available) {
+      anyAvailable = true
+      const f = Number(r.range?.from || 0)
+      if (f > 0 && (firstSample === null || f < firstSample)) firstSample = f
+    }
+    byEngine.push({
+      id: engine.id,
+      label: engine.label,
+      available: r.available,
+      error: r.error,
+      has_collector: !!engine.collectorUrl,
+      mapped_models: (engine.models || []).length,
+      metrics: r.range ? !!r.range.metrics : null,
+      totals: { prefill: Math.round(prefill), generation: Math.round(generation),
+        tokens: Math.round(prefill + generation) },
+      coverage: {
+        days_covered: coveredDays,
+        first_sample: r.range?.from ?? null,
+        last_sample: r.range?.to ?? null,
+        ok_ratio: r.range?.rows ? Number((r.range.ok_rows / r.range.rows).toFixed(4)) : null,
+      },
+    })
+  })
+
+  const daily = dayList.map((d) => {
+    const r = summed.get(d)
+    return {
+      day: d,
+      covered: r.covered,
+      partial: r.partial,
+      prefill: Math.round(r.prefill),
+      generation: Math.round(r.generation),
+      tokens: Math.round(r.prefill + r.generation),
+      missing_buckets: r.missing_buckets,
+      restarts: r.restarts,
+    }
+  })
+  const totals = daily.reduce(
+    (a, r) => ({ prefill: a.prefill + r.prefill, generation: a.generation + r.generation,
+      tokens: a.tokens + r.tokens }),
+    { prefill: 0, generation: 0, tokens: 0 },
+  )
+  const coveredDays = daily.filter((r) => r.covered).length
+
+  return {
+    available: anyAvailable,
+    reason: anyAvailable ? null : 'no_collector_data',
+    daily,
+    totals,
+    by_engine: byEngine,
+    coverage: {
+      days_covered: coveredDays,
+      days_total: dayList.length,
+      complete: coveredDays === dayList.length,
+      first_sample: firstSample,
+      restarts: daily.reduce((a, r) => a + r.restarts, 0),
+    },
+  }
+}
+
+// ── Unified usage: the reconciliation ───────────────────────────────
+
+const LANES = ['prefill', 'generation', 'combined']
+
+function laneValue(side, lane) {
+  if (lane === 'prefill') return side.prefill
+  if (lane === 'generation') return side.generation
+  return side.prefill + side.generation
+}
+
+/**
+ * hermes + engine → one set of numbers, per lane and per day.
+ *
+ * `engine_other` is the residual after removing hermes' own engine-hosted
+ * traffic from what the endpoint processed: real traffic from other clients on
+ * the network, not an error term. It clamps at zero, and every clamp is
+ * reported with the most probable cause rather than silently flattened.
+ */
+function reconcile(hermes, engineSide, dayList) {
+  const hByDay = new Map(hermes.daily.map((r) => [r.day, r]))
+  const eByDay = new Map((engineSide.daily || []).map((r) => [r.day, r]))
+  let clampedDays = 0
+  let clampedTokens = 0
+  let clampedPartialDays = 0
+
+  const rows = dayList.map((day) => {
+    const h = hByDay.get(day) || { engine: emptySide(), other: emptySide(), estimated: false }
+    const e = eByDay.get(day)
+    const covered = !!e?.covered
+    const partial = !!e?.partial
+    const row = { day, covered, partial, estimated: !!h.estimated, restarts: e?.restarts || 0 }
+    for (const lane of LANES) {
+      const hermesEngine = laneValue(h.engine, lane)
+      const hermesOther = laneValue(h.other, lane)
+      const engineTotal = covered ? laneValue(e, lane) : 0
+      const residual = engineTotal - hermesEngine
+      if (covered && lane === 'combined' && residual < 0) {
+        clampedDays++
+        clampedTokens += -residual
+        if (partial) clampedPartialDays++
+      }
+      const engineOther = Math.max(0, residual)
+      row[lane] = {
+        hermes_engine: Math.round(hermesEngine),
+        hermes_other: Math.round(hermesOther),
+        engine_other: Math.round(engineOther),
+        engine_total: Math.round(engineTotal),
+        total: Math.round(hermesEngine + hermesOther + engineOther),
+      }
+    }
+    return row
+  })
+
+  const totals = {}
+  for (const lane of LANES) {
+    totals[lane] = rows.reduce(
+      (a, r) => ({
+        hermes_engine: a.hermes_engine + r[lane].hermes_engine,
+        hermes_other: a.hermes_other + r[lane].hermes_other,
+        engine_other: a.engine_other + r[lane].engine_other,
+        engine_total: a.engine_total + r[lane].engine_total,
+        total: a.total + r[lane].total,
+      }),
+      { hermes_engine: 0, hermes_other: 0, engine_other: 0, engine_total: 0, total: 0 },
+    )
+  }
+
+  // hermes' share of what the endpoint did, over the covered days only —
+  // comparing a 30-day hermes figure with 3 days of engine data would be
+  // arithmetic on two different windows.
+  const coveredEngineTotal = totals.combined.engine_total
+  const coveredHermesEngine = rows
+    .filter((r) => r.covered)
+    .reduce((a, r) => a + r.combined.hermes_engine, 0)
+  const hermesShare = coveredEngineTotal > 0
+    ? Number((coveredHermesEngine / coveredEngineTotal).toFixed(4))
+    : null
+
+  return {
+    daily: rows,
+    totals,
+    hermes_share_of_engine: hermesShare,
+    clamped: {
+      days: clampedDays,
+      partial_days: clampedPartialDays,
+      tokens: Math.round(clampedTokens),
+    },
+  }
+}
+
+function reconciliationWarnings(hermes, engineSide, reconciled, dayList) {
+  const w = []
+  const push = (code, severity, message) => w.push({ code, severity, message })
+
+  if (!hermes.complete) {
+    push('hermes_incomplete', 'warn',
+      `${hermes.profiles_missing.length} hermes profile(s) did not answer (${hermes.profiles_missing.join(', ')}). ` +
+      "hermes' side is undercounted, which inflates the engine's other-clients residual.")
+  }
+  if (!engineSide.available) {
+    push('no_engine_data', 'info',
+      engineSide.reason === 'no_engines'
+        ? 'No engine is configured, so this window shows hermes only. Add one in Setup.'
+        : 'No collector answered, so this window shows hermes only. The Engine tab needs a collector for history.')
+  } else if (!engineSide.coverage.complete) {
+    const c = engineSide.coverage
+    push('engine_coverage_partial', 'warn',
+      `Engine data covers ${c.days_covered} of ${c.days_total} days. ` +
+      'Days without it show hermes only, and the total is hermes for the full window plus other-client traffic for the recorded days.')
+  }
+  if (reconciled.clamped.days > 0) {
+    const c = reconciled.clamped
+    const over = Math.round(c.tokens).toLocaleString('en-US')
+    // A clamp on a day the collector only half-watched is expected arithmetic,
+    // not a symptom. Saying so is the difference between a useful warning and
+    // one people learn to ignore.
+    const explained = c.partial_days === c.days
+      ? 'All of those days are ones the collector only partly recorded, which is the expected cause.'
+      : c.partial_days > 0
+        ? `${c.partial_days} of them are days the collector only partly recorded; the rest are not explained by coverage — check the model map.`
+        : 'None of those days has a coverage gap, so the model map may attribute a model to an engine it does not run on.'
+    push('residual_clamped', c.partial_days === c.days ? 'info' : 'warn',
+      `On ${c.days} day(s) hermes reported more engine-hosted tokens than the engine recorded (${over} over). ${explained}`)
+  }
+  if (hermes.unmapped_local_models.length) {
+    push('unmapped_local_models', 'info',
+      `${hermes.unmapped_local_models.length} model(s) look locally hosted but are mapped to no engine ` +
+      `(${hermes.unmapped_local_models.map((m) => m.model).join(', ')}). Their tokens count as hermes-only.`)
+  }
+  const cov = hermes.attribution_coverage
+  if (cov?.available && cov.capped && !cov.covers_window) {
+    push('attribution_capped', 'info',
+      `The session sample reaches back ${cov.covered_days} of ${dayList.length} days, so earlier days are split ` +
+      "by the window's overall model mix rather than their own.")
+  }
+  const engineNoCollector = engineSide.by_engine?.filter((e) => !e.has_collector) || []
+  if (engineNoCollector.length) {
+    push('engine_without_collector', 'info',
+      `${engineNoCollector.map((e) => e.label).join(', ')} has no collector URL, so its traffic is absent from the total.`)
+  }
+  const engineUnmapped = engineSide.by_engine?.filter((e) => e.has_collector && !e.mapped_models) || []
+  if (engineUnmapped.length) {
+    push('engine_without_models', 'warn',
+      `${engineUnmapped.map((e) => e.label).join(', ')} has no hermes models mapped, so all of its traffic ` +
+      'is attributed to other clients. Map its models in Setup.')
+  }
+  return w
+}
+
+async function buildUnifiedUsage(days) {
+  const status = await dashJson('/api/status')
+  // Wider than the overview's sample: this list is what splits the daily
+  // series between the two sides, so its reach bounds the split's accuracy.
+  const sessionLimit = Math.min(2000, Math.max(500, days * 25))
+  const [{ usages, profiles, missing }, sessions] = await Promise.all([
+    fetchProfileUsages(days, status),
+    dashJson(`/api/profiles/sessions?limit=${sessionLimit}&order=recent`),
+  ])
+  const usage = mergeUsage(usages, days)
+  const built = buildHermesSide(days, usage, sessions)
+  const hermes = {
+    ...built,
+    // A dropped profile understates hermes and inflates the residual, so
+    // this is a correctness flag for the reconciliation, not a status line.
+    complete: missing.length === 0,
+    profiles_total: profiles.length,
+    profiles_missing: missing,
+    attribution_coverage: attributionCoverage(sessions, days, sessionLimit),
+  }
+
+  const dayList = built.days
+  const engineSide = await buildEngineSide(dayList)
+  const reconciled = reconcile(hermes, engineSide, dayList)
+
+  return {
+    hermes,
+    engine: engineSide,
+    reconciled,
+    warnings: reconciliationWarnings(hermes, engineSide, reconciled, dayList),
+    meta: {
+      days,
+      dashboard_url: dashboardUrl(),
+      engines_configured: engines().length,
+      engines_mapped: engines().filter((e) => (e.models || []).length).length,
+      generated_at: new Date().toISOString(),
+    },
+  }
+}
+
 // ── Settings & connection test ──────────────────────────────────────
 
 function sanitizedSettings() {
@@ -828,6 +1691,7 @@ function sanitizedSettings() {
     auth_mode: authMode(),
     config_file: CONFIG_FILE,
     engines: engines(),
+    comparator: comparator(),
   }
 }
 
@@ -881,6 +1745,25 @@ function applySettings(body) {
       next.push(e)
     }
     config.engines = next
+  }
+  if (body.resetComparator) {
+    delete config.comparator
+  } else if (body.comparator && typeof body.comparator === 'object') {
+    const c = body.comparator
+    const rate = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null)
+    const model = String(c.model || '').trim()
+    const input = rate(c.input_per_m)
+    const output = rate(c.output_per_m)
+    if (!model) return { error: 'Comparator needs a model name' }
+    if (input === null || output === null) {
+      return { error: 'Comparator input and output rates must be numbers ≥ 0' }
+    }
+    config.comparator = {
+      model,
+      input_per_m: input,
+      output_per_m: output,
+      cached_input_per_m: rate(c.cached_input_per_m) ?? 0,
+    }
   }
   writeConfig(config)
   return { settings: sanitizedSettings() }
@@ -1087,6 +1970,11 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, await buildOverview(days), true)
       return
     }
+    if (req.method === 'GET' && url.pathname === '/api/usage/unified') {
+      const days = clampInt(url.searchParams.get('days'), { def: 30, min: 1, max: 365 })
+      sendJson(res, 200, await buildUnifiedUsage(days), true)
+      return
+    }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
       sendJson(res, 200, sanitizedSettings())
       return
@@ -1136,6 +2024,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/engine/test') {
       sendJson(res, 200, await testEngine(await readJsonBody(req)))
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/engine/model-suggest') {
+      const result = await suggestEngineModels(await readJsonBody(req))
+      sendJson(res, result.error && !result.model_path ? 400 : 200, result)
       return
     }
   } catch (err) {
