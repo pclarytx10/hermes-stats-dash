@@ -124,6 +124,24 @@
   .save-note { font-size: 13px; margin-left: 4px; align-self: center; }
   .save-note.ok { color: var(--good-text); }
   .save-note.fail { color: var(--critical); }
+
+  .engine-row {
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px;
+  }
+  .engine-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .engine-row-head .idx { font-size: 12px; color: var(--text-muted); font-weight: 600; }
+  .engine-row .row2 { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; margin-bottom: 8px; }
+  @media (max-width: 520px) { .engine-row .row2 { grid-template-columns: 1fr; } }
+  .engine-row .field { margin-bottom: 0; }
+  .engine-row .field label { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
+  .engine-row .field input { width: 100%; padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--baseline); background: var(--page); color: var(--text-primary); font: inherit; }
+  .engine-row .field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  .remove-btn { border: none; background: none; color: var(--text-muted); cursor: pointer; font-size: 13px; padding: 2px 4px; }
+  .remove-btn:hover { color: var(--critical); }
+  .engine-test-btn { font-size: 12px; padding: 5px 10px; }
+  .engine-result { margin-top: 8px; font-size: 12px; }
+  .engine-result .result-row { padding: 3px 0; border-bottom: none; }
 </style>
 </head>
 <body>
@@ -194,6 +212,20 @@
   </div>
 
   <div class="card">
+    <h2>Engines (llama.cpp)</h2>
+    <div class="hint" style="margin-bottom:12px">
+      Telemetry sources for the Engine tab — each is a llama-server, plus
+      optionally its telemetry collector. Neither URL holds credentials.
+    </div>
+    <div id="engine-rows"></div>
+    <button class="link-btn" id="add-engine-btn" type="button">+ Add engine</button>
+    <div class="actions" style="margin-top:14px">
+      <button id="engines-save-btn" class="primary">Save engines</button>
+      <span class="save-note" id="engines-save-note"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Current state</h2>
     <div class="state-line" id="state-line">Loading…</div>
     <div style="margin-top:8px">
@@ -247,7 +279,128 @@ async function loadSettings() {
     el('div', { class: 'hint', text: `Saved to ${settings.config_file}` }));
   $('forget-btn').hidden =
     !settings.has_cached_session_token && !settings.has_cached_login_cookie;
+
+  if (!enginesLoaded) {
+    enginesLoaded = true;
+    loadEngines(settings.engines);
+  }
 }
+
+// ── Engines (llama.cpp) ──────────────────────────────────────────────
+let enginesLoaded = false;
+let engineRowSeq = 0;
+
+function resultRow(state, label, detail) {
+  const icon = state === 'ok' ? '✓' : state === 'fail' ? '✗' : '·';
+  return el('div', { class: 'result-row' },
+    el('span', { class: `result-icon ${state}`, text: icon }),
+    el('span', { class: 'result-label', text: label }),
+    detail ? el('span', { class: 'result-detail', text: detail }) : null);
+}
+
+function newEngineRow(e) {
+  e = e || { id: '', label: '', llamaUrl: '', collectorUrl: '' };
+  const rid = 'er' + (engineRowSeq++);
+  const idIn = el('input', { type: 'text', id: `${rid}-id`, value: e.id || '',
+    placeholder: 'nfcmini', spellcheck: 'false' });
+  const labelIn = el('input', { type: 'text', id: `${rid}-label`, value: e.label || '',
+    placeholder: 'nfcmini · Qwen3.6-35B', spellcheck: 'false' });
+  const llamaIn = el('input', { type: 'url', id: `${rid}-llama`, value: e.llamaUrl || '',
+    placeholder: 'http://127.0.0.1:8080', spellcheck: 'false' });
+  const collectorIn = el('input', { type: 'url', id: `${rid}-collector`, value: e.collectorUrl || '',
+    placeholder: 'http://127.0.0.1:8081 (optional)', spellcheck: 'false' });
+  const resultDiv = el('div', { class: 'engine-result' });
+  const testBtn = el('button', { type: 'button', class: 'engine-test-btn', text: 'Test connection' });
+  const removeBtn = el('button', { type: 'button', class: 'remove-btn',
+    'aria-label': 'Remove engine', text: '✕ Remove' });
+
+  const row = el('div', { class: 'engine-row', 'data-row': rid },
+    el('div', { class: 'engine-row-head' },
+      el('span', { class: 'idx', text: 'Engine' }),
+      removeBtn),
+    el('div', { class: 'row2' },
+      el('div', { class: 'field' }, el('label', { for: `${rid}-id`, text: 'ID' }), idIn),
+      el('div', { class: 'field' }, el('label', { for: `${rid}-label`, text: 'Label' }), labelIn)),
+    el('div', { class: 'row2' },
+      el('div', { class: 'field' },
+        el('label', { for: `${rid}-llama`, text: 'llama-server URL' }), llamaIn),
+      el('div', { class: 'field' },
+        el('label', { for: `${rid}-collector`, text: 'Collector URL (optional)' }), collectorIn)),
+    el('div', { style: 'margin-top:8px' }, testBtn),
+    resultDiv);
+
+  removeBtn.addEventListener('click', () => row.remove());
+  testBtn.addEventListener('click', async () => {
+    testBtn.disabled = true; testBtn.textContent = 'Testing…';
+    try {
+      const res = await fetch('/api/engine/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ llamaUrl: llamaIn.value.trim(), collectorUrl: collectorIn.value.trim() }),
+      });
+      const r = await res.json();
+      const rows = [resultRow(r.llama.ok ? 'ok' : 'fail', 'llama-server',
+        [r.llama.error, r.llama.detail,
+          r.llama.ok ? (r.llama.metrics_enabled === false ? 'metrics disabled' : 'metrics enabled') : null,
+          r.llama.latency_ms != null ? `${r.llama.latency_ms} ms` : null]
+          .filter(Boolean).join(' · '))];
+      if (r.collector) {
+        rows.push(resultRow(r.collector.ok ? 'ok' : 'fail', 'Collector',
+          [r.collector.error, r.collector.ok && r.collector.rows != null ? `${r.collector.rows} rows recorded` : null,
+            r.collector.latency_ms != null ? `${r.collector.latency_ms} ms` : null]
+            .filter(Boolean).join(' · ')));
+      }
+      resultDiv.replaceChildren(...rows);
+    } catch (err) {
+      resultDiv.replaceChildren(resultRow('fail', 'Test failed', String(err?.message || err)));
+    } finally {
+      testBtn.disabled = false; testBtn.textContent = 'Test connection';
+    }
+  });
+
+  $('engine-rows').appendChild(row);
+}
+
+function loadEngines(list) {
+  $('engine-rows').replaceChildren();
+  (list || []).forEach((e) => newEngineRow(e));
+}
+
+$('add-engine-btn').addEventListener('click', () => newEngineRow());
+
+$('engines-save-btn').addEventListener('click', async () => {
+  const btn = $('engines-save-btn');
+  btn.disabled = true;
+  const note = $('engines-save-note');
+  note.textContent = '';
+  const engineList = [...document.querySelectorAll('#engine-rows .engine-row')].map((r) => {
+    const rid = r.dataset.row;
+    return {
+      id: $(`${rid}-id`).value.trim(),
+      label: $(`${rid}-label`).value.trim(),
+      llamaUrl: $(`${rid}-llama`).value.trim(),
+      collectorUrl: $(`${rid}-collector`).value.trim(),
+    };
+  });
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ engines: engineList }),
+    });
+    const r = await res.json();
+    if (r.error) {
+      note.className = 'save-note fail'; note.textContent = r.error;
+    } else {
+      note.className = 'save-note ok'; note.textContent = 'Saved';
+      loadEngines(r.settings.engines);
+    }
+  } catch (err) {
+    note.className = 'save-note fail'; note.textContent = String(err?.message || err);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 function formBody() {
   return {
@@ -260,14 +413,6 @@ function formBody() {
     clearCookie: $('clear-cookie').checked,
     clearPassword: $('clear-password').checked,
   };
-}
-
-function resultRow(state, label, detail) {
-  const icon = state === 'ok' ? '✓' : state === 'fail' ? '✗' : '·';
-  return el('div', { class: 'result-row' },
-    el('span', { class: `result-icon ${state}`, text: icon }),
-    el('span', { class: 'result-label', text: label }),
-    detail ? el('span', { class: 'result-detail', text: detail }) : null);
 }
 
 $('test-btn').addEventListener('click', async () => {

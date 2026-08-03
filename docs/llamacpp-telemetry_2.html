@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llama-server telemetry</title>
+<style>
+  :root{
+    --ground:#0E1A1F; --panel:#15252B; --panel-2:#1A2E35; --rule:#24404A;
+    --ink:#DEEAEE; --ink-dim:#7C9AA4; --ink-faint:#4E6C76;
+    --prefill:#E8913C; --gen:#63C8E8; --alert:#E4605F; --ok:#7FD69B; --think:#B48CE0;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:15px;
+       line-height:1.55;-webkit-font-smoothing:antialiased;padding:0 0 64px}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 20px}
+
+  .eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:lowercase;
+           color:var(--ink-faint);margin:0 0 6px}
+
+  header{border-bottom:1px solid var(--rule);position:sticky;top:0;z-index:5;
+         backdrop-filter:blur(8px);background-color:rgba(14,26,31,.88)}
+  .bar{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;padding:16px 0 14px}
+  .brand{margin-right:auto}
+  .brand h1{font-family:var(--mono);font-size:15px;font-weight:600;letter-spacing:-.01em;margin:0}
+  .brand p{margin:2px 0 0;font-size:12px;color:var(--ink-dim)}
+
+  .field{display:flex;flex-direction:column;gap:5px}
+  .field label{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--ink-faint);text-transform:lowercase}
+  input[type=text],input[type=number],select{font-family:var(--mono);font-size:13px;background:var(--panel);
+    color:var(--ink);border:1px solid var(--rule);border-radius:3px;padding:7px 9px}
+  select{cursor:pointer;min-width:210px}
+  select:focus-visible{outline:2px solid var(--gen);outline-offset:2px}
+  input[type=text]{min-width:246px}
+  input[type=number]{width:78px}
+  input:focus-visible,button:focus-visible{outline:2px solid var(--gen);outline-offset:2px}
+  button{font-family:var(--mono);font-size:12px;letter-spacing:.06em;background:var(--panel-2);
+    color:var(--ink);border:1px solid var(--rule);border-radius:3px;padding:8px 14px;cursor:pointer}
+  button:hover{border-color:var(--ink-faint)}
+  button.primary{background:var(--gen);color:#06181E;border-color:var(--gen);font-weight:600}
+  button.primary:hover{filter:brightness(1.08)}
+
+  .lamp{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;
+        color:var(--ink-dim);padding-bottom:8px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ink-faint);flex:none}
+  .dot.live{background:var(--ok);box-shadow:0 0 0 3px rgba(127,214,155,.16)}
+  .dot.err{background:var(--alert);box-shadow:0 0 0 3px rgba(228,96,95,.16)}
+  .dot.demo{background:var(--prefill);box-shadow:0 0 0 3px rgba(232,145,60,.16)}
+
+  .msg{border:1px solid var(--rule);border-left:3px solid var(--alert);background:var(--panel);
+       border-radius:3px;padding:14px 16px;margin:20px 0 0;font-size:13.5px}
+  .msg strong{font-family:var(--mono);font-size:12px;letter-spacing:.04em;display:block;
+              margin-bottom:5px;color:var(--alert)}
+  .msg code{font-family:var(--mono);font-size:12px;background:var(--panel-2);padding:1px 5px;
+            border-radius:2px;color:var(--ink)}
+  .msg[hidden]{display:none}
+
+  .strip{margin:26px 0 0;border:1px solid var(--rule);border-radius:4px;background:var(--panel);overflow:hidden}
+  .strip-head{display:flex;flex-wrap:wrap;gap:20px;align-items:baseline;padding:14px 18px;
+              border-bottom:1px solid var(--rule)}
+  .legend{display:flex;gap:18px;margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
+  .legend span{display:flex;align-items:center;gap:7px}
+  .swatch{width:10px;height:3px;border-radius:1px;display:inline-block}
+  canvas{display:block;width:100%;height:270px}
+  .strip-foot{display:flex;justify-content:space-between;gap:16px;padding:9px 18px;
+    border-top:1px solid var(--rule);font-family:var(--mono);font-size:10.5px;
+    color:var(--ink-faint);letter-spacing:.04em}
+
+  .grid{display:grid;gap:14px;margin-top:14px}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+
+  .cell{border:1px solid var(--rule);border-radius:4px;background:var(--panel);padding:14px 16px 15px}
+  .cell .val{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.025em;
+             font-size:clamp(26px,3.2vw,34px);line-height:1.05;font-weight:500}
+  .cell .unit{font-size:12px;color:var(--ink-dim);letter-spacing:0;margin-left:5px;font-weight:400}
+  .cell .sub{font-size:11.5px;color:var(--ink-dim);margin-top:7px;line-height:1.45}
+  .cell.pre .val{color:var(--prefill)}
+  .cell.gen .val{color:var(--gen)}
+
+  section{margin-top:30px}
+  h2{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.16em;text-transform:lowercase;
+     color:var(--ink-dim);margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px}
+  th{text-align:left;font-weight:500;font-size:10px;letter-spacing:.14em;color:var(--ink-faint);
+     text-transform:lowercase;padding:0 10px 8px 0;border-bottom:1px solid var(--rule)}
+  td{padding:8px 10px 8px 0;border-bottom:1px solid rgba(36,64,74,.5);color:var(--ink);vertical-align:middle}
+  td.n,th.n{text-align:right;padding-right:0}
+  td.n{font-variant-numeric:tabular-nums}
+  td.dim{color:var(--ink-dim)}
+  tr.idle td{color:var(--ink-faint)}
+
+  .tag{font-size:10px;letter-spacing:.08em;padding:2px 6px;border-radius:2px;background:var(--panel-2);
+       border:1px solid var(--rule);color:var(--ink-faint);white-space:nowrap}
+  .tag.gen{color:var(--gen);border-color:rgba(99,200,232,.45)}
+  .tag.pre{color:var(--prefill);border-color:rgba(232,145,60,.45)}
+
+  .bar-track{height:4px;background:var(--panel-2);border-radius:2px;overflow:hidden;min-width:70px}
+  .bar-fill{height:100%;border-radius:2px}
+
+  .ranges{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-top:14px}
+  .rangebtns{display:flex;gap:6px;flex-wrap:wrap;margin-right:auto}
+  .rangebtns button{padding:8px 12px}
+  .rangebtns button.on{background:var(--gen);color:#06181E;border-color:var(--gen);font-weight:600}
+
+  .empty{color:var(--ink-faint);font-family:var(--mono);font-size:12px;padding:22px 0;text-align:center}
+  .note{font-size:13px;color:var(--ink-dim);line-height:1.6;border-left:2px solid var(--rule);
+        padding-left:14px;margin:14px 0 0}
+  .note code{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .note strong{color:var(--ink);font-weight:600}
+  .actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+
+  @media (max-width:900px){
+    .g4{grid-template-columns:repeat(2,1fr)}
+    .g2{grid-template-columns:1fr}
+    canvas{height:210px}
+    input[type=text]{min-width:180px}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap bar">
+    <div class="brand">
+      <h1>llama-server telemetry</h1>
+      <p id="ident">Live token flow read from slot state. Counters only settle when a request ends.</p>
+    </div>
+    <div class="field">
+      <label for="srv">endpoint</label>
+      <select id="srv"></select>
+    </div>
+    <div class="field">
+      <label for="url">server</label>
+      <input type="text" id="url" value="http://nfcmini.local:8080" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="iv">poll (s)</label>
+      <input type="number" id="iv" value="2" min="1" max="60" step="1">
+    </div>
+    <button id="go" class="primary">Start polling</button>
+    <button id="demo">Demo data</button>
+    <div class="lamp"><span class="dot" id="dot"></span><span id="status">idle</span></div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="msg" id="msg" hidden></div>
+
+  <div class="strip">
+    <div class="strip-head">
+      <div>
+        <p class="eyebrow">token flow per interval</p>
+        <div id="srcNote" style="font-family:var(--mono);font-size:13px;color:var(--ink-dim)">
+          measured from slot progress, so a long stream shows up while it runs
+        </div>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--prefill)"></i>prefill
+          <b id="lgPre" style="font-family:var(--mono);color:var(--prefill);font-weight:500">—</b></span>
+        <span><i class="swatch" style="background:var(--gen)"></i>generation
+          <b id="lgGen" style="font-family:var(--mono);color:var(--gen);font-weight:500">—</b></span>
+      </div>
+    </div>
+    <canvas id="strip"></canvas>
+    <div class="strip-foot">
+      <span id="footL">no samples yet</span>
+      <span>prefill above the line · generation below · each column is one poll</span>
+    </div>
+  </div>
+
+  <div class="grid g4">
+    <div class="cell pre">
+      <p class="eyebrow">prefill · now</p>
+      <div class="val" id="preLive">—<span class="unit">tok/s</span></div>
+      <div class="sub" id="preSettled">on completion —</div>
+    </div>
+    <div class="cell gen">
+      <p class="eyebrow">generation · now</p>
+      <div class="val" id="genLive">—<span class="unit">tok/s</span></div>
+      <div class="sub" id="genSettled">on completion —</div>
+    </div>
+    <div class="cell">
+      <p class="eyebrow">prompt cache reuse</p>
+      <div class="val" id="cache">—<span class="unit">%</span></div>
+      <div class="sub" id="cacheSub">Share of prompt tokens served from cache instead of reprocessed.</div>
+    </div>
+    <div class="cell">
+      <p class="eyebrow">server state</p>
+      <div class="val" id="state" style="font-size:clamp(19px,2.2vw,24px)">—</div>
+      <div class="sub" id="stateSub">—</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>history</h2>
+    <div class="strip">
+      <div class="strip-head">
+        <div>
+          <p class="eyebrow">recorded throughput</p>
+          <div id="histNote" style="font-family:var(--mono);font-size:13px;color:var(--ink-dim)">
+            no window loaded — pick a range below
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="swatch" style="background:var(--prefill)"></i>prefill
+            <b id="hlgPre" style="font-family:var(--mono);color:var(--prefill);font-weight:500">—</b></span>
+          <span><i class="swatch" style="background:var(--gen)"></i>generation
+            <b id="hlgGen" style="font-family:var(--mono);color:var(--gen);font-weight:500">—</b></span>
+        </div>
+      </div>
+      <canvas id="hstrip"></canvas>
+      <div class="strip-foot">
+        <span id="histFoot">—</span>
+        <span id="histSpan">prefill above the line · generation below</span>
+      </div>
+    </div>
+
+    <div class="ranges">
+      <div class="field">
+        <label for="hurl">collector</label>
+        <input type="text" id="hurl" value="http://nfcmini.local:8081" spellcheck="false">
+      </div>
+      <div class="rangebtns">
+        <button data-span="900">15m</button>
+        <button data-span="3600">1h</button>
+        <button data-span="21600">6h</button>
+        <button data-span="86400">24h</button>
+        <button data-span="604800">7d</button>
+        <button data-span="all">all</button>
+      </div>
+      <button id="hcsv">Export window as CSV</button>
+    </div>
+
+    <div class="grid g4" style="margin-top:14px">
+      <div class="cell pre">
+        <p class="eyebrow">prefill · window avg</p>
+        <div class="val" id="hPre">—<span class="unit">tok/s</span></div>
+        <div class="sub" id="hPreSub">Prompt tokens divided by prompt compute seconds.</div>
+      </div>
+      <div class="cell gen">
+        <p class="eyebrow">generation · window avg</p>
+        <div class="val" id="hGen">—<span class="unit">tok/s</span></div>
+        <div class="sub" id="hGenSub">Generated tokens divided by generation compute seconds.</div>
+      </div>
+      <div class="cell">
+        <p class="eyebrow">tokens in window</p>
+        <div class="val" id="hTok">—</div>
+        <div class="sub" id="hTokSub">Differenced from the counters across the window.</div>
+      </div>
+      <div class="cell">
+        <p class="eyebrow">utilisation</p>
+        <div class="val" id="hBusy">—<span class="unit">slots</span></div>
+        <div class="sub" id="hBusySub">Mean busy slots, and how much of the window was actually recorded.</div>
+      </div>
+    </div>
+    <p class="note">
+      <strong>Where this comes from.</strong>
+      A collector on the server samples <code>/metrics</code> and <code>/slots</code> every 5s into SQLite and
+      serves this window back. Because the counters are monotonic, any two samples difference into
+      exact throughput for the span between them, so long windows stay accurate however coarsely they
+      are bucketed. Generation is measured from slot progress per bucket; prefill is differenced from
+      the prompt counters. Breaks in the line are server restarts, and a red tick marks a bucket where
+      the server was unreachable.
+    </p>
+  </section>
+
+  <section>
+    <h2>workload shape</h2>
+    <div class="grid g4">
+      <div class="cell">
+        <p class="eyebrow">prompt : generated</p>
+        <div class="val" id="ratio">—</div>
+        <div class="sub">Lifetime. High values mean prefill-dominated work.</div>
+      </div>
+      <div class="cell">
+        <p class="eyebrow">context high-water</p>
+        <div class="val" id="ctxMax">—<span class="unit">tok</span></div>
+        <div class="sub" id="ctxPct">slot window unknown</div>
+      </div>
+      <div class="cell">
+        <p class="eyebrow">busy slots per decode</p>
+        <div class="val" id="busy">—</div>
+        <div class="sub">Batching efficiency. Near 1.0 means one request at a time.</div>
+      </div>
+      <div class="cell">
+        <p class="eyebrow">requests seen</p>
+        <div class="val" id="reqs">—</div>
+        <div class="sub">Counted from slot task IDs. Requests shorter than one poll are missed.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>slots</h2>
+    <div id="slotsBox"><p class="empty">Not connected.</p></div>
+    <p class="note">
+      <strong>Why the counters looked idle.</strong>
+      The server commits <code>tokens_predicted_total</code> and its timing only when a slot releases,
+      at the end of a request. A reasoning model can decode for a long time before that happens, so the
+      counters sit flat for the whole stream and then jump at once. Thinking tokens are ordinary decoded
+      tokens, so they are included in that jump. The live figures above come from each slot's
+      <code>n_decoded</code> and <code>n_prompt_tokens_processed</code>, which move token by token.
+    </p>
+  </section>
+
+  <section>
+    <h2>raw counters</h2>
+    <div class="grid g2">
+      <table>
+        <thead><tr><th>counter</th><th class="n">value</th><th class="n">Δ last poll</th></tr></thead>
+        <tbody id="rawA"><tr><td class="dim" colspan="3">—</td></tr></tbody>
+      </table>
+      <table>
+        <thead><tr><th>server gauge</th><th class="n">reported</th><th class="n">meaning</th></tr></thead>
+        <tbody id="rawB"><tr><td class="dim" colspan="3">—</td></tr></tbody>
+      </table>
+    </div>
+    <p class="note">
+      <strong>The gauges are shown but never used.</strong>
+      <code>prompt_tokens_seconds</code> and <code>predicted_tokens_seconds</code> divide lifetime tokens by
+      lifetime compute seconds, and nothing resets that accumulator, so both settle into an all-time average.
+      The "on completion" figures on this page come from differencing the counters between polls, which gives
+      per-request speed as each request lands.
+    </p>
+    <div class="actions">
+      <button id="csv">Export samples as CSV</button>
+      <button id="clear">Clear history</button>
+    </div>
+  </section>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var $ = function(id){ return document.getElementById(id); };
+
+  var COUNTERS = [
+    ["prompt_tokens_total","prompt tokens"],
+    ["prompt_seconds_total","prompt seconds"],
+    ["tokens_predicted_total","generated tokens"],
+    ["tokens_predicted_seconds_total","generation seconds"],
+    ["n_decode_total","llama_decode() calls"],
+    ["n_tokens_max","largest context seen"]
+  ];
+  var GAUGES = [
+    ["prompt_tokens_seconds","lifetime average"],
+    ["predicted_tokens_seconds","lifetime average"],
+    ["requests_processing","live"],
+    ["requests_deferred","live"],
+    ["n_busy_slots_per_decode","lifetime average"]
+  ];
+
+  var MAXCOLS = 160;
+  var samples = [], deltas = [];
+  var slotPrev = {};            // slot id -> {task, decoded, processed}
+  var taskPrompt = {};          // task id -> {cache, total}
+  var taskOrder = [];
+  var reqCount = 0;
+  var timer = null, mode = "idle", nCtx = 0, demoState = null;
+  var slotsErr = null, liveSource = "none";
+  var slotsSeen = false, promptFieldsSeen = false;
+
+  // Some builds report next_token as a one-element array, others as a bare object.
+  function nextTok(s){
+    var nt = s.next_token;
+    if (Array.isArray(nt)) nt = nt.length ? nt[0] : null;
+    return (nt && typeof nt === "object") ? nt : {};
+  }
+  function hasNum(v){ return typeof v === "number" && isFinite(v); }
+
+  function parseProm(text){
+    var out = {}, lines = text.split("\n");
+    for (var i=0;i<lines.length;i++){
+      var s = lines[i].trim();
+      if (!s || s.charAt(0) === "#") continue;
+      var sp = s.lastIndexOf(" ");
+      if (sp < 0) continue;
+      var name = s.slice(0,sp).trim(), val = parseFloat(s.slice(sp+1));
+      var br = name.indexOf("{");
+      if (br >= 0) name = name.slice(0,br);
+      if (name.indexOf("llamacpp:") === 0) name = name.slice(9);
+      if (isFinite(val)) out[name] = val;
+    }
+    return out;
+  }
+
+  function fmt(n,dp){
+    if (n===null||n===undefined||!isFinite(n)) return "—";
+    dp = (dp===undefined)?1:dp;
+    return n.toLocaleString(undefined,{minimumFractionDigits:dp,maximumFractionDigits:dp});
+  }
+  function fmtInt(n){ return (n===null||n===undefined||!isFinite(n))?"—":Math.round(n).toLocaleString(); }
+  function compact(n){
+    if (!isFinite(n)) return "—";
+    if (n>=1e6) return (n/1e6).toFixed(2)+"M";
+    if (n>=1e3) return (n/1e3).toFixed(1)+"k";
+    return String(Math.round(n));
+  }
+  function firstNum(list){
+    for (var i=0;i<list.length;i++){
+      var v = list[i];
+      if (typeof v === "number" && isFinite(v)) return v;
+    }
+    return 0;
+  }
+  function setStatus(t,c){ $("status").textContent=t; $("dot").className="dot"+(c?" "+c:""); }
+  function showMsg(t,h){ var m=$("msg"); m.innerHTML="<strong>"+t+"</strong>"+h; m.hidden=false; }
+  function hideMsg(){ $("msg").hidden=true; }
+
+  /* ---- live progress straight off the slots ---- */
+  function readSlots(slots, dt){
+    var live = {gen:0, pre:0, generating:0, prefilling:0, idle:0};
+    if (!Array.isArray(slots)) return null;
+    slotsSeen = true;
+
+    var next = {};
+    for (var i=0;i<slots.length;i++){
+      var s = slots[i];
+      var id = String(s.id);
+      var task = (s.id_task === undefined) ? -1 : s.id_task;
+      var nt = nextTok(s);
+      var dec   = firstNum([nt.n_decoded, s.n_decoded]);
+      var proc  = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
+      var cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
+      var total = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
+      // Lean /slots payloads omit the prompt counters entirely; prefill then has no slot-side source.
+      if (hasNum(s.n_prompt_tokens) || hasNum(s.prompt_tokens) ||
+          hasNum(s.n_prompt_tokens_processed) || hasNum(s.prompt_n)) promptFieldsSeen = true;
+
+      var p = slotPrev[id];
+      // First sighting records a baseline only, otherwise a request already in progress
+      // would dump its whole history into one interval. After that, a changed task ID means
+      // the counters restarted at zero, so the current value is itself the delta.
+      var sameTask = p && p.task === task;
+      var dDec  = !p ? 0 : (sameTask ? Math.max(0, dec  - p.decoded)   : dec);
+      var dProc = !p ? 0 : (sameTask ? Math.max(0, proc - p.processed) : proc);
+
+      if (s.is_processing){
+        live.gen += dDec;
+        live.pre += dProc;
+        if (dec > 0) live.generating++; else live.prefilling++;
+      } else {
+        live.idle++;
+      }
+
+      if (task !== -1 && total > 0){
+        if (!taskPrompt[task]) taskOrder.push(task);
+        taskPrompt[task] = {cache:cache, total:total};
+      }
+      if (task !== -1 && (!p || p.task !== task) && s.is_processing) reqCount++;
+
+      next[id] = {task:task, decoded:dec, processed:proc};
+    }
+    slotPrev = next;
+
+    while (taskOrder.length > 300){ delete taskPrompt[taskOrder.shift()]; }
+
+    live.genRate = dt > 0 ? live.gen/dt : 0;
+    live.preRate = promptFieldsSeen ? (dt > 0 ? live.pre/dt : 0) : null;
+    return live;
+  }
+
+  function cacheReuse(){
+    var c=0,t=0;
+    for (var k in taskPrompt){
+      if (Object.prototype.hasOwnProperty.call(taskPrompt,k)){
+        c += taskPrompt[k].cache; t += taskPrompt[k].total;
+      }
+    }
+    return t > 0 ? {pct:100*c/t, cached:c, total:t} : null;
+  }
+
+  function ingest(metrics, slots, props, ts){
+    if (props && props.default_generation_settings && props.default_generation_settings.n_ctx){
+      nCtx = props.default_generation_settings.n_ctx;
+    }
+    var prev = samples.length ? samples[samples.length-1] : null;
+
+    if (prev && metrics.n_decode_total < prev.m.n_decode_total){
+      samples=[];deltas=[];slotPrev={};taskPrompt={};taskOrder=[];reqCount=0;prev=null;
+      showMsg("Counters went backwards","The server appears to have restarted. History was cleared.");
+    }
+
+    var now = (ts === undefined) ? Date.now() : ts;
+    var dt = prev ? (now - prev.t)/1000 : 0;
+    var live = readSlots(slots, dt);
+
+    samples.push({t:now, m:metrics});
+    if (samples.length > MAXCOLS+1) samples.shift();
+
+    if (prev && dt > 0){
+      deltas.push({
+        t:now, dt:dt,
+        preTok: Math.max(0,(metrics.prompt_tokens_total||0)-(prev.m.prompt_tokens_total||0)),
+        preSec: Math.max(0,(metrics.prompt_seconds_total||0)-(prev.m.prompt_seconds_total||0)),
+        genTok: Math.max(0,(metrics.tokens_predicted_total||0)-(prev.m.tokens_predicted_total||0)),
+        genSec: Math.max(0,(metrics.tokens_predicted_seconds_total||0)-(prev.m.tokens_predicted_seconds_total||0)),
+        decodes: Math.max(0,(metrics.n_decode_total||0)-(prev.m.n_decode_total||0)),
+        livePre: live ? live.preRate : null,
+        liveGen: live ? live.genRate : null
+      });
+      if (deltas.length > MAXCOLS) deltas.shift();
+    }
+    render(metrics, slots, live);
+  }
+
+  function render(m, slots, live){
+    // live rates: short window so a stream registers quickly
+    // Averaged independently: a build can expose decoded progress without prompt progress.
+    var w = deltas.slice(-3), lp=0, np=0, lg=0, ng=0;
+    for (var i=0;i<w.length;i++){
+      if (w[i].livePre !== null && w[i].livePre !== undefined){ lp += w[i].livePre; np++; }
+      if (w[i].liveGen !== null && w[i].liveGen !== undefined){ lg += w[i].liveGen; ng++; }
+    }
+    var livePre = np ? lp/np : null, liveGen = ng ? lg/ng : null;
+
+    // settled rates from the counters, over a longer window
+    var s = deltas.slice(-10), pT=0,pS=0,gT=0,gS=0,wall=0;
+    for (var j=0;j<s.length;j++){
+      pT+=s[j].preTok; pS+=s[j].preSec; gT+=s[j].genTok; gS+=s[j].genSec; wall+=s[j].dt;
+    }
+
+    liveSource = (liveGen !== null) ? "slots" : (deltas.length ? "decode" : "none");
+
+    // Without /slots the only continuously-moving signal is the decode counter.
+    var decRate = null;
+    if (liveSource === "decode"){
+      var dTot=0, dWall=0, r = deltas.slice(-3);
+      for (var k=0;k<r.length;k++){ dTot+=r[k].decodes; dWall+=r[k].dt; }
+      decRate = dWall > 0 ? dTot/dWall : null;
+    }
+
+    if (liveSource === "slots"){
+      $("genLive").innerHTML = (liveGen<0.05?"0":fmt(liveGen,1))+'<span class="unit">tok/s</span>';
+      $("lgGen").textContent = fmt(liveGen,1);
+      if (livePre !== null){
+        $("preLive").innerHTML = (livePre<0.5?"0":fmt(livePre,0))+'<span class="unit">tok/s</span>';
+        $("lgPre").textContent = fmt(livePre,0);
+        $("srcNote").textContent = "measured from slot progress, so a long stream shows up while it runs";
+      } else {
+        // No prompt counters on this build's /slots — fall back to the metrics delta, which
+        // commits when prefill ends rather than while it runs.
+        var recentPre = (metricsAvail && pS>0) ? pT/pS : null;
+        $("preLive").innerHTML = (recentPre===null?"—":fmt(recentPre,0))+'<span class="unit">tok/s</span>';
+        $("lgPre").textContent = recentPre===null?"—":fmt(recentPre,0);
+        $("srcNote").textContent = metricsAvail
+          ? "generation from slot n_decoded · this build's /slots omits prompt counters, so prefill is differenced from /metrics"
+          : "generation from slot n_decoded · /metrics is disabled on this server, so prefill, cache reuse and the lifetime counters are unavailable";
+      }
+    } else {
+      $("preLive").innerHTML = '—<span class="unit">tok/s</span>';
+      $("genLive").innerHTML = (decRate===null?"—":fmt(decRate,1))+'<span class="unit">dec/s</span>';
+      $("lgPre").textContent = "n/a";
+      $("lgGen").textContent = decRate===null?"—":fmt(decRate,1);
+      $("srcNote").textContent = "no slot data — showing llama_decode() calls per second instead";
+    }
+    $("preSettled").textContent = "on completion "+(pS>0?fmt(pT/pS,0)+" tok/s":"—");
+    $("genSettled").textContent = "on completion "+(gS>0?fmt(gT/gS,1)+" tok/s":"—");
+
+    var cr = cacheReuse();
+    $("cache").innerHTML = (cr?fmt(cr.pct,1):"—")+'<span class="unit">%</span>';
+    $("cacheSub").textContent = cr
+      ? compact(cr.cached)+" reused of "+compact(cr.total)+" prompt tokens across "+taskOrder.length+" requests"
+      : (slotsSeen && !promptFieldsSeen
+          ? "Unavailable: this build's /slots does not report n_prompt_tokens_cache."
+          : "Share of prompt tokens served from cache instead of reprocessed.");
+
+    var stateTxt = "idle", sub = "No slot is processing.";
+    if (live){
+      if (live.generating){ stateTxt = "generating"; sub = live.generating+" slot"+(live.generating===1?"":"s")+" decoding · counters commit at completion"; }
+      else if (live.prefilling){ stateTxt = "prefilling"; sub = live.prefilling+" slot"+(live.prefilling===1?"":"s")+" processing prompt"; }
+      else { sub = live.idle+" slot"+(live.idle===1?"":"s")+" idle"; }
+    } else if (m.requests_processing > 0){
+      stateTxt = "busy"; sub = "Slots endpoint unavailable — falling back to the gauge.";
+    }
+    $("state").textContent = stateTxt;
+    $("stateSub").textContent = sub + (m.requests_deferred>0 ? " · "+m.requests_deferred+" deferred" : "");
+
+    var pt=m.prompt_tokens_total||0, gt=m.tokens_predicted_total||0;
+    $("ratio").textContent = gt>0 ? fmt(pt/gt,0)+" : 1" : "—";
+    $("ctxMax").innerHTML = compact(m.n_tokens_max)+'<span class="unit">tok</span>';
+    $("ctxPct").textContent = nCtx>0
+      ? fmt(100*(m.n_tokens_max||0)/nCtx,1)+"% of "+compact(nCtx)+" slot window"
+      : "slot window unknown";
+    $("busy").textContent = fmt(m.n_busy_slots_per_decode,2);
+    $("reqs").textContent = fmtInt(reqCount);
+
+    var prevM = samples.length>1 ? samples[samples.length-2].m : null, rowsA="";
+    for (var c=0;c<COUNTERS.length;c++){
+      var k=COUNTERS[c][0], v=m[k], d = prevM ? (v-prevM[k]) : null;
+      var dp = (k.indexOf("seconds")>=0)?2:0;
+      rowsA += "<tr><td class='dim'>"+COUNTERS[c][1]+"</td><td class='n'>"+fmt(v,dp)+
+               "</td><td class='n'>"+(d===null?"—":(d>0?"+":"")+fmt(d,dp))+"</td></tr>";
+    }
+    $("rawA").innerHTML = rowsA;
+
+    var rowsB="";
+    for (var g=0;g<GAUGES.length;g++){
+      rowsB += "<tr><td class='dim'>"+GAUGES[g][0]+"</td><td class='n'>"+fmt(m[GAUGES[g][0]],2)+
+               "</td><td class='n dim' style='font-size:10px;letter-spacing:.1em'>"+GAUGES[g][1]+"</td></tr>";
+    }
+    $("rawB").innerHTML = rowsB;
+
+    renderSlots(slots);
+    if (deltas.length){
+      $("footL").textContent = deltas.length+" interval"+(deltas.length===1?"":"s")+
+        " · "+fmt(deltas[deltas.length-1].dt,1)+"s per column";
+    }
+    try { draw(); } catch(e){ $("footL").textContent = "chart unavailable: "+(e.message||e); }
+  }
+
+  function renderSlots(slots){
+    var box = $("slotsBox");
+    if (!Array.isArray(slots) || !slots.length){
+      box.innerHTML = '<p class="empty">No slot data'+(slotsErr?" — "+String(slotsErr).replace(/</g,"&lt;"):"")+
+        '.<br>Live token rates need this endpoint. Restart with <code>--slots</code>, or check that your build exposes it.</p>';
+      return;
+    }
+    // Prompt columns are dropped entirely on builds that never report those fields.
+    var showPrompt = promptFieldsSeen;
+    var h = "<table><thead><tr><th>slot</th><th>state</th><th class='n'>task</th>"+
+            (showPrompt ? "<th style='width:26%'>prompt</th><th class='n'>cached</th>" : "")+
+            "<th class='n'>decoded</th><th class='n'>context</th></tr></thead><tbody>";
+    for (var i=0;i<slots.length;i++){
+      var s = slots[i];
+      var busy = !!s.is_processing;
+      var dec = nextTok(s).n_decoded || 0;
+      var total = s.n_prompt_tokens || 0;
+      var cache = s.n_prompt_tokens_cache || 0;
+      var proc = s.n_prompt_tokens_processed || 0;
+      var done = Math.min(total, cache + proc);
+      var pct = total > 0 ? 100*done/total : 0;
+
+      var state = !busy ? "idle" : (dec > 0 ? "generating" : "prefilling");
+      var cls = !busy ? "" : (dec > 0 ? "gen" : "pre");
+      var col = dec > 0 ? "var(--gen)" : "var(--prefill)";
+
+      h += "<tr class='"+(busy?"":"idle")+"'>"+
+           "<td>"+s.id+"</td>"+
+           "<td><span class='tag "+cls+"'>"+state+"</span></td>"+
+           "<td class='n'>"+(s.id_task===-1||s.id_task===undefined?"—":s.id_task)+"</td>"+
+           (showPrompt
+             ? "<td>"+(total>0
+                 ? "<div class='bar-track'><div class='bar-fill' style='width:"+pct.toFixed(1)+"%;background:"+col+"'></div></div>"+
+                   "<span style='font-size:10px;color:var(--ink-faint)'>"+compact(done)+" / "+compact(total)+"</span>"
+                 : "<span style='color:var(--ink-faint)'>—</span>")+"</td>"+
+               "<td class='n'>"+(total>0?fmt(100*cache/total,0)+"%":"—")+"</td>"
+             : "")+
+           "<td class='n'>"+(busy||dec?fmtInt(dec):"—")+"</td>"+
+           "<td class='n dim'>"+compact(s.n_ctx)+"</td>"+
+           "</tr>";
+    }
+    box.innerHTML = h+"</tbody></table>";
+  }
+
+  /* ---- strip ---- */
+  var cv = $("strip"), g = cv.getContext("2d");
+  var hcv = $("hstrip"), hg = hcv.getContext("2d");
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function sizeCanvas(c, ctx){
+    var dpr = window.devicePixelRatio || 1, r = c.getBoundingClientRect();
+    c.width = Math.max(1,Math.round(r.width*dpr));
+    c.height = Math.max(1,Math.round(r.height*dpr));
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    return {w:r.width,h:r.height};
+  }
+
+  // Shared by the live and history strips: prefill above the midline, generation below,
+  // each axis scaled to its own maximum. opt.marks flags buckets with missing samples,
+  // opt.breaks flags a discontinuity (server restart) before that column.
+  function drawStrip(c, ctx, pre, gen, emptyMsg, opt){
+    if (!ctx) return;
+    opt = opt || {};
+    var d = sizeCanvas(c, ctx), W=d.w, H=d.h;
+    ctx.clearRect(0,0,W,H);
+    var padL=46,padR=12,padT=14,padB=opt.labels?24:14;
+    var plotW=W-padL-padR, mid=padT+(H-padT-padB)/2, half=(H-padT-padB)/2-6;
+    var rule=css("--rule"), faint=css("--ink-faint");
+
+    ctx.strokeStyle=rule; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL,Math.round(mid)+0.5); ctx.lineTo(W-padR,Math.round(mid)+0.5); ctx.stroke();
+
+    if (!pre.length){
+      ctx.fillStyle=faint; ctx.font="12px "+css("--mono"); ctx.textAlign="center";
+      ctx.fillText(emptyMsg, W/2, mid-12);
+      return;
+    }
+
+    var maxPre=Math.max.apply(null,pre.concat([1])), maxGen=Math.max.apply(null,gen.concat([1]));
+    var n=pre.length, slot=plotW/Math.max(n,24), bw=Math.max(1.5,slot-1.6);
+
+    ctx.setLineDash([2,4]); ctx.strokeStyle=rule; ctx.beginPath();
+    ctx.moveTo(padL,Math.round(mid-half)+0.5); ctx.lineTo(W-padR,Math.round(mid-half)+0.5);
+    ctx.moveTo(padL,Math.round(mid+half)+0.5); ctx.lineTo(W-padR,Math.round(mid+half)+0.5);
+    ctx.stroke(); ctx.setLineDash([]);
+
+    ctx.fillStyle=faint; ctx.font="10px "+css("--mono"); ctx.textAlign="right";
+    ctx.fillText(compact(maxPre), padL-8, mid-half+4);
+    ctx.fillText(compact(maxGen), padL-8, mid+half+4);
+    ctx.fillText("0", padL-8, mid+3.5);
+
+    var cPre=css("--prefill"), cGen=css("--gen"), alert=css("--alert");
+    for (var j=0;j<n;j++){
+      var x = padL+plotW-(n-j)*slot+(slot-bw)/2;
+      if (opt.breaks && opt.breaks[j]){
+        ctx.strokeStyle=faint; ctx.globalAlpha=.5; ctx.beginPath();
+        ctx.moveTo(Math.round(x)-0.5, mid-half); ctx.lineTo(Math.round(x)-0.5, mid+half);
+        ctx.stroke(); ctx.globalAlpha=1;
+      }
+      if (opt.marks && opt.marks[j]){
+        ctx.fillStyle=alert; ctx.fillRect(x, mid-1.5, Math.max(bw,1.5), 3);
+        continue;
+      }
+      ctx.globalAlpha = (opt.dimOlder===false || j===n-1) ? 1 : 0.82;
+      var hp=(pre[j]/maxPre)*half;
+      if (hp>0.4){ ctx.fillStyle=cPre; ctx.fillRect(x, mid-hp, bw, hp); }
+      var hg=(gen[j]/maxGen)*half;
+      if (hg>0.4){ ctx.fillStyle=cGen; ctx.fillRect(x, mid+1, bw, hg); }
+      ctx.globalAlpha=1;
+    }
+
+    if (opt.labels){
+      ctx.fillStyle=faint; ctx.font="10px "+css("--mono");
+      for (var L=0;L<opt.labels.length;L++){
+        var lb = opt.labels[L];
+        ctx.textAlign = lb.frac<=0 ? "left" : (lb.frac>=1 ? "right" : "center");
+        ctx.fillText(lb.text, padL+plotW*lb.frac, H-6);
+      }
+    }
+  }
+
+  function draw(){
+    var pre=[],gen=[];
+    for (var i=0;i<deltas.length;i++){
+      var q=deltas[i];
+      pre.push(q.livePre !== null ? q.livePre : (q.preSec>0?q.preTok/q.preSec:0));
+      gen.push(q.liveGen !== null ? q.liveGen : (q.genSec>0?q.genTok/q.genSec:0));
+    }
+    drawStrip(cv, g, pre, gen, "waiting for a second reading — rates need two points");
+  }
+  window.addEventListener("resize", function(){ draw(); drawHist(); });
+
+  /* ---- history, served by the collector on the server ---- */
+  var hist = null, HC = {}, histSpan = null, histTimer = null;
+
+  function histBase(){ return $("hurl").value.trim().replace(/\/+$/,""); }
+
+  function histSeries(){
+    if (!hist || !hist.rows || hist.rows.length < 2) return [];
+    var R = hist.rows, out = [];
+    // On a server without --metrics the counters are permanently NULL. That is a
+    // capability limit, not a collection gap — only treat NULL as a gap when the
+    // collector did record counters for this window.
+    var haveM = !!hist.metrics;
+    for (var i=1;i<R.length;i++){
+      var a = R[i-1], b = R[i];
+      var gap = b[HC.n] > b[HC.n_ok];
+      var pair = a[HC.prompt_tokens] !== null && b[HC.prompt_tokens] !== null;
+      if (haveM && !pair){
+        out.push({t:b[HC.ts], dt:0, pre:0, gen:0, preTok:0, preSec:0, genTok:0, genSec:0,
+                  busy:0, gap:true, brk:false});
+        continue;
+      }
+      var dt = b[HC.ts] - a[HC.ts];
+      if (!(dt > 0)) continue;
+      // A restart resets the counters, so that pair differences to nonsense — break instead.
+      var brk = b[HC.epoch] !== a[HC.epoch];
+      var can = pair && !brk;
+      var dpT = can ? Math.max(0, b[HC.prompt_tokens]    - a[HC.prompt_tokens]) : 0;
+      var dpS = can ? Math.max(0, b[HC.prompt_seconds]   - a[HC.prompt_seconds]) : 0;
+      var dgT = can ? Math.max(0, b[HC.predicted_tokens] - a[HC.predicted_tokens]) : 0;
+      var dgS = can ? Math.max(0, b[HC.predicted_seconds]- a[HC.predicted_seconds]) : 0;
+      out.push({
+        t: b[HC.ts], dt: dt,
+        pre: dpS > 0 ? dpT/dpS : 0,
+        gen: (b[HC.gen_delta] > 0) ? b[HC.gen_delta]/dt : 0,
+        preTok: dpT, preSec: dpS, genTok: dgT, genSec: dgS,
+        busy: (b[HC.slots_generating]||0) + (b[HC.slots_prefilling]||0),
+        gap: gap, brk: brk
+      });
+    }
+    return out;
+  }
+
+  // Keyed off how much time the data actually covers, not the requested range —
+  // "all" has no nominal span, and a short window under a 7d request still wants clock times.
+  function tlabel(t, spanSec){
+    var d = new Date(t*1000);
+    var hm = d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+    if (spanSec > 86400) return d.toLocaleDateString([], {month:"short", day:"numeric"})+" "+hm;
+    return hm;
+  }
+
+  function drawHist(){
+    var s = histSeries();
+    if (!s.length){
+      drawStrip(hcv, hg, [], [], hist ? "window contains no usable pairs" : "no window loaded");
+      return;
+    }
+    var pre=[], gen=[], marks=[], breaks=[];
+    for (var i=0;i<s.length;i++){
+      pre.push(s[i].pre); gen.push(s[i].gen); marks.push(s[i].gap); breaks.push(s[i].brk);
+    }
+    var t0 = s[0].t, t1 = s[s.length-1].t, sp = t1 - t0;
+    drawStrip(hcv, hg, pre, gen, "", {
+      marks: marks, breaks: breaks, dimOlder: false,
+      labels: [{frac:0, text:tlabel(t0,sp)},
+               {frac:0.5, text:tlabel((t0+t1)/2,sp)},
+               {frac:1, text:tlabel(t1,sp)}]
+    });
+  }
+
+  function renderHist(){
+    var s = histSeries();
+    if (!s.length){
+      $("hPre").innerHTML='—<span class="unit">tok/s</span>';
+      $("hGen").innerHTML='—<span class="unit">tok/s</span>';
+      $("hTok").textContent="—"; $("hBusy").innerHTML='—<span class="unit">slots</span>';
+      $("hlgPre").textContent="—"; $("hlgGen").textContent="—";
+      $("histFoot").textContent="—";
+      drawHist();
+      return;
+    }
+    var haveM = !!hist.metrics;
+    var pT=0,pS=0,gT=0,gS=0,wall=0,busy=0,gaps=0,restarts=0,slotTok=0;
+    for (var i=0;i<s.length;i++){
+      pT+=s[i].preTok; pS+=s[i].preSec; gT+=s[i].genTok; gS+=s[i].genSec;
+      wall+=s[i].dt; busy+=s[i].busy*s[i].dt; slotTok+=s[i].gen*s[i].dt;
+      if (s[i].gap) gaps++;
+      if (s[i].brk) restarts++;
+    }
+    // Without counters the only generation figure available is slot-derived, which
+    // is tokens per wall second — not the same denominator as decode compute time.
+    var preAvg = (haveM && pS>0) ? pT/pS : null;
+    var genAvg = haveM ? (gS>0 ? gT/gS : null) : (wall>0 ? slotTok/wall : null);
+    $("hPre").innerHTML = (preAvg===null?"—":fmt(preAvg,0))+'<span class="unit">tok/s</span>';
+    $("hGen").innerHTML = (genAvg===null?"—":fmt(genAvg,1))+'<span class="unit">tok/s</span>';
+    $("hlgPre").textContent = preAvg===null?"—":fmt(preAvg,0);
+    $("hlgGen").textContent = genAvg===null?"—":fmt(genAvg,1);
+    $("hPreSub").textContent = haveM
+      ? compact(pT)+" prompt tokens over "+fmt(pS,0)+"s of prefill compute"
+      : "Unavailable: /metrics is disabled on this server, and /slots carries no prompt counters.";
+    $("hGenSub").textContent = haveM
+      ? compact(gT)+" tokens over "+fmt(gS,0)+"s of decode compute"
+      : compact(slotTok)+" tokens over "+fmt(wall/60,0)+"min of wall clock — slot-derived, not decode time";
+    $("hTok").textContent = haveM ? compact(pT)+" / "+compact(gT) : "— / "+compact(slotTok);
+    $("hTokSub").textContent = (haveM
+      ? "prompt / generated, differenced across the window"
+      : "prompt unavailable; generated counted from slot progress")+
+      (restarts ? " · "+restarts+" restart"+(restarts===1?"":"s")+" spanned" : "");
+    $("hBusy").innerHTML = fmt(wall>0?busy/wall:0,2)+'<span class="unit">slots</span>';
+    $("hBusySub").textContent = gaps
+      ? gaps+" of "+s.length+" buckets missed samples — server unreachable then"
+      : "continuous coverage, no missed samples";
+
+    var mins = wall/60;
+    $("histFoot").textContent = s.length+" buckets · "+
+      (hist.bucket>=60 ? fmt(hist.bucket/60,1)+"min" : fmt(hist.bucket,0)+"s")+" per column · "+
+      (mins>=90 ? fmt(mins/60,1)+"h" : fmt(mins,0)+"min")+" spanned";
+    var sp = s[s.length-1].t - s[0].t;
+    $("histSpan").textContent = tlabel(s[0].t,sp)+" → "+tlabel(s[s.length-1].t,sp)+
+      " · prefill above · generation below";
+    drawHist();
+  }
+
+  function loadHist(span){
+    histSpan = (span === "all") ? null : span;
+    var url = histBase();
+    if (!url){ $("histNote").textContent = "set the collector address first"; return; }
+    var fetchWindow = function(t0, t1){
+      return fetch(url+"/history?from="+t0+"&to="+t1+"&points=400",{cache:"no-store"})
+        .then(function(r){ if(!r.ok) throw new Error("/history returned "+r.status); return r.json(); })
+        .then(function(j){
+          hist = j; HC = {};
+          for (var i=0;i<j.cols.length;i++) HC[j.cols[i]] = i;
+          $("histNote").textContent = "loaded "+new Date().toLocaleTimeString();
+          renderHist();
+        });
+    };
+    $("histNote").textContent = "loading…";
+    var p;
+    if (span === "all"){
+      p = fetch(url+"/range",{cache:"no-store"})
+        .then(function(r){ if(!r.ok) throw new Error("/range returned "+r.status); return r.json(); })
+        .then(function(g){
+          if (!g.rows) throw new Error("collector has recorded nothing yet");
+          return fetchWindow(g.from-1, g.to+1);
+        });
+    } else {
+      var now = Date.now()/1000;
+      p = fetchWindow(now-span, now);
+    }
+    p.catch(function(e){
+      hist = null;
+      $("histNote").textContent = (e instanceof TypeError)
+        ? "can't reach the collector at "+url+" — is llamacpp-telemetry.service running?"
+        : String(e.message||e);
+      renderHist();
+    });
+  }
+
+  /* ---- endpoints ---- */
+  // Each entry pairs a llama-server with the collector recording it. Switching
+  // discards all in-memory history: the two endpoints share no counter space.
+  var SERVERS = [
+    {name:"nfcmini · Qwen3.6-35B",  llama:"http://nfcmini.local:8080",  collector:"http://nfcmini.local:8081"},
+    {name:"mini795s7 · Gemma-4-E4B", llama:"http://mini795s7.local:8080", collector:"http://mini795s7.local:8081"},
+    {name:"custom…", llama:"", collector:""}
+  ];
+  var CUSTOM = SERVERS.length - 1;
+  var DEFAULT_SPAN = 900;          // history window loaded on open and on switch
+  var metricsAvail = true;
+
+  function saveSel(){
+    try {
+      localStorage.setItem("llamatel-endpoint", JSON.stringify(
+        {i: $("srv").selectedIndex, llama: $("url").value, collector: $("hurl").value}));
+    } catch(e){}
+  }
+  function loadSel(){
+    try { return JSON.parse(localStorage.getItem("llamatel-endpoint")); } catch(e){ return null; }
+  }
+
+  function setIdent(props){
+    var p = $("ident");
+    if (!props){ return; }
+    var dgs = props.default_generation_settings || {};
+    var model = String(props.model_path || "").split("/").pop() || "unknown model";
+    var bits = [model];
+    if (props.build_info) bits.push(props.build_info);
+    if (props.total_slots) bits.push(props.total_slots+" slots");
+    if (dgs.n_ctx) bits.push(compact(dgs.n_ctx)+" ctx");
+    if (!metricsAvail) bits.push("no /metrics");
+    p.textContent = bits.join(" · ");
+  }
+
+  // Everything in memory is endpoint-specific — counters, slot baselines, the
+  // recorded window. Keeping any of it across a switch would blend two servers.
+  function resetAll(){
+    samples=[];deltas=[];slotPrev={};taskPrompt={};taskOrder=[];reqCount=0;
+    slotsSeen=false;promptFieldsSeen=false;metricsAvail=true;slotsErr=null;
+    hist=null;HC={};histSpan=null;
+    if (histTimer){ clearInterval(histTimer); histTimer=null; }
+    var rb = document.querySelectorAll(".rangebtns button");
+    for (var i=0;i<rb.length;i++) rb[i].className="";
+    $("ident").textContent = "Live token flow read from slot state. Counters only settle when a request ends.";
+    $("footL").textContent = "no samples yet";
+    $("histNote").textContent = "no window loaded — pick a range below";
+    $("slotsBox").innerHTML = '<p class="empty">Not connected.</p>';
+    hideMsg(); renderHist(); draw();
+  }
+
+  function applyServer(i, opts){
+    var s = SERVERS[i] || SERVERS[0];
+    var wasLive = (mode === "live");
+    // Stop first: an in-flight interval would otherwise fire once against the
+    // new endpoint with the old interval's timing.
+    stop();
+    resetAll();
+    if (i !== CUSTOM){ $("url").value = s.llama; $("hurl").value = s.collector; }
+    else if (opts && opts.llama !== undefined){ $("url").value = opts.llama; $("hurl").value = opts.collector; }
+    saveSel();
+    if (wasLive) start(); else setStatus("idle","");
+    selectSpan(DEFAULT_SPAN);      // the new endpoint's recent window, not a blank panel
+  }
+
+  function initServers(){
+    var sel = $("srv");
+    for (var i=0;i<SERVERS.length;i++){
+      sel.appendChild(el_opt(SERVERS[i].name, i));
+    }
+    var saved = loadSel();
+    var idx = (saved && saved.i >= 0 && saved.i < SERVERS.length) ? saved.i : 0;
+    sel.selectedIndex = idx;
+    if (idx === CUSTOM && saved){ $("url").value = saved.llama || ""; $("hurl").value = saved.collector || ""; }
+    else { $("url").value = SERVERS[idx].llama; $("hurl").value = SERVERS[idx].collector; }
+    sel.addEventListener("change", function(){ applyServer(sel.selectedIndex); });
+    // Hand-editing a URL means the selection no longer describes it.
+    var mark = function(){
+      if ($("srv").selectedIndex !== CUSTOM){ $("srv").selectedIndex = CUSTOM; }
+      saveSel();
+    };
+    $("url").addEventListener("change", mark);
+    $("hurl").addEventListener("change", mark);
+  }
+  function el_opt(text, val){
+    var o = document.createElement("option");
+    o.textContent = text; o.value = String(val);
+    return o;
+  }
+
+  /* ---- polling ---- */
+  function base(){ return $("url").value.trim().replace(/\/+$/,""); }
+  function getJSON(p){
+    return fetch(base()+p,{cache:"no-store"}).then(function(r){
+      if(!r.ok) throw new Error(p+" "+r.status); return r.json();
+    });
+  }
+
+  function poll(){
+    fetch(base()+"/metrics",{cache:"no-store"})
+      .then(function(r){
+        // A server started without --metrics answers 501. That is a capability
+        // limit, not an outage — /slots still carries decode progress — so fall
+        // through with no counters rather than failing the whole poll.
+        if (r.status===501||r.status===400) return null;
+        if (!r.ok) throw new Error("/metrics returned "+r.status);
+        return r.text();
+      })
+      .then(function(text){
+        var m = null;
+        if (text !== null){
+          m = parseProm(text);
+          if (m.prompt_tokens_total === undefined) m = null;
+        }
+        metricsAvail = (m !== null);
+        return Promise.all([
+          getJSON("/slots").then(function(v){ slotsErr = null; return v; })
+                           .catch(function(e){ slotsErr = String(e.message||e); return null; }),
+          getJSON("/props").catch(function(){ return null; })
+        ]).then(function(rest){
+          if (!metricsAvail && !Array.isArray(rest[0])){
+            throw new Error("this server exposes neither /metrics nor /slots — " +
+                            "restart it with --metrics, or with slots enabled");
+          }
+          hideMsg();
+          setStatus("live · "+new Date().toLocaleTimeString(),"live");
+          setIdent(rest[1]);
+          ingest(m || {}, rest[0], rest[1]);
+        });
+      })
+      .catch(function(err){
+        setStatus("error","err");
+        var isNet = (err instanceof TypeError);
+        showMsg(isNet?"Can't reach the server":"Poll failed",
+          "<p style='margin:0 0 8px'>"+String(err.message||err).replace(/</g,"&lt;")+"</p>"+
+          (isNet
+            ? "<p style='margin:0'>Usually the browser blocking a cross-origin request rather than the server being down. "+
+              "Check with <code>curl "+base()+"/metrics</code>. If that works, serve this page same-origin: put it in a folder and "+
+              "start with <code>--path /that/folder</code>.</p>"
+            : "<p style='margin:0'>If metrics are unsupported, restart with <code>--metrics</code>. "+
+              "In router mode append <code>?model=&lt;id&gt;</code>.</p>"));
+      });
+  }
+
+  function start(){
+    stop(); mode="live";
+    slotsSeen=false; promptFieldsSeen=false;
+    var iv = Math.max(1, parseInt($("iv").value,10)||2);
+    setStatus("connecting…","");
+    poll();
+    timer = setInterval(poll, iv*1000);
+    $("go").textContent = "Stop polling";
+  }
+  function stop(){
+    if (timer) clearInterval(timer);
+    timer=null;
+    if (mode!=="idle") setStatus("stopped","");
+    mode="idle";
+    $("go").textContent="Start polling";
+  }
+
+  /* ---- demo: a reasoning model that thinks for a long time ---- */
+  function demoTick(){
+    var s = demoState, m = s.m;
+    s.tick++;
+
+    if (s.stage === "wait"){
+      if (s.tick > s.until){ s.stage="prefill"; s.task++; s.promptTotal=20000+Math.random()*90000;
+        s.promptCache=Math.random()<0.65 ? s.promptTotal*(0.6+Math.random()*0.35) : 0;
+        s.promptDone=s.promptCache; s.decoded=0; }
+    } else if (s.stage === "prefill"){
+      s.promptDone += 1100 + Math.random()*400;
+      if (s.promptDone >= s.promptTotal){
+        s.promptDone = s.promptTotal;
+        var newly = s.promptTotal - s.promptCache;
+        m.prompt_tokens_total += newly;
+        m.prompt_seconds_total += newly/(950+Math.random()*250);
+        m.n_tokens_max = Math.max(m.n_tokens_max, s.promptTotal);
+        s.stage="gen"; s.genLen = 400 + Math.random()*1400;   // long reasoning trace
+      }
+      m.n_decode_total += 2;
+    } else {
+      s.decoded += 13 + Math.random()*9;                       // ~7 tok/s at 1.5s ticks
+      m.n_decode_total += 10;
+      if (s.decoded >= s.genLen){
+        m.tokens_predicted_total += s.decoded;                 // commits only now
+        m.tokens_predicted_seconds_total += s.decoded/(12+Math.random()*4);
+        s.stage="wait"; s.until = s.tick + 1 + Math.floor(Math.random()*3);
+        s.decoded=0; s.promptTotal=0;
+      }
+    }
+
+    m.requests_processing = s.stage==="wait" ? 0 : 1;
+    m.requests_deferred = 0;
+    m.n_busy_slots_per_decode = 1 + Math.random()*0.3;
+    m.prompt_tokens_seconds = m.prompt_tokens_total/Math.max(m.prompt_seconds_total,.001);
+    m.predicted_tokens_seconds = m.tokens_predicted_total/Math.max(m.tokens_predicted_seconds_total,.001);
+
+    var slots=[];
+    for (var i=0;i<2;i++){
+      var active = (i===0 && s.stage!=="wait");
+      slots.push({
+        id:i, id_task: active ? s.task : -1, n_ctx:262144, is_processing:active,
+        n_prompt_tokens: active ? Math.round(s.promptTotal) : 0,
+        n_prompt_tokens_cache: active ? Math.round(s.promptCache) : 0,
+        n_prompt_tokens_processed: active ? Math.round(Math.max(0,s.promptDone-s.promptCache)) : 0,
+        next_token:{n_decoded: active ? Math.round(s.decoded) : 0}
+      });
+    }
+    nCtx = 262144;
+    s.clock += 1500;                       // synthetic, so the warm-up loop yields real intervals
+    ingest(JSON.parse(JSON.stringify(m)), slots, null, s.clock);
+    setStatus("demo data","demo");
+  }
+
+  function startDemo(){
+    stop();
+    samples=[];deltas=[];slotPrev={};taskPrompt={};taskOrder=[];reqCount=0;
+    slotsSeen=false;promptFieldsSeen=false;
+    demoState = {tick:0, stage:"wait", until:0, task:500, promptTotal:0, promptCache:0,
+      promptDone:0, decoded:0, genLen:0, clock: Date.now() - 71*1500,
+      m:{prompt_tokens_total:0,prompt_seconds_total:0,tokens_predicted_total:0,
+         tokens_predicted_seconds_total:0,n_decode_total:0,n_tokens_max:0,
+         requests_processing:0,requests_deferred:0,n_busy_slots_per_decode:1,
+         prompt_tokens_seconds:0,predicted_tokens_seconds:0}};
+    hideMsg(); mode="demo";
+    for (var i=0;i<70;i++) demoTick();
+    timer = setInterval(demoTick, 1500);
+    $("go").textContent="Start polling";
+  }
+
+  var rangeBtns = document.querySelectorAll(".rangebtns button");
+  function selectSpan(raw){
+    raw = String(raw);
+    for (var k=0;k<rangeBtns.length;k++)
+      rangeBtns[k].className = (rangeBtns[k].getAttribute("data-span") === raw) ? "on" : "";
+    var span = raw === "all" ? "all" : parseInt(raw,10);
+    loadHist(span);
+    // A relative window keeps sliding; an absolute "all" does not, so only refresh the former.
+    if (histTimer) clearInterval(histTimer);
+    histTimer = (span === "all") ? null : setInterval(function(){ loadHist(span); }, 30000);
+  }
+  for (var rb=0; rb<rangeBtns.length; rb++){
+    rangeBtns[rb].addEventListener("click", function(){ selectSpan(this.getAttribute("data-span")); });
+  }
+
+  $("hcsv").addEventListener("click", function(){
+    var s = histSeries();
+    if (!s.length){ showMsg("Nothing to export","<p style='margin:0'>Load a history window first.</p>"); return; }
+    var rows = ["timestamp,bucket_s,prefill_tok_s,generation_tok_s,prompt_tokens,prompt_seconds,generated_tokens,generation_seconds,busy_slots,gap,restart"];
+    for (var i=0;i<s.length;i++){
+      var d = s[i];
+      rows.push([new Date(d.t*1000).toISOString(), d.dt.toFixed(1), d.pre.toFixed(2), d.gen.toFixed(2),
+        Math.round(d.preTok), d.preSec.toFixed(3), Math.round(d.genTok), d.genSec.toFixed(3),
+        d.busy.toFixed(2), d.gap?1:0, d.brk?1:0].join(","));
+    }
+    var blob = new Blob([rows.join("\n")],{type:"text/csv"});
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "llamacpp-history-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".csv";
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+
+  $("go").addEventListener("click", function(){ if (mode==="live") stop(); else start(); });
+  $("demo").addEventListener("click", startDemo);
+  $("clear").addEventListener("click", function(){
+    samples=[];deltas=[];slotPrev={};taskPrompt={};taskOrder=[];reqCount=0;
+    $("footL").textContent="no samples yet"; draw();
+  });
+  $("csv").addEventListener("click", function(){
+    if (!deltas.length){ showMsg("Nothing to export","<p style='margin:0'>Collect at least two readings first.</p>"); return; }
+    var rows=["timestamp,interval_s,live_prefill_tok_s,live_generation_tok_s,settled_prompt_tokens,settled_prompt_seconds,settled_generated_tokens,settled_generation_seconds,decodes"];
+    for (var i=0;i<deltas.length;i++){
+      var d=deltas[i];
+      rows.push([new Date(d.t).toISOString(), d.dt.toFixed(2),
+        d.livePre===null?"":d.livePre.toFixed(2),
+        d.liveGen===null?"":d.liveGen.toFixed(2),
+        Math.round(d.preTok), d.preSec.toFixed(3),
+        Math.round(d.genTok), d.genSec.toFixed(3), d.decodes].join(","));
+    }
+    var blob=new Blob([rows.join("\n")],{type:"text/csv"});
+    var a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="llamacpp-intervals-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".csv";
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+
+  initServers();
+  draw();
+  selectSpan(DEFAULT_SPAN);
+})();
+</script>
+</body>
+</html>

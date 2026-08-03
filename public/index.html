@@ -25,6 +25,7 @@
     --border:        rgba(11,11,11,0.10);
     --good:          #0ca30c;
     --critical:      #d03b3b;
+    --warn:          #eda100;
     --series-1:      #2a78d6;  /* input tokens */
     --series-2:      #1baf7a;  /* output tokens */
     --series-3:      #eda100;  /* reasoning tokens */
@@ -46,6 +47,7 @@
       --gridline:      #2c2c2a;
       --baseline:      #383835;
       --border:        rgba(255,255,255,0.10);
+      --warn:          #c98500;
       --series-1:      #3987e5;
       --series-2:      #199e70;
       --series-3:      #c98500;
@@ -63,6 +65,7 @@
     --gridline:      #2c2c2a;
     --baseline:      #383835;
     --border:        rgba(255,255,255,0.10);
+    --warn:          #c98500;
     --series-1:      #3987e5;
     --series-2:      #199e70;
     --series-3:      #c98500;
@@ -95,15 +98,51 @@
   .status-dot.up { background: var(--good); }
   .status-dot.down { background: var(--critical); }
 
+  .engine-badge {
+    appearance: none; display: inline-flex; align-items: center; gap: 6px;
+    font: inherit; font-size: 12px; font-weight: 600; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
+    background: var(--surface-1); cursor: pointer;
+  }
+  .engine-badge:hover { border-color: var(--baseline); }
+  .engine-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .engine-badge[data-state="active"] { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+  .engine-badge[data-state="active"] .dot { background: var(--good); }
+  .engine-badge[data-state="full"], .engine-badge[data-state="not_responding"] {
+    color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  }
+  .engine-badge[data-state="full"] .dot, .engine-badge[data-state="not_responding"] .dot { background: var(--warn); }
+  .engine-badge[data-state="queued"] {
+    color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, transparent); font-weight: 700;
+  }
+  .engine-badge[data-state="queued"] .dot { background: var(--critical); }
+  .engine-badge[data-state="unreachable"] { color: var(--text-muted); }
+  .engine-badge[data-state="unreachable"] .dot { background: var(--critical); opacity: 0.5; }
+  .engine-badge[data-state="stale"] { color: var(--text-muted); opacity: 0.75; }
+
+  .tabs { display: flex; gap: 4px; margin: 16px 0 0; border-bottom: 1px solid var(--gridline); }
+  .tab-btn {
+    appearance: none; border: none; background: none; cursor: pointer;
+    font: inherit; font-size: 14px; font-weight: 600; color: var(--text-muted);
+    padding: 8px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab-btn:hover { color: var(--text-primary); }
+  .tab-btn[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+  [role="tabpanel"][hidden] { display: none; }
+  .attribution-note {
+    font-size: 12px; color: var(--text-muted); margin: 10px 0 0; line-height: 1.5;
+  }
+  .attribution-note strong { color: var(--text-secondary); font-weight: 600; }
+
   .filters { display: flex; gap: 8px; align-items: center; margin: 18px 0 16px; }
   .filters .label { color: var(--text-muted); font-size: 13px; margin-right: 4px; }
-  .range-btn {
+  .range-btn, .hist-range-btn {
     appearance: none; border: 1px solid var(--border); background: var(--surface-1);
     color: var(--text-secondary); border-radius: 8px; padding: 5px 12px;
     font: inherit; font-size: 13px; cursor: pointer;
   }
-  .range-btn:hover { color: var(--text-primary); }
-  .range-btn[aria-pressed="true"] {
+  .range-btn:hover, .hist-range-btn:hover { color: var(--text-primary); }
+  .range-btn[aria-pressed="true"], .hist-range-btn[aria-pressed="true"] {
     color: var(--text-primary); font-weight: 600; border-color: var(--baseline);
   }
 
@@ -246,6 +285,28 @@
   svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--text-muted); }
   .day-hit { fill: transparent; cursor: default; outline: none; }
   .day-hit:focus-visible { stroke: var(--text-primary); stroke-width: 1; stroke-dasharray: 0; }
+
+  /* ── Engine tab ── */
+  .engine-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .engine-identity-card h2 { font-size: 15px; color: var(--text-primary); margin: 0; }
+  .engine-strip-canvas { width: 100%; height: 140px; display: block; margin-top: 4px; }
+  .tile .val-unit { font-size: 13px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+  .tile.state-idle .value { color: var(--text-muted); }
+  .tile.state-generating .value { color: var(--series-2); }
+  .tile.state-prefilling .value { color: var(--series-1); }
+  .tile.state-queued .value { color: var(--critical); }
+
+  .slot-tag {
+    display: inline-block; border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600;
+    background: var(--gridline); color: var(--text-secondary);
+  }
+  .slot-tag.gen { background: color-mix(in srgb, var(--series-2) 18%, transparent); color: var(--series-2); }
+  .slot-tag.pre { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .slot-bar-track { display: flex; align-items: center; gap: 6px; min-width: 120px; }
+  .slot-bar-rail { flex: 1; height: 6px; border-radius: 3px; background: var(--gridline); overflow: hidden; min-width: 40px; }
+  .slot-bar-fill { height: 100%; }
+  .slot-bar-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; flex: none; }
+  tr.slot-idle td { color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -255,75 +316,147 @@
     <div class="status-line" id="status-line">
       <span class="status-dot" id="status-dot"></span><span id="status-text">connecting…</span>
     </div>
+    <button class="engine-badge" id="engine-badge" type="button" hidden></button>
     <a class="setup-link" href="/setup.html">Setup</a>
     <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
   </header>
 
-  <div class="filters" role="group" aria-label="Date range">
-    <span class="label">Range</span>
-    <button class="range-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
-    <button class="range-btn" data-days="30" aria-pressed="true">Last 30 days</button>
-    <button class="range-btn" data-days="90" aria-pressed="false">Last 90 days</button>
+  <div class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button class="tab-btn" id="tab-usage-btn" role="tab" type="button"
+      aria-selected="true" aria-controls="tab-usage">Usage</button>
+    <button class="tab-btn" id="tab-engine-btn" role="tab" type="button"
+      aria-selected="false" aria-controls="tab-engine">Engine</button>
   </div>
 
-  <div id="content">
-    <div class="grid tiles" id="tiles"></div>
+  <p class="attribution-note">
+    <strong>Usage</strong> counts what hermes sent through this endpoint, from hermes' own records.
+    <strong>Engine</strong> counts everything the endpoint processed, including any other client on the
+    network — hermes is one consumer among possibly several. Neither total is a subset of the other.
+  </p>
 
-    <div class="card activity-card" id="activity-card">
-      <div class="card-head">
-        <h2>Gateway activity</h2>
-        <span class="busy-badge" id="busy-badge"></span>
-      </div>
-      <div class="activity-grid" id="activity-grid"></div>
-      <div class="active-block" id="active-block"></div>
-      <div class="profiles-block" id="profiles-block"></div>
+  <div id="tab-usage" role="tabpanel" aria-labelledby="tab-usage-btn">
+    <div class="filters" role="group" aria-label="Date range">
+      <span class="label">Range</span>
+      <button class="range-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
+      <button class="range-btn" data-days="30" aria-pressed="true">Last 30 days</button>
+      <button class="range-btn" data-days="90" aria-pressed="false">Last 90 days</button>
     </div>
 
-    <div class="card chart-card">
-      <div class="card-head">
-        <h2 id="chart-title">Token counts over time</h2>
-        <div class="head-controls">
-          <div class="seg" id="token-view-seg" role="group" aria-label="Token chart breakdown">
-            <button class="seg-btn" type="button" data-view="type" aria-pressed="true">By type</button>
-            <button class="seg-btn" type="button" data-view="profile" aria-pressed="false">By profile</button>
+    <div id="content">
+      <div class="grid tiles" id="tiles"></div>
+
+      <div class="card activity-card" id="activity-card">
+        <div class="card-head">
+          <h2>Gateway activity</h2>
+          <span class="busy-badge" id="busy-badge"></span>
+        </div>
+        <div class="activity-grid" id="activity-grid"></div>
+        <div class="active-block" id="active-block"></div>
+        <div class="profiles-block" id="profiles-block"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2 id="chart-title">Token counts over time</h2>
+          <div class="head-controls">
+            <div class="seg" id="token-view-seg" role="group" aria-label="Token chart breakdown">
+              <button class="seg-btn" type="button" data-view="type" aria-pressed="true">By type</button>
+              <button class="seg-btn" type="button" data-view="profile" aria-pressed="false">By profile</button>
+            </div>
+            <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
           </div>
-          <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
+        </div>
+        <div class="chart-holder" id="chart-holder">
+          <div id="chart"></div>
+          <div class="tooltip" id="tooltip"></div>
+        </div>
+        <div class="legend" id="chart-legend"></div>
+        <div id="chart-table" hidden></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Usage by model</h2>
+          <button class="toggle-btn" id="model-toggle" aria-pressed="false">Table view</button>
+        </div>
+        <div class="chart-holder" id="model-holder">
+          <div id="model-chart"></div>
+          <div class="tooltip" id="model-tooltip"></div>
+        </div>
+        <div class="legend" id="model-legend"></div>
+        <div id="model-table" hidden></div>
+      </div>
+
+      <div class="grid cols">
+        <div class="card">
+          <h2>Top models</h2>
+          <div id="top-models"></div>
+        </div>
+        <div class="card">
+          <h2>Recent sessions</h2>
+          <div id="sessions"></div>
         </div>
       </div>
-      <div class="chart-holder" id="chart-holder">
-        <div id="chart"></div>
-        <div class="tooltip" id="tooltip"></div>
-      </div>
-      <div class="legend" id="chart-legend"></div>
-      <div id="chart-table" hidden></div>
     </div>
 
-    <div class="card chart-card">
-      <div class="card-head">
-        <h2>Usage by model</h2>
-        <button class="toggle-btn" id="model-toggle" aria-pressed="false">Table view</button>
-      </div>
-      <div class="chart-holder" id="model-holder">
-        <div id="model-chart"></div>
-        <div class="tooltip" id="model-tooltip"></div>
-      </div>
-      <div class="legend" id="model-legend"></div>
-      <div id="model-table" hidden></div>
+    <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
+  </div>
+
+  <div id="tab-engine" role="tabpanel" aria-labelledby="tab-engine-btn" hidden>
+    <div class="filters" role="group" aria-label="Engine picker" id="engine-picker-row" hidden>
+      <span class="label">Engine</span>
+      <div class="seg" id="engine-picker" role="group" aria-label="Select engine"></div>
     </div>
 
-    <div class="grid cols">
-      <div class="card">
-        <h2>Top models</h2>
-        <div id="top-models"></div>
+    <div id="engine-empty" class="card" hidden>
+      <div class="empty" id="engine-empty-text"></div>
+    </div>
+
+    <div id="engine-content" hidden>
+      <div class="card engine-identity-card">
+        <h2 id="engine-identity-title">—</h2>
+        <div class="engine-sub" id="engine-identity-sub"></div>
       </div>
-      <div class="card">
-        <h2>Recent sessions</h2>
-        <div id="sessions"></div>
+
+      <div class="grid tiles" id="engine-tiles" style="margin-top:14px"></div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Token flow per interval</h2>
+          <div class="legend" id="engine-strip-legend"></div>
+        </div>
+        <canvas id="engine-strip" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-strip-note"></div>
+      </div>
+
+      <div class="card chart-card">
+        <h2>Slots</h2>
+        <div id="engine-slots"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Recorded throughput</h2>
+          <div class="legend" id="engine-hist-legend"></div>
+        </div>
+        <div class="filters" role="group" aria-label="History range" style="margin:0 0 10px">
+          <span class="label">Range</span>
+          <button class="hist-range-btn" data-span="900" aria-pressed="true">15m</button>
+          <button class="hist-range-btn" data-span="3600" aria-pressed="false">1h</button>
+          <button class="hist-range-btn" data-span="21600" aria-pressed="false">6h</button>
+          <button class="hist-range-btn" data-span="86400" aria-pressed="false">24h</button>
+          <button class="hist-range-btn" data-span="604800" aria-pressed="false">7d</button>
+          <button class="hist-range-btn" data-span="all" aria-pressed="false">All</button>
+        </div>
+        <canvas id="engine-hist-strip" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-hist-note"></div>
+        <div class="grid tiles" id="engine-hist-tiles" style="margin-top:14px"></div>
+        <div style="margin-top:10px">
+          <button class="toggle-btn" id="engine-hist-csv" type="button">Export CSV</button>
+        </div>
       </div>
     </div>
   </div>
-
-  <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
 </div>
 
 <script>
@@ -1223,6 +1356,785 @@ applyTheme();
 
 refresh();
 setInterval(refresh, 30_000);
+
+// ── Tabs ────────────────────────────────────────────────────────────
+// Usage owns `days` and the date-range filter above; Engine has its own
+// time domain and poll cadence (added in later phases) — they are
+// deliberately not shared state.
+const TAB_IDS = ['usage', 'engine'];
+let activeTab = 'usage';
+
+function setActiveTab(tab, opts) {
+  opts = opts || {};
+  if (!TAB_IDS.includes(tab)) tab = 'usage';
+  const changed = tab !== activeTab;
+  activeTab = tab;
+  for (const id of TAB_IDS) {
+    $(`tab-${id}-btn`).setAttribute('aria-selected', String(id === tab));
+    $(`tab-${id}`).hidden = id !== tab;
+  }
+  if (!opts.skipHash) {
+    const hash = tab === 'usage' ? '' : `#${tab}`;
+    if (location.hash !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
+  }
+  if (changed) {
+    if (tab === 'engine') startEnginePoll(); else stopEnginePoll();
+  }
+}
+$('tab-usage-btn').addEventListener('click', () => setActiveTab('usage'));
+$('tab-engine-btn').addEventListener('click', () => setActiveTab('engine'));
+window.addEventListener('hashchange', () =>
+  setActiveTab(location.hash.replace('#', ''), { skipHash: true }));
+// A tab switch stops the engine poll; a backgrounded browser tab should too,
+// so an idle window doesn't poll llama-server forever.
+document.addEventListener('visibilitychange', () => {
+  if (activeTab !== 'engine') return;
+  if (document.hidden) stopEnginePoll(); else startEnginePoll();
+});
+
+// ── Engine tab ──────────────────────────────────────────────────────
+let engineList = [];
+let currentEngineId = null;
+let enginePollTimer = null;
+const ENGINE_POLL_MS = 4000;
+const ENGINE_MAXCOLS = 160;
+
+// Per-engine running series, rebuilt from scratch on engine switch or a
+// detected server restart (counters going backwards) — none of it is
+// comparable across either boundary.
+let engineSamples = [];      // [{t, m}] raw metric snapshots, m may be null
+let engineDeltas = [];       // [{t, dt, preTok, preSec, genTok, genSec, decodes, livePre, liveGen}]
+let engineSlotPrev = {};     // slot id -> {task, decoded, processed}
+let engineTaskPrompt = {};   // task id -> {cache, total}
+let engineTaskOrder = [];
+let engineReqCount = 0;
+let engineHasPromptFields = false;
+
+function resetEngineSeries() {
+  engineSamples = []; engineDeltas = []; engineSlotPrev = {};
+  engineTaskPrompt = {}; engineTaskOrder = []; engineReqCount = 0;
+}
+
+function fmtNum(n, dp) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  dp = dp === undefined ? 1 : dp;
+  return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+function firstNum(list) {
+  for (const v of list) if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return 0;
+}
+function valueWithUnit(numText, unit) {
+  return el('span', {}, document.createTextNode(numText), unit ? el('span', { class: 'val-unit', text: unit }) : null);
+}
+function tileEl(label, valueNode, sub, extraClass) {
+  return el('div', { class: 'card tile' + (extraClass ? ' ' + extraClass : '') },
+    el('div', { class: 'label', text: label }),
+    el('div', { class: 'value' }, valueNode),
+    sub ? el('div', { class: 'sub', text: sub }) : null);
+}
+
+// Mirrors the standalone telemetry page's slot-progress reader: first
+// sighting of a slot only baselines it (a request already mid-flight would
+// otherwise dump its whole history into one interval); after that, a
+// changed task id means the slot's own counters restarted at zero, so the
+// current value *is* the delta rather than a difference.
+function readSlots(slots, dt) {
+  const live = { gen: 0, pre: 0, generating: 0, prefilling: 0, idle: 0 };
+  if (!Array.isArray(slots)) return null;
+  const next = {};
+  for (const s of slots) {
+    const id = String(s.id);
+    const task = s.id_task === undefined ? -1 : s.id_task;
+    const nt = s.next_token || {};
+    const dec = firstNum([nt.n_decoded, s.n_decoded]);
+    const proc = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
+    const cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
+    const total = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
+    const p = engineSlotPrev[id];
+    const sameTask = p && p.task === task;
+    const dDec = !p ? 0 : (sameTask ? Math.max(0, dec - p.decoded) : dec);
+    const dProc = !p ? 0 : (sameTask ? Math.max(0, proc - p.processed) : proc);
+    if (s.is_processing) {
+      live.gen += dDec; live.pre += dProc;
+      if (dec > 0) live.generating++; else live.prefilling++;
+    } else {
+      live.idle++;
+    }
+    if (task !== -1 && total > 0) {
+      if (!engineTaskPrompt[task]) engineTaskOrder.push(task);
+      engineTaskPrompt[task] = { cache, total };
+    }
+    if (task !== -1 && (!p || p.task !== task) && s.is_processing) engineReqCount++;
+    next[id] = { task, decoded: dec, processed: proc };
+  }
+  engineSlotPrev = next;
+  while (engineTaskOrder.length > 300) delete engineTaskPrompt[engineTaskOrder.shift()];
+  live.genRate = dt > 0 ? live.gen / dt : 0;
+  live.preRate = engineHasPromptFields ? (dt > 0 ? live.pre / dt : 0) : null;
+  return live;
+}
+
+function engineCacheReuse() {
+  let c = 0, t = 0;
+  for (const k in engineTaskPrompt) { c += engineTaskPrompt[k].cache; t += engineTaskPrompt[k].total; }
+  return t > 0 ? { pct: 100 * c / t, cached: c, total: t } : null;
+}
+
+function computeLiveRates() {
+  const w = engineDeltas.slice(-3);
+  let lp = 0, np = 0, lg = 0, ng = 0;
+  for (const d of w) {
+    if (d.livePre !== null && d.livePre !== undefined) { lp += d.livePre; np++; }
+    if (d.liveGen !== null && d.liveGen !== undefined) { lg += d.liveGen; ng++; }
+  }
+  return { livePre: np ? lp / np : null, liveGen: ng ? lg / ng : null };
+}
+function computeSettledRates() {
+  const s = engineDeltas.slice(-10);
+  let pT = 0, pS = 0, gT = 0, gS = 0;
+  for (const d of s) { pT += d.preTok; pS += d.preSec; gT += d.genTok; gS += d.genSec; }
+  return { preSettled: pS > 0 ? pT / pS : null, genSettled: gS > 0 ? gT / gS : null };
+}
+
+function ingestEngineLive(payload) {
+  const m = payload.metrics;
+  engineHasPromptFields = !!(payload.features && payload.features.hasPromptFields);
+  const prev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
+  if (prev && prev.m && m && Number(m.n_decode_total) < Number(prev.m.n_decode_total)) {
+    resetEngineSeries();
+  }
+  const now = Date.now();
+  const dtPrev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
+  const dt = dtPrev ? (now - dtPrev.t) / 1000 : 0;
+  const live = readSlots(payload.slots, dt);
+  engineSamples.push({ t: now, m });
+  if (engineSamples.length > ENGINE_MAXCOLS + 1) engineSamples.shift();
+  if (dtPrev && dt > 0 && dtPrev.m && m) {
+    engineDeltas.push({
+      t: now, dt,
+      preTok: Math.max(0, (m.prompt_tokens_total || 0) - (dtPrev.m.prompt_tokens_total || 0)),
+      preSec: Math.max(0, (m.prompt_seconds_total || 0) - (dtPrev.m.prompt_seconds_total || 0)),
+      genTok: Math.max(0, (m.tokens_predicted_total || 0) - (dtPrev.m.tokens_predicted_total || 0)),
+      genSec: Math.max(0, (m.tokens_predicted_seconds_total || 0) - (dtPrev.m.tokens_predicted_seconds_total || 0)),
+      decodes: Math.max(0, (m.n_decode_total || 0) - (dtPrev.m.n_decode_total || 0)),
+      livePre: live ? live.preRate : null,
+      liveGen: live ? live.genRate : null,
+    });
+    if (engineDeltas.length > ENGINE_MAXCOLS) engineDeltas.shift();
+  }
+  renderEngineLive(payload, live);
+}
+
+function renderEngineIdentity(payload) {
+  const eng = payload.engine || {};
+  const props = payload.props;
+  let title, sub;
+  if (props) {
+    const model = String(props.model_path || '').split('/').pop() || 'unknown model';
+    const bits = [model];
+    if (props.build_info) bits.push(props.build_info);
+    if (props.total_slots != null) bits.push(`${props.total_slots} slots`);
+    title = bits.join(' · ');
+    sub = [eng.llama_url, props.n_ctx ? `n_ctx ${fmtFull(props.n_ctx)}` : null,
+      props.endpoint_metrics === false ? 'metrics disabled on this server' : null]
+      .filter(Boolean).join(' · ');
+  } else {
+    title = eng.label || eng.id || 'Engine';
+    sub = [eng.llama_url, payload.props_error ? `model info unavailable (${payload.props_error})` : null]
+      .filter(Boolean).join(' · ');
+  }
+  $('engine-identity-title').textContent = title;
+  $('engine-identity-sub').textContent = sub;
+}
+
+function renderEngineLive(payload, live) {
+  renderEngineIdentity(payload);
+
+  const m = payload.metrics || {};
+  const { livePre, liveGen } = computeLiveRates();
+  const { preSettled, genSettled } = computeSettledRates();
+  const liveSource = liveGen !== null ? 'slots' : (engineDeltas.length ? 'decode' : 'none');
+
+  const tiles = [];
+  if (liveSource === 'slots' && livePre !== null) {
+    tiles.push(tileEl('Prefill · now', valueWithUnit(livePre < 0.5 ? '0' : fmtNum(livePre, 0), 'tok/s'),
+      `on completion ${preSettled != null ? fmtNum(preSettled, 0) + ' tok/s' : '—'}`));
+  } else if (liveSource === 'slots') {
+    tiles.push(tileEl('Prefill · now', valueWithUnit(preSettled == null ? '—' : fmtNum(preSettled, 0), 'tok/s'),
+      "this build's /slots omits prompt counters — differenced from /metrics instead"));
+  } else {
+    tiles.push(tileEl('Prefill · now', valueWithUnit('—', 'tok/s'), 'no slot data'));
+  }
+
+  if (liveSource === 'slots') {
+    tiles.push(tileEl('Generation · now', valueWithUnit(liveGen < 0.05 ? '0' : fmtNum(liveGen, 1), 'tok/s'),
+      `on completion ${genSettled != null ? fmtNum(genSettled, 1) + ' tok/s' : '—'}`,
+      liveGen >= 0.05 ? 'state-generating' : ''));
+  } else if (liveSource === 'decode') {
+    const r = engineDeltas.slice(-3);
+    let dTot = 0, dWall = 0;
+    for (const d of r) { dTot += d.decodes || 0; dWall += d.dt; }
+    const decRate = dWall > 0 ? dTot / dWall : null;
+    tiles.push(tileEl('Generation · now', valueWithUnit(decRate == null ? '—' : fmtNum(decRate, 1), 'dec/s'),
+      'no slot data — llama_decode() calls per second instead'));
+  } else {
+    tiles.push(tileEl('Generation · now', valueWithUnit('—', 'tok/s'), '—'));
+  }
+
+  const cr = engineCacheReuse();
+  tiles.push(tileEl('Prompt cache reuse', valueWithUnit(cr ? fmtNum(cr.pct, 1) : '—', '%'),
+    cr
+      ? `${fmtCompact(cr.cached)} reused of ${fmtCompact(cr.total)} prompt tokens across ${engineTaskOrder.length} requests`
+      : (!engineHasPromptFields
+          ? "Unavailable: this build's /slots does not report n_prompt_tokens_cache."
+          : 'Share of prompt tokens served from cache instead of reprocessed.')));
+
+  let stateTxt = 'idle', stateSub = 'No slot is processing.', stateClass = 'state-idle';
+  if (live) {
+    if (live.generating) {
+      stateTxt = 'generating'; stateClass = 'state-generating';
+      stateSub = `${live.generating} slot${live.generating === 1 ? '' : 's'} decoding`;
+    } else if (live.prefilling) {
+      stateTxt = 'prefilling'; stateClass = 'state-prefilling';
+      stateSub = `${live.prefilling} slot${live.prefilling === 1 ? '' : 's'} processing prompt`;
+    } else {
+      stateSub = `${live.idle} slot${live.idle === 1 ? '' : 's'} idle`;
+    }
+  } else if (Number(m.requests_processing) > 0) {
+    stateTxt = 'busy'; stateSub = 'slots endpoint unavailable — falling back to the gauge';
+  }
+  const deferred = Number(m.requests_deferred || 0);
+  if (deferred > 0) { stateSub += ` · ${deferred} deferred`; stateClass = 'state-queued'; }
+  tiles.push(tileEl('Server state', document.createTextNode(stateTxt), stateSub, stateClass));
+
+  $('engine-tiles').replaceChildren(...tiles);
+  renderEngineSlots(payload.slots, payload.slots_error);
+  drawEngineStrip();
+
+  $('engine-strip-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-2)' }), el('span', { text: 'Generation' })));
+  $('engine-strip-note').textContent = engineDeltas.length
+    ? `${engineDeltas.length} interval${engineDeltas.length === 1 ? '' : 's'} · ${fmtNum(engineDeltas[engineDeltas.length - 1].dt, 1)}s per column`
+    : 'waiting for a second reading — rates need two points';
+}
+
+function renderEngineSlots(slots, slotsError) {
+  const holder = $('engine-slots');
+  if (!Array.isArray(slots) || !slots.length) {
+    holder.replaceChildren(el('div', { class: 'empty',
+      text: 'No slot data' + (slotsError ? ` — ${slotsError}` : '') + '. Live token rates need this endpoint.' }));
+    return;
+  }
+  const showPrompt = engineHasPromptFields;
+  const head = el('tr', {},
+    el('th', { text: 'Slot' }), el('th', { text: 'State' }), el('th', { class: 'num', text: 'Task' }),
+    ...(showPrompt ? [el('th', { text: 'Prompt' }), el('th', { class: 'num', text: 'Cached' })] : []),
+    el('th', { class: 'num', text: 'Decoded' }), el('th', { class: 'num', text: 'Context' }));
+  const rows = slots.map((s) => {
+    const busy = !!s.is_processing;
+    const nt = s.next_token || {};
+    const dec = nt.n_decoded || 0;
+    const total = s.n_prompt_tokens || 0;
+    const cache = s.n_prompt_tokens_cache || 0;
+    const proc = s.n_prompt_tokens_processed || 0;
+    const done = Math.min(total, cache + proc);
+    const pct = total > 0 ? 100 * done / total : 0;
+    const state = !busy ? 'idle' : (dec > 0 ? 'generating' : 'prefilling');
+    const tagClass = !busy ? '' : (dec > 0 ? 'gen' : 'pre');
+    const barColor = dec > 0 ? 'var(--series-2)' : 'var(--series-1)';
+    return el('tr', { class: busy ? '' : 'slot-idle' },
+      el('td', { text: String(s.id) }),
+      el('td', {}, el('span', { class: 'slot-tag' + (tagClass ? ' ' + tagClass : ''), text: state })),
+      el('td', { class: 'num', text: (s.id_task == null || s.id_task === -1) ? '—' : String(s.id_task) }),
+      ...(showPrompt ? [
+        el('td', {}, total > 0
+          ? el('div', { class: 'slot-bar-track' },
+              el('div', { class: 'slot-bar-rail' },
+                el('div', { class: 'slot-bar-fill', style: `width:${pct.toFixed(1)}%;background:${barColor}` })),
+              el('span', { class: 'slot-bar-label', text: `${fmtCompact(done)} / ${fmtCompact(total)}` }))
+          : el('span', { class: 'cell-sub', text: '—' })),
+        el('td', { class: 'num', text: total > 0 ? `${fmtNum(100 * cache / total, 0)}%` : '—' }),
+      ] : []),
+      el('td', { class: 'num', text: (busy || dec) ? fmtFull(dec) : '—' }),
+      el('td', { class: 'num cell-sub', text: fmtCompact(s.n_ctx) }));
+  });
+  holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
+}
+
+// ── Engine live strip (canvas — 400+ columns, SVG would be too heavy) ──
+function cssVar(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function sizeEngineCanvas(c, ctx) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = c.getBoundingClientRect();
+  c.width = Math.max(1, Math.round(r.width * dpr));
+  c.height = Math.max(1, Math.round(r.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: r.width, h: r.height };
+}
+// Shared by the live and history strips: prefill above the midline,
+// generation below, each axis scaled to its own maximum. opt.marks flags
+// buckets with a missing sample (collector recorded ok=0); opt.breaks flags
+// a discontinuity (server restart) right before that column — drawn as a
+// break in the strip rather than differenced into a false spike.
+function drawStripCanvas(c, pre, gen, emptyMsg, opt) {
+  opt = opt || {};
+  if (!c.isConnected || c.clientWidth === 0) return;
+  const ctx = c.getContext('2d');
+  const { w: W, h: H } = sizeEngineCanvas(c, ctx);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 46, padR = 12, padT = 14, padB = opt.labels ? 24 : 14;
+  const plotW = W - padL - padR, mid = padT + (H - padT - padB) / 2, half = (H - padT - padB) / 2 - 6;
+  const rule = cssVar('--gridline'), faint = cssVar('--text-muted');
+
+  ctx.strokeStyle = rule; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, Math.round(mid) + 0.5); ctx.lineTo(W - padR, Math.round(mid) + 0.5); ctx.stroke();
+
+  if (!pre.length) {
+    ctx.fillStyle = faint; ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(emptyMsg, W / 2, mid - 12);
+    return;
+  }
+
+  const maxPre = Math.max(1, ...pre), maxGen = Math.max(1, ...gen);
+  const n = pre.length, slot = plotW / Math.max(n, 24), bw = Math.max(1.5, slot - 1.6);
+
+  ctx.setLineDash([2, 4]); ctx.strokeStyle = rule; ctx.beginPath();
+  ctx.moveTo(padL, Math.round(mid - half) + 0.5); ctx.lineTo(W - padR, Math.round(mid - half) + 0.5);
+  ctx.moveTo(padL, Math.round(mid + half) + 0.5); ctx.lineTo(W - padR, Math.round(mid + half) + 0.5);
+  ctx.stroke(); ctx.setLineDash([]);
+
+  ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(fmtCompact(maxPre), padL - 8, mid - half + 4);
+  ctx.fillText(fmtCompact(maxGen), padL - 8, mid + half + 4);
+  ctx.fillText('0', padL - 8, mid + 3.5);
+
+  const cPre = cssVar('--series-1'), cGen = cssVar('--series-2'), alert = cssVar('--critical');
+  for (let j = 0; j < n; j++) {
+    const x = padL + plotW - (n - j) * slot + (slot - bw) / 2;
+    if (opt.breaks && opt.breaks[j]) {
+      ctx.strokeStyle = faint; ctx.globalAlpha = 0.5; ctx.beginPath();
+      ctx.moveTo(Math.round(x) - 0.5, mid - half); ctx.lineTo(Math.round(x) - 0.5, mid + half);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (opt.marks && opt.marks[j]) {
+      ctx.fillStyle = alert; ctx.fillRect(x, mid - 1.5, Math.max(bw, 1.5), 3);
+      continue;
+    }
+    ctx.globalAlpha = (opt.dimOlder === false || j === n - 1) ? 1 : 0.82;
+    const hp = (pre[j] / maxPre) * half;
+    if (hp > 0.4) { ctx.fillStyle = cPre; ctx.fillRect(x, mid - hp, bw, hp); }
+    const hg = (gen[j] / maxGen) * half;
+    if (hg > 0.4) { ctx.fillStyle = cGen; ctx.fillRect(x, mid + 1, bw, hg); }
+    ctx.globalAlpha = 1;
+  }
+
+  if (opt.labels) {
+    ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif';
+    for (const lb of opt.labels) {
+      ctx.textAlign = lb.frac <= 0 ? 'left' : (lb.frac >= 1 ? 'right' : 'center');
+      ctx.fillText(lb.text, padL + plotW * lb.frac, H - 6);
+    }
+  }
+}
+
+function drawEngineStrip() {
+  const pre = [], gen = [];
+  for (const d of engineDeltas) {
+    pre.push(d.livePre !== null && d.livePre !== undefined ? d.livePre : (d.preSec > 0 ? d.preTok / d.preSec : 0));
+    gen.push(d.liveGen !== null && d.liveGen !== undefined ? d.liveGen : (d.genSec > 0 ? d.genTok / d.genSec : 0));
+  }
+  drawStripCanvas($('engine-strip'), pre, gen, 'waiting for a second reading — rates need two points');
+}
+window.addEventListener('resize', () => {
+  if (activeTab !== 'engine' || $('engine-content').hidden) return;
+  drawEngineStrip();
+  drawEngineHistStrip();
+});
+
+// ── Engine tab: recorded history (served by the collector, proxied) ────
+let engineHist = null;         // {cols, bucket, from, to, metrics, rows} | null
+let engineHistCols = {};       // column name -> index into each row
+let engineHistSpan = 900;      // seconds, or 'all'
+let engineHistLoadedFor = null;
+
+function histTimeLabel(t, spanSec) {
+  const d = new Date(t * 1000);
+  const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return spanSec > 86400 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${hm}` : hm;
+}
+
+// Turns raw collector rows into per-bucket rates by differencing consecutive
+// pairs — mirrors the standalone telemetry page's histSeries(). A pair whose
+// bucket recorded no counters (collector was down) becomes a gap marker
+// instead of a zero; a pair whose epoch changed (server restart) becomes a
+// break instead of being differenced into a false spike.
+function engineHistSeries() {
+  if (!engineHist || !Array.isArray(engineHist.rows) || engineHist.rows.length < 2) return [];
+  const R = engineHist.rows, HC = engineHistCols, out = [];
+  const haveM = !!engineHist.metrics;
+  for (let i = 1; i < R.length; i++) {
+    const a = R[i - 1], b = R[i];
+    const gap = b[HC.n] > b[HC.n_ok];
+    const pair = a[HC.prompt_tokens] !== null && b[HC.prompt_tokens] !== null;
+    if (haveM && !pair) {
+      out.push({ t: b[HC.ts], dt: 0, pre: 0, gen: 0, preTok: 0, preSec: 0, genTok: 0, genSec: 0, busy: 0, gap: true, brk: false });
+      continue;
+    }
+    const dt = b[HC.ts] - a[HC.ts];
+    if (!(dt > 0)) continue;
+    const brk = b[HC.epoch] !== a[HC.epoch];
+    const can = pair && !brk;
+    const dpT = can ? Math.max(0, b[HC.prompt_tokens] - a[HC.prompt_tokens]) : 0;
+    const dpS = can ? Math.max(0, b[HC.prompt_seconds] - a[HC.prompt_seconds]) : 0;
+    const dgT = can ? Math.max(0, b[HC.predicted_tokens] - a[HC.predicted_tokens]) : 0;
+    const dgS = can ? Math.max(0, b[HC.predicted_seconds] - a[HC.predicted_seconds]) : 0;
+    out.push({
+      t: b[HC.ts], dt,
+      pre: dpS > 0 ? dpT / dpS : 0,
+      gen: (b[HC.gen_delta] > 0) ? b[HC.gen_delta] / dt : 0,
+      preTok: dpT, preSec: dpS, genTok: dgT, genSec: dgS,
+      busy: (b[HC.slots_generating] || 0) + (b[HC.slots_prefilling] || 0),
+      gap, brk,
+    });
+  }
+  return out;
+}
+
+function drawEngineHistStrip() {
+  const s = engineHistSeries();
+  if (!s.length) {
+    drawStripCanvas($('engine-hist-strip'), [], [], engineHist ? 'window contains no usable pairs' : 'no window loaded');
+    return;
+  }
+  const pre = [], gen = [], marks = [], breaks = [];
+  for (const row of s) { pre.push(row.pre); gen.push(row.gen); marks.push(row.gap); breaks.push(row.brk); }
+  const t0 = s[0].t, t1 = s[s.length - 1].t, sp = t1 - t0;
+  drawStripCanvas($('engine-hist-strip'), pre, gen, '', {
+    marks, breaks, dimOlder: false,
+    labels: [
+      { frac: 0, text: histTimeLabel(t0, sp) },
+      { frac: 0.5, text: histTimeLabel((t0 + t1) / 2, sp) },
+      { frac: 1, text: histTimeLabel(t1, sp) },
+    ],
+  });
+}
+
+function renderEngineHistSummary() {
+  const s = engineHistSeries();
+  const tilesHolder = $('engine-hist-tiles');
+  $('engine-hist-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-2)' }), el('span', { text: 'Generation' })));
+  if (!s.length) {
+    tilesHolder.replaceChildren();
+    drawEngineHistStrip();
+    return;
+  }
+  const haveM = !!engineHist.metrics;
+  let pT = 0, pS = 0, gT = 0, gS = 0, wall = 0, busy = 0, gaps = 0, restarts = 0, slotTok = 0;
+  for (const row of s) {
+    pT += row.preTok; pS += row.preSec; gT += row.genTok; gS += row.genSec;
+    wall += row.dt; busy += row.busy * row.dt; slotTok += row.gen * row.dt;
+    if (row.gap) gaps++;
+    if (row.brk) restarts++;
+  }
+  const preAvg = (haveM && pS > 0) ? pT / pS : null;
+  const genAvg = haveM ? (gS > 0 ? gT / gS : null) : (wall > 0 ? slotTok / wall : null);
+
+  tilesHolder.replaceChildren(
+    tileEl('Prefill · window avg', valueWithUnit(preAvg == null ? '—' : fmtNum(preAvg, 0), 'tok/s'),
+      haveM ? `${fmtCompact(pT)} prompt tokens over ${fmtNum(pS, 0)}s of prefill compute`
+            : 'Unavailable: /metrics is disabled on this server.'),
+    tileEl('Generation · window avg', valueWithUnit(genAvg == null ? '—' : fmtNum(genAvg, 1), 'tok/s'),
+      haveM ? `${fmtCompact(gT)} tokens over ${fmtNum(gS, 0)}s of decode compute`
+            : `${fmtCompact(slotTok)} tokens over ${fmtNum(wall / 60, 0)}min — slot-derived, not decode time`),
+    tileEl('Tokens in window', document.createTextNode(haveM ? `${fmtCompact(pT)} / ${fmtCompact(gT)}` : `— / ${fmtCompact(slotTok)}`),
+      (haveM ? 'prompt / generated, differenced across the window' : 'prompt unavailable; generated counted from slot progress') +
+        (restarts ? ` · ${restarts} restart${restarts === 1 ? '' : 's'} spanned` : '')),
+    tileEl('Utilisation', valueWithUnit(fmtNum(wall > 0 ? busy / wall : 0, 2), 'slots'),
+      gaps ? `${gaps} of ${s.length} buckets missed samples — server unreachable then` : 'continuous coverage, no missed samples'));
+
+  const mins = wall / 60;
+  $('engine-hist-note').textContent = `${s.length} bucket${s.length === 1 ? '' : 's'} · ` +
+    `${engineHist.bucket >= 60 ? fmtNum(engineHist.bucket / 60, 1) + 'min' : fmtNum(engineHist.bucket, 0) + 's'} per column · ` +
+    `${mins >= 90 ? fmtNum(mins / 60, 1) + 'h' : fmtNum(mins, 0) + 'min'} spanned`;
+  drawEngineHistStrip();
+}
+
+function setHistSpanButtons(span) {
+  document.querySelectorAll('.hist-range-btn').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.span === String(span))));
+}
+
+async function loadEngineHistory(span) {
+  engineHistSpan = span;
+  setHistSpanButtons(span);
+  if (!currentEngineId) return;
+  $('engine-hist-note').textContent = 'loading…';
+  try {
+    let from, to;
+    if (span === 'all') {
+      const r = await fetch(`/api/engine/range?engine=${encodeURIComponent(currentEngineId)}`);
+      const g = await r.json();
+      if (g.error) throw new Error(g.error);
+      if (!g.rows) throw new Error('collector has recorded nothing yet');
+      from = g.from - 1; to = g.to + 1;
+    } else {
+      to = Date.now() / 1000;
+      from = to - span;
+    }
+    const res = await fetch(`/api/engine/history?engine=${encodeURIComponent(currentEngineId)}&from=${from}&to=${to}&points=400`);
+    const j = await res.json();
+    if (j.error) throw new Error(j.error);
+    engineHist = j;
+    engineHistCols = {};
+    (j.cols || []).forEach((name, i) => { engineHistCols[name] = i; });
+    renderEngineHistSummary();
+  } catch (err) {
+    engineHist = null;
+    $('engine-hist-note').textContent = String(err?.message || err);
+    renderEngineHistSummary();
+  }
+}
+document.querySelectorAll('.hist-range-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const raw = btn.dataset.span;
+    loadEngineHistory(raw === 'all' ? 'all' : Number(raw));
+  });
+});
+
+$('engine-hist-csv').addEventListener('click', () => {
+  const s = engineHistSeries();
+  if (!s.length) return;
+  const header = 'timestamp_iso,dt_seconds,prefill_tok_s,generation_tok_s,prompt_tokens,prompt_seconds,generated_tokens,generation_seconds,busy_slots,gap,restart\n';
+  const lines = s.map((row) => [
+    new Date(row.t * 1000).toISOString(), row.dt.toFixed(2), row.pre.toFixed(3), row.gen.toFixed(3),
+    row.preTok, row.preSec.toFixed(2), row.genTok, row.genSec.toFixed(2), row.busy, row.gap ? 1 : 0, row.brk ? 1 : 0,
+  ].join(','));
+  const blob = new Blob([header + lines.join('\n') + '\n'], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: `${currentEngineId || 'engine'}-history-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+// ── Engine tab: fetch orchestration, picker, empty states ──────────
+function showEngineEmpty(content) {
+  $('engine-content').hidden = true;
+  $('engine-empty').hidden = false;
+  const holder = $('engine-empty-text');
+  if (typeof content === 'string') holder.textContent = content;
+  else holder.replaceChildren(...(Array.isArray(content) ? content : [content]));
+}
+
+function renderEnginePicker() {
+  const row = $('engine-picker-row');
+  if (engineList.length < 2) { row.hidden = true; $('engine-picker').replaceChildren(); return; }
+  row.hidden = false;
+  $('engine-picker').replaceChildren(...engineList.map((e) =>
+    el('button', { class: 'seg-btn', type: 'button', 'data-id': e.id,
+      'aria-pressed': String(e.id === currentEngineId), text: e.label || e.id })));
+}
+$('engine-picker').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.seg-btn');
+  if (!btn || btn.dataset.id === currentEngineId) return;
+  selectEngine(btn.dataset.id);
+});
+function selectEngine(id) {
+  currentEngineId = id;
+  resetEngineSeries();
+  renderEnginePicker();
+  engineHistLoadedFor = id;
+  loadEngineHistory(900); // reset to the default window — history isn't comparable across engines either
+  if (activeTab === 'engine') pollEngineLive();
+}
+
+async function loadEngineList() {
+  try {
+    const res = await fetch('/api/engines');
+    const j = await res.json();
+    engineList = Array.isArray(j.engines) ? j.engines : [];
+  } catch {
+    engineList = [];
+  }
+  if (!currentEngineId && engineList.length) currentEngineId = engineList[0].id;
+  renderEnginePicker();
+  if (!engineList.length) {
+    showEngineEmpty([
+      el('span', { text: 'No llama.cpp engine configured. Add one in ' }),
+      el('a', { href: '/setup.html', text: 'Setup' }),
+      el('span', { text: '.' }),
+    ]);
+  }
+  if (activeTab === 'engine' && !enginePollTimer && engineList.length) startEnginePoll();
+
+  // The health badge always tracks the first configured engine — the one
+  // hermes actually talks to (see the plan doc's attribution boundary) —
+  // independent of whichever engine the Engine tab happens to be showing.
+  const wantBadgeEngine = engineList[0] || null;
+  if (wantBadgeEngine?.id !== badgeEngine?.id) {
+    badgeEngine = wantBadgeEngine;
+    stopEngineBadge();
+    badgeLastGood = null; badgeLastGoodAt = null;
+    if (badgeEngine && !document.hidden) startEngineBadge();
+    else renderEngineBadge(null);
+  }
+}
+
+function engineAllFailed(payload) {
+  return !payload.metrics && !payload.slots && !payload.props;
+}
+
+async function pollEngineLive() {
+  if (!currentEngineId) return;
+  try {
+    const res = await fetch(`/api/engine/live?engine=${encodeURIComponent(currentEngineId)}`);
+    const payload = await res.json();
+    if (payload.error) { showEngineEmpty(payload.error); return; }
+    if (engineAllFailed(payload)) {
+      resetEngineSeries();
+      showEngineEmpty(`Cannot reach ${payload.engine?.label || currentEngineId} — ` +
+        `${payload.metrics_error || payload.slots_error || payload.props_error || 'unreachable'}.`);
+      return;
+    }
+    $('engine-empty').hidden = true;
+    $('engine-content').hidden = false;
+    ingestEngineLive(payload);
+  } catch {
+    showEngineEmpty('Stats server unreachable.');
+  }
+}
+
+function startEnginePoll() {
+  stopEnginePoll();
+  if (!engineList.length) { loadEngineList(); return; }
+  if (engineHistLoadedFor !== currentEngineId) {
+    engineHistLoadedFor = currentEngineId;
+    loadEngineHistory(engineHistSpan);
+  }
+  pollEngineLive();
+  enginePollTimer = setInterval(pollEngineLive, ENGINE_POLL_MS);
+}
+function stopEnginePoll() {
+  if (enginePollTimer) { clearInterval(enginePollTimer); enginePollTimer = null; }
+}
+
+// ── Engine health badge ──────────────────────────────────────────────
+// Answers one question from the Usage tab, where someone is when a session
+// feels slow: is the engine underneath currently a bottleneck? A separate
+// route and timer from the Engine tab's own poll — /api/engine/health hits
+// only /metrics, so it stays the cheapest call in the system and the Usage
+// tab never blocks on it.
+let badgeEngine = null;        // {id, label} | null — hidden entirely when null
+let badgePollTimer = null;
+let badgeLastGood = null;      // last successful /api/engine/health payload
+let badgeLastGoodAt = null;    // Date.now() of that success
+const BADGE_POLL_MS = 20_000;
+const BADGE_STALE_MS = 90_000;
+
+function badgeHostPort(url) {
+  try {
+    const u = new URL(url);
+    return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+  } catch {
+    return url || 'engine';
+  }
+}
+
+// Wording is deliberate: it names the endpoint, and anywhere load is
+// implicated it says load may include other clients — never "your
+// requests", which would misattribute traffic hermes cannot see (see the
+// plan doc's attribution boundary in §1). The badge is the UI surface most
+// likely to trip that failure mode.
+function renderEngineBadge(health) {
+  const btn = $('engine-badge');
+  if (!badgeEngine) { btn.hidden = true; return; }
+  const h = health && health.state && health.state !== 'hidden' ? health : badgeLastGood;
+  if (!h) { btn.hidden = true; return; } // never had a good answer — stay hidden rather than guess
+
+  const stale = badgeLastGoodAt !== null && (Date.now() - badgeLastGoodAt) > BADGE_STALE_MS;
+  const state = stale ? 'stale' : h.state;
+  const host = badgeHostPort(h.engine?.llama_url);
+  const otherClients = 'Load may include clients other than hermes.';
+
+  let visible, ariaTail;
+  if (state === 'stale') {
+    const ageS = Math.round((Date.now() - badgeLastGoodAt) / 1000);
+    visible = `Engine — ${fmtAge(ageS)}`;
+    ariaTail = `no update in ${ageS}s — may be out of date.`;
+  } else if (state === 'queued') {
+    visible = `Engine queued ×${fmtFull(h.requests_deferred)}`;
+    ariaTail = `${fmtFull(h.requests_deferred)} request${h.requests_deferred === 1 ? '' : 's'} queued. ${otherClients}`;
+  } else if (state === 'full') {
+    visible = 'Engine full';
+    ariaTail = `all ${fmtFull(h.total_slots)} slots busy. ${otherClients}`;
+  } else if (state === 'active') {
+    visible = 'Engine active';
+    ariaTail = `${fmtFull(h.requests_processing)} of ${fmtFull(h.total_slots)} slots busy. ${otherClients}`;
+  } else if (state === 'not_responding') {
+    visible = 'Engine not responding';
+    ariaTail = "didn't answer within 3s — may be under heavy load.";
+  } else if (state === 'unreachable') {
+    visible = 'Engine unreachable';
+    ariaTail = 'could not connect.';
+  } else {
+    visible = 'Engine idle';
+    ariaTail = 'no requests processing.';
+  }
+
+  btn.hidden = false;
+  btn.dataset.state = state;
+  btn.replaceChildren(el('span', { class: 'dot' }), el('span', { text: visible }));
+  const fullText = `llama.cpp @ ${host} — ${ariaTail} Click to open the Engine tab.`;
+  btn.setAttribute('aria-label', fullText);
+  btn.title = fullText;
+}
+
+async function pollEngineBadge() {
+  if (!badgeEngine) return;
+  try {
+    const res = await fetch(`/api/engine/health?engine=${encodeURIComponent(badgeEngine.id)}`);
+    const h = await res.json();
+    if (h.state && h.state !== 'hidden') {
+      badgeLastGood = h;
+      badgeLastGoodAt = Date.now();
+    }
+    renderEngineBadge(h);
+  } catch {
+    // Fails silently — staleness (checked on every render, including the
+    // next poll tick) surfaces it once BADGE_STALE_MS has passed, rather
+    // than this catch block flipping straight to a confident wrong state.
+    renderEngineBadge(null);
+  }
+}
+
+function startEngineBadge() {
+  stopEngineBadge();
+  pollEngineBadge();
+  badgePollTimer = setInterval(pollEngineBadge, BADGE_POLL_MS);
+}
+function stopEngineBadge() {
+  if (badgePollTimer) { clearInterval(badgePollTimer); badgePollTimer = null; }
+}
+
+// Calls setActiveTab directly rather than only setting location.hash: if the
+// hash is already #engine (e.g. navigated there earlier, then back to Usage
+// without the hash changing) assigning the same value fires no hashchange
+// event, and a click-through that silently no-ops is worse than a redundant call.
+$('engine-badge').addEventListener('click', () => setActiveTab('engine'));
+// Not folded into the Engine tab's own visibilitychange handler — this one
+// must keep working (and stop working) independent of which tab is active.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopEngineBadge();
+  else if (badgeEngine) startEngineBadge();
+});
+
+loadEngineList();
+setActiveTab(location.hash.replace('#', '') || 'usage', { skipHash: true });
 </script>
 </body>
 </html>

@@ -119,6 +119,50 @@ const staticPassword = () =>
 const passwordSource = () =>
   config.password ? 'saved' : process.env.HERMES_DASHBOARD_PASSWORD ? 'env' : null
 
+// ── Engine (llama.cpp) config ────────────────────────────────────────
+//
+// A list of { id, label, llamaUrl, collectorUrl }. No entry holds
+// credentials, so none needs redaction in sanitizedSettings(). Falls back to
+// a single env-configured engine (LLAMA_SERVER_URL / LLAMA_COLLECTOR_URL) for
+// a bare deployment with no saved config.
+
+const ENV_LLAMA_URL = trimSlash(process.env.LLAMA_SERVER_URL || '')
+const ENV_COLLECTOR_URL = trimSlash(process.env.LLAMA_COLLECTOR_URL || '')
+
+function sanitizeEngineEntry(e) {
+  if (!e || typeof e !== 'object') return null
+  const id = String(e.id || '').trim()
+  const llamaUrl = trimSlash(e.llamaUrl || '')
+  if (!id || !/^https?:\/\//.test(llamaUrl)) return null
+  const collectorUrl = trimSlash(e.collectorUrl || '')
+  return {
+    id,
+    label: String(e.label || '').trim() || id,
+    llamaUrl,
+    collectorUrl: /^https?:\/\//.test(collectorUrl) ? collectorUrl : '',
+  }
+}
+
+function engines() {
+  if (Array.isArray(config.engines)) {
+    const list = config.engines.map(sanitizeEngineEntry).filter(Boolean)
+    if (list.length) return list
+  }
+  if (ENV_LLAMA_URL) {
+    return [{ id: 'default', label: 'llama.cpp', llamaUrl: ENV_LLAMA_URL, collectorUrl: ENV_COLLECTOR_URL }]
+  }
+  return []
+}
+
+// No id → the first configured engine (the tab's default). An unknown id →
+// null, so the caller can 404 rather than silently falling back.
+function engineById(id) {
+  const list = engines()
+  if (!list.length) return null
+  if (!id) return list[0]
+  return list.find((e) => e.id === id) || null
+}
+
 // ── Scraped session-token cache (loopback / pre-v17 mode) ───────────
 
 // Accepts both the current and legacy variable names the dashboard has
@@ -508,6 +552,264 @@ async function buildOverview(days) {
   }
 }
 
+// ── Engine (llama.cpp) telemetry ────────────────────────────────────
+//
+// Fans out to a llama-server (/metrics, /slots, /props) and, optionally, its
+// telemetry collector (see docs/collect.py — a separate Python/systemd
+// process, not run by this server). Prometheus text is parsed here, not in
+// the browser, so the frontend gets a stable shape regardless of llama.cpp
+// build, and build-specific quirks (next_token as a one-element array on
+// some builds, missing prompt-token fields on others) are feature-detected
+// once, server-side.
+
+const HEALTH_TIMEOUT_MS = 3_000
+
+function clampFloat(raw, { def, min, max }) {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return def
+  return Math.min(max, Math.max(min, n))
+}
+
+function parseProm(text) {
+  const out = {}
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim()
+    if (!line || line[0] === '#') continue
+    const sp = line.lastIndexOf(' ')
+    if (sp < 0) continue
+    let name = line.slice(0, sp).trim()
+    const val = Number(line.slice(sp + 1))
+    const br = name.indexOf('{')
+    if (br >= 0) name = name.slice(0, br)
+    if (name.startsWith('llamacpp:')) name = name.slice(9)
+    if (Number.isFinite(val)) out[name] = val
+  }
+  return out
+}
+
+// Fetch with a timeout, classifying the failure so callers (and eventually
+// the UI) can tell "server said no" from "server didn't answer in time" from
+// "nothing is listening there" — those are different situations.
+async function upstreamFetch(url, { timeoutMs, headers } = {}) {
+  try {
+    const res = await fetch(url, {
+      headers: { accept: '*/*', ...(headers || {}) },
+      signal: AbortSignal.timeout(timeoutMs ?? UPSTREAM_TIMEOUT_MS),
+    })
+    return { res, error: null }
+  } catch (err) {
+    const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+    return { res: null, error: timedOut ? 'timeout' : 'unreachable' }
+  }
+}
+
+// A 501/400 from /metrics means the server was started without --metrics —
+// a capability limit, not an outage (mirrors docs/collect.py's handling).
+async function fetchMetrics(engine, timeoutMs) {
+  const { res, error } = await upstreamFetch(`${engine.llamaUrl}/metrics`, { timeoutMs })
+  if (error) return { metrics: null, error }
+  if (res.status === 501 || res.status === 400) return { metrics: null, error: 'metrics_disabled' }
+  if (!res.ok) return { metrics: null, error: `http_${res.status}` }
+  const parsed = parseProm(await res.text())
+  if (!('requests_processing' in parsed)) return { metrics: null, error: 'unexpected_response' }
+  return { metrics: parsed, error: null }
+}
+
+async function fetchSlots(engine, timeoutMs) {
+  const { res, error } = await upstreamFetch(`${engine.llamaUrl}/slots`, { timeoutMs })
+  if (error) return { slots: null, error }
+  if (!res.ok) return { slots: null, error: `http_${res.status}` }
+  let json
+  try {
+    json = await res.json()
+  } catch {
+    return { slots: null, error: 'invalid_json' }
+  }
+  if (!Array.isArray(json)) return { slots: null, error: 'unexpected_response' }
+  return { slots: json, error: null }
+}
+
+async function fetchProps(engine, timeoutMs) {
+  const { res, error } = await upstreamFetch(`${engine.llamaUrl}/props`, { timeoutMs })
+  if (error) return { props: null, error }
+  if (!res.ok) return { props: null, error: `http_${res.status}` }
+  let json
+  try {
+    json = await res.json()
+  } catch {
+    return { props: null, error: 'invalid_json' }
+  }
+  const dgs = json?.default_generation_settings || {}
+  return {
+    props: {
+      model_path: json?.model_path || null,
+      build_info: json?.build_info || null,
+      total_slots: Number.isFinite(Number(json?.total_slots)) ? Number(json.total_slots) : null,
+      n_ctx: Number.isFinite(Number(dgs?.n_ctx)) ? Number(dgs.n_ctx) : null,
+      endpoint_metrics: !!json?.endpoint_metrics,
+    },
+    error: null,
+  }
+}
+
+// Two build-specific quirks this project has already hit (see the plan doc):
+// next_token arrives as a one-element array on some builds, a bare object on
+// others; some builds' /slots omits the prompt-token fields entirely. Detect
+// both from a live sample rather than assuming either shape.
+function detectSlotFeatures(slots) {
+  if (!Array.isArray(slots) || !slots.length) return { hasPromptFields: false, nextTokenShape: 'none' }
+  let hasPromptFields = false
+  let nextTokenShape = 'none'
+  for (const s of slots) {
+    if (s && (s.n_prompt_tokens != null || s.n_prompt_tokens_processed != null || s.n_prompt_tokens_cache != null)) {
+      hasPromptFields = true
+    }
+    if (nextTokenShape === 'none' && s && 'next_token' in s) {
+      nextTokenShape = Array.isArray(s.next_token) ? 'array' : 'object'
+    }
+  }
+  return { hasPromptFields, nextTokenShape }
+}
+
+// Normalizes next_token to a plain object regardless of build shape, so the
+// frontend never branches on it.
+function normalizeSlots(slots) {
+  if (!Array.isArray(slots)) return slots
+  return slots.map((s) => {
+    if (!s || typeof s !== 'object') return s
+    let nt = s.next_token
+    if (Array.isArray(nt)) nt = nt.length ? nt[0] : null
+    return { ...s, next_token: nt && typeof nt === 'object' ? nt : {} }
+  })
+}
+
+async function buildEngineLive(engine) {
+  const [m, s, p] = await Promise.all([
+    fetchMetrics(engine, UPSTREAM_TIMEOUT_MS),
+    fetchSlots(engine, UPSTREAM_TIMEOUT_MS),
+    fetchProps(engine, UPSTREAM_TIMEOUT_MS),
+  ])
+  return {
+    engine: { id: engine.id, label: engine.label, llama_url: engine.llamaUrl },
+    metrics: m.metrics,
+    metrics_error: m.error,
+    slots: normalizeSlots(s.slots),
+    slots_error: s.error,
+    props: p.props,
+    props_error: p.error,
+    features: detectSlotFeatures(s.slots),
+    generated_at: new Date().toISOString(),
+  }
+}
+
+// total_slots comes from /props, which doesn't change on the timescale the
+// health badge polls at — cache it so the badge's own request stays cheap
+// (its whole point is to be the cheapest call in the system).
+const propsCache = new Map() // engine id -> { total_slots, ts }
+const PROPS_CACHE_TTL_MS = 5 * 60_000
+
+async function cachedTotalSlots(engine) {
+  const cached = propsCache.get(engine.id)
+  if (cached && Date.now() - cached.ts < PROPS_CACHE_TTL_MS) return cached.total_slots
+  const { props } = await fetchProps(engine, HEALTH_TIMEOUT_MS)
+  const total_slots = props?.total_slots ?? cached?.total_slots ?? null
+  propsCache.set(engine.id, { total_slots, ts: Date.now() })
+  return total_slots
+}
+
+/**
+ * The engine health badge's one data source. Keyed on requests_deferred, not
+ * slot occupancy (see the plan doc's §"Engine health badge") — a saturated
+ * engine is normal, a queueing one is the state worth surfacing. "Stale" is
+ * not computed here: it's a function of how long ago the caller last got a
+ * good answer, which only the polling client knows.
+ */
+async function buildEngineHealth(engine) {
+  const [{ metrics, error }, total_slots] = await Promise.all([
+    fetchMetrics(engine, HEALTH_TIMEOUT_MS),
+    cachedTotalSlots(engine),
+  ])
+  const base = {
+    engine: { id: engine.id, label: engine.label, llama_url: engine.llamaUrl },
+    total_slots,
+    requests_processing: null,
+    requests_deferred: null,
+    generated_at: new Date().toISOString(),
+  }
+  if (error === 'timeout') return { ...base, state: 'not_responding' }
+  if (error) return { ...base, state: 'unreachable', reason: error }
+  const processing = Number(metrics.requests_processing || 0)
+  const deferred = Number(metrics.requests_deferred || 0)
+  let state
+  if (deferred > 0) state = 'queued'
+  else if (total_slots != null && processing >= total_slots) state = 'full'
+  else if (processing > 0) state = 'active'
+  else state = 'idle'
+  return { ...base, requests_processing: processing, requests_deferred: deferred, state }
+}
+
+async function proxyCollectorJson(engine, path, query) {
+  if (!engine.collectorUrl) {
+    return { status: 404, body: { error: 'no collector configured for this engine' } }
+  }
+  const qs = query ? `?${query}` : ''
+  const { res, error } = await upstreamFetch(`${engine.collectorUrl}${path}${qs}`, {
+    timeoutMs: UPSTREAM_TIMEOUT_MS,
+  })
+  if (error) return { status: 502, body: { error: `collector ${error}` } }
+  if (!res.ok) return { status: 502, body: { error: `collector http ${res.status}` } }
+  try {
+    return { status: 200, body: await res.json() }
+  } catch {
+    return { status: 502, body: { error: 'collector returned invalid JSON' } }
+  }
+}
+
+/**
+ * Ad-hoc probe for the setup page's per-engine "Test connection" — takes
+ * URLs straight from the form, not from saved config, so it works before
+ * Save is pressed.
+ */
+async function testEngine(body) {
+  const llamaUrl = trimSlash(body.llamaUrl || '')
+  const collectorUrl = trimSlash(body.collectorUrl || '')
+  const out = { llama: { ok: false, url: llamaUrl } }
+  if (!/^https?:\/\//.test(llamaUrl)) {
+    out.llama.error = 'URL must start with http:// or https://'
+    return out
+  }
+  const t0 = Date.now()
+  const { error } = await fetchMetrics({ llamaUrl }, 5_000)
+  out.llama.latency_ms = Date.now() - t0
+  if (!error) {
+    out.llama.ok = true
+    out.llama.metrics_enabled = true
+  } else if (error === 'metrics_disabled') {
+    out.llama.ok = true
+    out.llama.metrics_enabled = false
+    out.llama.detail = 'reachable, but started without --metrics'
+  } else {
+    out.llama.error = error
+  }
+  if (collectorUrl) {
+    if (!/^https?:\/\//.test(collectorUrl)) {
+      out.collector = { ok: false, url: collectorUrl, error: 'URL must start with http:// or https://' }
+    } else {
+      const t1 = Date.now()
+      const { res, error: cErr } = await upstreamFetch(`${collectorUrl}/range`, { timeoutMs: 5_000 })
+      if (cErr) {
+        out.collector = { ok: false, url: collectorUrl, error: cErr, latency_ms: Date.now() - t1 }
+      } else if (!res.ok) {
+        out.collector = { ok: false, url: collectorUrl, error: `http_${res.status}`, latency_ms: Date.now() - t1 }
+      } else {
+        const j = await res.json().catch(() => null)
+        out.collector = { ok: true, url: collectorUrl, latency_ms: Date.now() - t1, rows: j?.rows ?? null }
+      }
+    }
+  }
+  return out
+}
+
 // ── Settings & connection test ──────────────────────────────────────
 
 function sanitizedSettings() {
@@ -525,6 +827,7 @@ function sanitizedSettings() {
     has_cached_login_cookie: !!cachedLoginCookie(dashboardUrl()),
     auth_mode: authMode(),
     config_file: CONFIG_FILE,
+    engines: engines(),
   }
 }
 
@@ -566,6 +869,18 @@ function applySettings(body) {
   if (body.clearCachedToken || credsChanged || dashboardUrl() !== prevUrl) {
     delete config.cachedLoginCookie
     delete config.cachedLoginCookieUrl
+  }
+  if (Array.isArray(body.engines)) {
+    const seen = new Set()
+    const next = []
+    for (const raw of body.engines) {
+      const e = sanitizeEngineEntry(raw)
+      if (!e) return { error: 'Each engine needs an id and a llamaUrl starting with http:// or https://' }
+      if (seen.has(e.id)) return { error: `Duplicate engine id "${e.id}"` }
+      seen.add(e.id)
+      next.push(e)
+    }
+    config.engines = next
   }
   writeConfig(config)
   return { settings: sanitizedSettings() }
@@ -783,6 +1098,44 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/test') {
       sendJson(res, 200, await testConnection(await readJsonBody(req)))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/engines') {
+      sendJson(res, 200, { engines: engines().map(({ id, label }) => ({ id, label })) })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/engine/live') {
+      const engine = engineById(url.searchParams.get('engine'))
+      if (!engine) { sendJson(res, 404, { error: 'no engine configured' }); return }
+      sendJson(res, 200, await buildEngineLive(engine))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/engine/health') {
+      const engine = engineById(url.searchParams.get('engine'))
+      if (!engine) { sendJson(res, 200, { engine: null, state: 'hidden' }); return }
+      sendJson(res, 200, await buildEngineHealth(engine))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/engine/range') {
+      const engine = engineById(url.searchParams.get('engine'))
+      if (!engine) { sendJson(res, 404, { error: 'no engine configured' }); return }
+      const { status, body } = await proxyCollectorJson(engine, '/range')
+      sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/engine/history') {
+      const engine = engineById(url.searchParams.get('engine'))
+      if (!engine) { sendJson(res, 404, { error: 'no engine configured' }); return }
+      const now = Date.now() / 1000
+      const to = clampFloat(url.searchParams.get('to'), { def: now, min: 0, max: now + 86400 })
+      const from = clampFloat(url.searchParams.get('from'), { def: to - 3600, min: 0, max: to })
+      const points = clampInt(url.searchParams.get('points'), { def: 600, min: 10, max: 4000 })
+      const { status, body } = await proxyCollectorJson(engine, '/history', `from=${from}&to=${to}&points=${points}`)
+      sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/engine/test') {
+      sendJson(res, 200, await testEngine(await readJsonBody(req)))
       return
     }
   } catch (err) {
