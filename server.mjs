@@ -1287,7 +1287,8 @@ async function engineDailyTokens(engine, dayList) {
   // Query starts one day early: the delta for the first needed day needs the
   // counter value as it stood at that day's midnight, which is the last bucket
   // of the day before.
-  const from = dayStartSec(shiftDay(needed[0], -1))
+  const anchorDay = shiftDay(needed[0], -1)
+  const from = dayStartSec(anchorDay)
   const to = dayStartSec(today) + 86400
   const wantPoints = Math.round((to - from) / 3600) // hourly, so buckets land on UTC hours
   const points = Math.min(4000, Math.max(10, wantPoints))
@@ -1363,14 +1364,19 @@ async function engineDailyTokens(engine, dayList) {
     }
   }
 
-  // Persist closed days; drop the anchor day if it fell outside the window.
+  // The anchor day is incomplete by construction — its first bucket was spent
+  // establishing the baseline, so that hour's delta (and any restart inside
+  // it) is not in `out`. It must never be cached or returned: doing so
+  // overwrote a correct cached day with a partial recompute on every
+  // subsequent request, quietly eroding history the longer the server ran.
+  const usable = (day) => day !== anchorDay
   for (const [day, row] of out) {
-    if (day !== today && dayList.includes(day)) cache.set(day, row)
+    if (usable(day) && day !== today && dayList.includes(day)) cache.set(day, row)
   }
   while (cache.size > ENGINE_DAY_CACHE_MAX) cache.delete(cache.keys().next().value)
 
   const daily = pickCached(cache, dayList)
-  for (const day of dayList) if (out.has(day)) daily.set(day, out.get(day))
+  for (const day of dayList) if (usable(day) && out.has(day)) daily.set(day, out.get(day))
   return { available: true, error: null, range, daily }
 }
 

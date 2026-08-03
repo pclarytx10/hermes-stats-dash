@@ -134,6 +134,41 @@
   }
   .attribution-note strong { color: var(--text-secondary); font-weight: 600; }
 
+  /* ── Usage (reconciled) tab ── */
+  .warn-row {
+    display: flex; gap: 8px; align-items: baseline; font-size: 12px;
+    border: 1px solid var(--border); border-left-width: 3px; border-radius: 8px;
+    padding: 8px 11px; margin-top: 8px; background: var(--surface-1);
+    color: var(--text-secondary); line-height: 1.5;
+  }
+  .warn-row.warn { border-left-color: var(--warn); }
+  .warn-row.info { border-left-color: var(--baseline); }
+  .warn-row .w-icon { flex: none; font-weight: 700; }
+  .warn-row.warn .w-icon { color: var(--warn); }
+  .warn-row.info .w-icon { color: var(--text-muted); }
+  #u-warnings { margin-top: 4px; }
+
+  .tooltip .tt-note {
+    color: var(--text-muted); margin-top: 6px; padding-top: 5px;
+    border-top: 1px solid var(--gridline); max-width: 210px; line-height: 1.4;
+  }
+  .lane-note { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+  .tile-split .split-item.hermes .value { color: var(--series-1); }
+  .tile-split .split-item.engine .value { color: var(--series-3); }
+  .detail-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 6px 0; border-bottom: 1px solid var(--gridline); font-size: 13px;
+  }
+  .detail-row:last-child { border-bottom: none; }
+  .detail-row .d-label { color: var(--text-secondary); }
+  .detail-row .d-value { font-variant-numeric: tabular-nums; text-align: right; }
+  .detail-row .d-value .d-sub { display: block; font-size: 11px; color: var(--text-muted); }
+  /* This hero's label carries a scope word, so it wraps instead of truncating
+     to "Total …" in a narrow column. */
+  #u-tiles .tile.hero .tile-head { align-items: flex-start; }
+  #u-tiles .tile.hero .tile-head .label { white-space: normal; overflow: visible; }
+  .table-note { font-size: 11px; color: var(--text-muted); margin-top: 9px; line-height: 1.5; }
+
   .filters { display: flex; gap: 8px; align-items: center; margin: 18px 0 16px; }
   .filters .label { color: var(--text-muted); font-size: 13px; margin-right: 4px; }
   .range-btn, .hist-range-btn {
@@ -340,8 +375,57 @@
       <strong>Hermes + Engine · other clients = Total</strong>.
     </p>
 
-    <div class="card" id="unified-placeholder" style="margin-top:14px">
-      <div class="empty">Unified reporting lands in a later phase of this branch.</div>
+    <div class="filters" role="group" aria-label="Reconciled usage controls">
+      <span class="label">Range</span>
+      <button class="urange-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
+      <button class="urange-btn" data-days="30" aria-pressed="true">Last 30 days</button>
+      <button class="urange-btn" data-days="90" aria-pressed="false">Last 90 days</button>
+      <span class="label" style="margin-left:10px">Scope</span>
+      <div class="seg" id="u-scope-seg" role="group" aria-label="Reconciliation scope">
+        <button class="seg-btn" type="button" data-scope="window" aria-pressed="true">Full window</button>
+        <button class="seg-btn" type="button" data-scope="covered" aria-pressed="false">Engine coverage</button>
+      </div>
+    </div>
+
+    <div id="u-warnings"></div>
+
+    <div id="u-content">
+      <div class="grid tiles" id="u-tiles"></div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2 id="u-chart-title">Reconciled tokens over time</h2>
+          <div class="head-controls">
+            <div class="seg" id="u-lane-seg" role="group" aria-label="Token lane">
+              <button class="seg-btn" type="button" data-lane="combined" aria-pressed="true">Combined</button>
+              <button class="seg-btn" type="button" data-lane="prefill" aria-pressed="false">Prefill</button>
+              <button class="seg-btn" type="button" data-lane="generation" aria-pressed="false">Generation</button>
+            </div>
+            <button class="toggle-btn" id="u-chart-toggle" aria-pressed="false">Table view</button>
+          </div>
+        </div>
+        <div class="chart-holder" id="u-chart-holder">
+          <div id="u-chart"></div>
+          <div class="tooltip" id="u-tooltip"></div>
+        </div>
+        <div class="legend" id="u-legend"></div>
+        <div id="u-chart-table" hidden></div>
+        <div class="engine-sub" id="u-chart-note"></div>
+        <div style="margin-top:10px">
+          <button class="toggle-btn" id="u-csv" type="button">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="grid cols">
+        <div class="card">
+          <h2>Engines</h2>
+          <div id="u-engines"></div>
+        </div>
+        <div class="card">
+          <h2>Window detail</h2>
+          <div id="u-detail"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -915,32 +999,52 @@ function buildModelSeries(modelDaily) {
   };
 }
 
-let modelCrosshairCleanup = null;
+// Shared by "Usage by model" (Hermes tab) and "Reconciled tokens over time"
+// (Usage tab): smooth per-day lines with a washed area, a snapping crosshair,
+// and one tooltip listing every series at that day. Any chart-specific detail
+// arrives through cfg rather than by forking the renderer.
+//
+// cfg: { chartId, holderId, tooltipId, legendId, days, series, aria, emptyText,
+//        bands, noteFor, dashSet }
+//   series  [{ name, color, values[], dashed }]
+//   bands   [[startIdx, endIdx]] — shaded spans, e.g. days with no engine data
+//   noteFor (i) => string | null, an extra tooltip line for that day
+const crosshairCleanups = new Map(); // chartId -> hide()
 
-function renderModelChart(modelDaily) {
-  const holder = $('model-chart');
-  const tooltip = $('model-tooltip');
+function renderLineChart(cfg) {
+  const holder = $(cfg.chartId);
+  const tooltip = $(cfg.tooltipId);
   tooltip.style.display = 'none';
-  if (modelCrosshairCleanup) { modelCrosshairCleanup(); modelCrosshairCleanup = null; }
+  const prior = crosshairCleanups.get(cfg.chartId);
+  if (prior) { prior(); crosshairCleanups.delete(cfg.chartId); }
 
-  const data = buildModelSeries(modelDaily || []);
-  renderModelTable(data);
-  if (!data.series.length) {
-    holder.replaceChildren(el('div', { class: 'empty', text: 'No per-model usage in this window (session rows may not include token counts).' }));
-    $('model-legend').replaceChildren();
+  const dayKeys = cfg.days || [];
+  const series = cfg.series || [];
+  if (!series.length || !dayKeys.length) {
+    holder.replaceChildren(el('div', { class: 'empty', text: cfg.emptyText }));
+    $(cfg.legendId).replaceChildren();
     return;
   }
 
   const W = 1000, H = 260, padL = 46, padR = 8, padT = 10, padB = 26;
   const plotW = W - padL - padR, plotH = H - padT - padB;
-  const maxV = Math.max(1, ...data.series.flatMap((s) => s.values));
+  const maxV = Math.max(1, ...series.flatMap((s) => s.values));
   const pow = Math.pow(10, Math.floor(Math.log10(maxV)));
   const yMax = [1, 2, 5, 10].map((m) => m * pow).find((v) => v >= maxV);
-  const xAt = (i) => padL + (data.days.length === 1 ? plotW / 2 : (i / (data.days.length - 1)) * plotW);
+  const xAt = (i) => padL + (dayKeys.length === 1 ? plotW / 2 : (i / (dayKeys.length - 1)) * plotW);
   const yAt = (v) => padT + plotH - (v / yMax) * plotH;
 
   const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, width: '100%', role: 'img',
-    'aria-label': `Daily token usage by model, last ${days} days` });
+    'aria-label': cfg.aria });
+
+  // Shaded spans sit under everything: they are context, not data.
+  const half = dayKeys.length > 1 ? plotW / (dayKeys.length - 1) / 2 : plotW / 2;
+  for (const [from, to] of cfg.bands || []) {
+    const x0 = Math.max(padL, xAt(from) - half);
+    const x1 = Math.min(W - padR, xAt(to) + half);
+    svg.appendChild(svgEl('rect', { x: x0, y: padT, width: Math.max(0, x1 - x0), height: plotH,
+      fill: 'var(--gridline)', opacity: '0.45' }));
+  }
 
   for (let i = 0; i <= 4; i++) {
     const v = (yMax / 4) * i;
@@ -953,8 +1057,8 @@ function renderModelChart(modelDaily) {
       svg.appendChild(t);
     }
   }
-  const step = Math.ceil(data.days.length / 6);
-  data.days.forEach((day, i) => {
+  const step = Math.ceil(dayKeys.length / 6);
+  dayKeys.forEach((day, i) => {
     if (i % step !== 0) return;
     const t = svgEl('text', { x: xAt(i), y: H - 8, 'text-anchor': 'middle' });
     t.textContent = fmtDay(day);
@@ -964,17 +1068,21 @@ function renderModelChart(modelDaily) {
   // Areas under lines first, then lines on top (paint order keeps every
   // stroke visible where washes overlap).
   const baseline = yAt(0);
-  for (const s of [...data.series].reverse()) {
+  for (const s of [...series].reverse()) {
     const pts = s.values.map((v, i) => ({ x: +xAt(i).toFixed(1), y: +yAt(v).toFixed(1) }));
     const line = smoothPath(pts);
-    svg.appendChild(svgEl('path', {
-      d: `${line} L${pts[pts.length - 1].x},${baseline} L${pts[0].x},${baseline} Z`,
-      fill: s.color, opacity: '0.1', stroke: 'none',
-    }));
-    svg.appendChild(svgEl('path', {
+    if (!s.dashed) {
+      svg.appendChild(svgEl('path', {
+        d: `${line} L${pts[pts.length - 1].x},${baseline} L${pts[0].x},${baseline} Z`,
+        fill: s.color, opacity: '0.1', stroke: 'none',
+      }));
+    }
+    const stroke = svgEl('path', {
       d: line, fill: 'none', stroke: s.color,
       'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-    }));
+    });
+    if (s.dashed) stroke.setAttribute('stroke-dasharray', '5 4');
+    svg.appendChild(stroke);
   }
 
   // Crosshair layer: a hairline that snaps to the nearest day, plus one
@@ -983,27 +1091,28 @@ function renderModelChart(modelDaily) {
     stroke: 'var(--baseline)', 'stroke-width': 1, visibility: 'hidden' });
   svg.appendChild(crosshair);
   const overlay = svgEl('rect', { x: padL, y: padT, width: plotW, height: plotH,
-    class: 'day-hit', tabindex: '0',
-    'aria-label': 'Usage by model — hover or use arrow keys to read daily values' });
+    class: 'day-hit', tabindex: '0', 'aria-label': cfg.aria });
   svg.appendChild(overlay);
 
-  let focusIdx = data.days.length - 1;
+  let focusIdx = dayKeys.length - 1;
   const showAt = (i) => {
-    focusIdx = Math.max(0, Math.min(data.days.length - 1, i));
+    focusIdx = Math.max(0, Math.min(dayKeys.length - 1, i));
     const cx = xAt(focusIdx);
     crosshair.setAttribute('x1', cx);
     crosshair.setAttribute('x2', cx);
     crosshair.setAttribute('visibility', 'visible');
-    const rows = [el('div', { class: 'tt-title', text: fmtDay(data.days[focusIdx]) })];
-    for (const s of [...data.series].sort((a, b) => b.values[focusIdx] - a.values[focusIdx])) {
+    const rows = [el('div', { class: 'tt-title', text: fmtDay(dayKeys[focusIdx]) })];
+    for (const s of [...series].sort((a, b) => b.values[focusIdx] - a.values[focusIdx])) {
       rows.push(el('div', { class: 'tt-row' },
         el('span', { class: 'tt-key', style: `border-color:${s.color}` }),
         el('span', { class: 'tt-val', text: fmtFull(s.values[focusIdx]) }),
         el('span', { class: 'tt-name', text: s.name })));
     }
+    const note = cfg.noteFor ? cfg.noteFor(focusIdx) : null;
+    if (note) rows.push(el('div', { class: 'tt-note', text: note }));
     tooltip.replaceChildren(...rows);
     tooltip.style.display = 'block';
-    const hostW = $('model-holder').clientWidth;
+    const hostW = $(cfg.holderId).clientWidth;
     const px = (cx / W) * hostW;
     const ttW = tooltip.offsetWidth;
     tooltip.style.left = Math.max(0, Math.min(hostW - ttW, px - ttW / 2)) + 'px';
@@ -1016,7 +1125,7 @@ function renderModelChart(modelDaily) {
   const onMove = (ev) => {
     const rect = overlay.getBoundingClientRect();
     const frac = (ev.clientX - rect.left) / rect.width;
-    showAt(Math.round(frac * (data.days.length - 1)));
+    showAt(Math.round(frac * (dayKeys.length - 1)));
   };
   const onKey = (ev) => {
     if (ev.key === 'ArrowLeft') { showAt(focusIdx - 1); ev.preventDefault(); }
@@ -1028,14 +1137,28 @@ function renderModelChart(modelDaily) {
   overlay.addEventListener('focus', () => showAt(focusIdx));
   overlay.addEventListener('blur', hide);
   overlay.addEventListener('keydown', onKey);
-  modelCrosshairCleanup = hide;
+  crosshairCleanups.set(cfg.chartId, hide);
 
   holder.replaceChildren(svg);
 
-  $('model-legend').replaceChildren(...data.series.map((s) =>
+  $(cfg.legendId).replaceChildren(...series.map((s) =>
     el('span', { class: 'key' },
-      el('span', { class: 'swatch', style: `background:${s.color};height:3px;border-radius:2px` }),
+      el('span', { class: 'swatch',
+        style: `background:${s.color};height:3px;border-radius:2px` +
+          (s.dashed ? ';opacity:0.65' : '') }),
       el('span', { text: s.name }))));
+}
+
+function renderModelChart(modelDaily) {
+  const data = buildModelSeries(modelDaily || []);
+  renderModelTable(data);
+  renderLineChart({
+    chartId: 'model-chart', holderId: 'model-holder',
+    tooltipId: 'model-tooltip', legendId: 'model-legend',
+    days: data.days, series: data.series,
+    aria: `Daily token usage by model, last ${days} days — hover or use arrow keys to read daily values`,
+    emptyText: 'No per-model usage in this window (session rows may not include token counts).',
+  });
 }
 
 function renderModelTable(data) {
@@ -1365,6 +1488,403 @@ $('theme-toggle').addEventListener('click', () => {
 themeMq.addEventListener('change', () => { if (!storedTheme()) applyTheme(); });
 applyTheme();
 
+// ── Usage tab: reconciled hermes ⨯ engine ───────────────────────────
+// Own range, own lane, own poll. The server does the reconciliation; this
+// side chooses a scope, sums the days in it, and renders.
+let uDays = 30;
+let uLane = 'combined';       // 'combined' | 'prefill' | 'generation'
+let uScope = 'window';        // 'window' | 'covered'
+let uHeroView = 'total';      // 'total' | 'split'
+let unified = null;
+let unifiedInFlight = false;
+
+const U_SERIES = [
+  { key: 'hermes_engine', name: 'Hermes · on engine', cssVar: '--series-1' },
+  { key: 'hermes_other', name: 'Hermes · other providers', cssVar: '--series-2' },
+  { key: 'engine_other', name: 'Engine · other clients', cssVar: '--series-3' },
+];
+const U_LANE_NOTE = {
+  combined: 'Prefill plus generation on both sides.',
+  prefill: 'Prompt tokens actually processed — hermes reports these net of cache reads, llama.cpp net of KV prefix reuse, so the two are on the same denominator.',
+  generation: 'Tokens the model produced. The two sides count this identically.',
+};
+
+// Days in the active scope. "Engine coverage" clips to days the collector
+// actually recorded, which is the only way the total is a single window
+// rather than hermes over N days plus other clients over fewer.
+function uRows() {
+  const rows = unified?.reconciled?.daily || [];
+  return uScope === 'covered' ? rows.filter((r) => r.covered) : rows;
+}
+
+function uSum(rows, lane) {
+  const t = { hermes_engine: 0, hermes_other: 0, engine_other: 0, engine_total: 0, total: 0 };
+  for (const r of rows) for (const k of Object.keys(t)) t[k] += r[lane][k];
+  return t;
+}
+
+// Recomputed here rather than taken from the payload so it tracks the scope
+// and lane the user is actually looking at.
+function uCostAvoided(rows) {
+  const cmp = unified?.hermes?.cost_avoided?.comparator;
+  if (!cmp) return null;
+  const byDay = new Map((unified.hermes.daily || []).map((r) => [r.day, r]));
+  let input = 0, output = 0;
+  for (const r of rows) {
+    const h = byDay.get(r.day);
+    if (!h) continue;
+    input += h.engine.prefill;
+    output += h.engine.generation;
+  }
+  return {
+    amount: (input / 1e6) * cmp.input_per_m + (output / 1e6) * cmp.output_per_m,
+    comparator: cmp, input, output,
+  };
+}
+
+function uHermesSum(rows, field) {
+  const byDay = new Map((unified?.hermes?.daily || []).map((r) => [r.day, r]));
+  let n = 0;
+  for (const r of rows) {
+    const h = byDay.get(r.day);
+    if (h) n += h.engine[field] + h.other[field];
+  }
+  return n;
+}
+
+function renderUWarnings() {
+  const holder = $('u-warnings');
+  const list = unified?.warnings || [];
+  holder.replaceChildren(...list.map((w) =>
+    el('div', { class: `warn-row ${w.severity === 'warn' ? 'warn' : 'info'}` },
+      el('span', { class: 'w-icon', text: w.severity === 'warn' ? '!' : 'i' }),
+      el('span', { text: w.message }))));
+}
+
+function renderUTiles(rows) {
+  const t = uSum(rows, uLane);
+  const hermesTotal = t.hermes_engine + t.hermes_other;
+
+  const heroSeg = el('div', {
+    class: 'seg', id: 'u-hero-seg', role: 'group', 'aria-label': 'Total view',
+  },
+    el('button', { class: 'seg-btn', type: 'button', 'data-view': 'total',
+      'aria-pressed': String(uHeroView === 'total'), text: 'Total' }),
+    el('button', { class: 'seg-btn', type: 'button', 'data-view': 'split',
+      'aria-pressed': String(uHeroView === 'split'), text: 'Split' }),
+  );
+  const scopeWord = uScope === 'covered' ? `${rows.length}d recorded` : `last ${uDays}d`;
+  let heroBody, heroSub;
+  if (uHeroView === 'split') {
+    heroBody = el('div', { class: 'tile-split' },
+      el('div', { class: 'split-item hermes' },
+        el('div', { class: 'split-label', text: 'Hermes' }),
+        el('div', { class: 'value', text: fmtCompact(hermesTotal) })),
+      el('div', { class: 'split-item engine' },
+        el('div', { class: 'split-label', text: 'Engine · other' }),
+        el('div', { class: 'value', text: fmtCompact(t.engine_other) })),
+    );
+    heroSub = `${fmtCompact(t.total)} total`;
+  } else {
+    heroBody = el('div', { class: 'value', text: fmtCompact(t.total) });
+    heroSub = `${fmtCompact(hermesTotal)} hermes · ${fmtCompact(t.engine_other)} other clients`;
+  }
+  const hero = el('div', { class: 'card tile hero' },
+    el('div', { class: 'tile-head' },
+      el('div', { class: 'label', text: `Total tokens · ${scopeWord}` }),
+      heroSeg),
+    heroBody,
+    el('div', { class: 'sub', text: heroSub }));
+
+  // Share is only meaningful over days the engine was actually recorded, so
+  // it always uses those days regardless of the scope toggle.
+  const covered = (unified?.reconciled?.daily || []).filter((r) => r.covered);
+  const cov = uSum(covered, uLane);
+  const share = cov.engine_total > 0 ? cov.hermes_engine / cov.engine_total : null;
+
+  const localShare = hermesTotal > 0 ? t.hermes_engine / hermesTotal : null;
+  const avoided = uCostAvoided(rows);
+  const cmpName = avoided?.comparator?.model || 'comparator';
+
+  const tiles = [
+    { label: 'Hermes share of engine',
+      value: share === null ? '—' : `${(share * 100).toFixed(0)}%`,
+      sub: covered.length
+        ? `of ${fmtCompact(cov.engine_total)} tokens over ${covered.length} recorded day${covered.length === 1 ? '' : 's'}`
+        : 'no engine data in this window' },
+    { label: 'Run locally',
+      value: localShare === null ? '—' : `${(localShare * 100).toFixed(0)}%`,
+      sub: `${fmtCompact(t.hermes_engine)} on engine · ${fmtCompact(t.hermes_other)} elsewhere` },
+    { label: 'Cost avoided',
+      value: avoided ? fmtUsd(avoided.amount) : '—',
+      sub: `at ${cmpName} list price · API cost only, excludes power and hardware` },
+  ];
+
+  $('u-tiles').replaceChildren(hero, ...tiles.map((tile) =>
+    el('div', { class: 'card tile' },
+      el('div', { class: 'label', text: tile.label }),
+      el('div', { class: 'value', text: tile.value }),
+      el('div', { class: 'sub', text: tile.sub }))));
+}
+
+function renderUChart(rows) {
+  const series = U_SERIES.map((s) => ({
+    key: s.key, name: s.name, color: `var(${s.cssVar})`,
+    values: rows.map((r) => r[uLane][s.key]),
+  })).filter((s) => s.values.some((v) => v > 0));
+
+  // Uncovered days are contiguous at the start of the window in the normal
+  // case (a collector younger than the range), but gaps are shaded wherever
+  // they fall rather than assumed.
+  const bands = [];
+  let start = null;
+  rows.forEach((r, i) => {
+    if (!r.covered && start === null) start = i;
+    if ((r.covered || i === rows.length - 1) && start !== null) {
+      bands.push([start, r.covered ? i - 1 : i]);
+      start = null;
+    }
+  });
+
+  renderLineChart({
+    chartId: 'u-chart', holderId: 'u-chart-holder',
+    tooltipId: 'u-tooltip', legendId: 'u-legend',
+    days: rows.map((r) => r.day),
+    series,
+    bands,
+    aria: `Reconciled daily tokens (${LANE_ARIA[uLane]}), last ${uDays} days — ` +
+      'hover or use arrow keys to read daily values',
+    emptyText: 'No usage in this window.',
+    noteFor: (i) => {
+      const r = rows[i];
+      const notes = [];
+      if (!r.covered) notes.push('No engine data recorded — hermes only.');
+      else if (r.partial) notes.push('Engine data for part of this day only.');
+      if (r.estimated) notes.push('Split estimated from the window mix.');
+      if (r.restarts) notes.push(`${r.restarts} engine restart${r.restarts === 1 ? '' : 's'}.`);
+      return notes.join(' ') || null;
+    },
+  });
+
+  const uncovered = rows.filter((r) => !r.covered).length;
+  const estimated = rows.filter((r) => r.estimated).length;
+  const bits = [U_LANE_NOTE[uLane]];
+  if (uncovered) bits.push(`Shaded: ${uncovered} day${uncovered === 1 ? '' : 's'} with no engine data.`);
+  if (estimated) bits.push(`${estimated} day${estimated === 1 ? '' : 's'} split by the window mix.`);
+  $('u-chart-note').textContent = bits.join(' ');
+  renderUTable(rows);
+}
+
+const LANE_ARIA = { combined: 'prefill and generation', prefill: 'prefill', generation: 'generation' };
+
+function renderUTable(rows) {
+  const holder = $('u-chart-table');
+  const active = rows.filter((r) => r[uLane].total > 0);
+  if (!active.length) {
+    holder.replaceChildren(el('div', { class: 'empty', text: 'No usage in this window.' }));
+    return;
+  }
+  const head = el('tr', {},
+    el('th', { text: 'Day' }),
+    ...U_SERIES.map((s) => el('th', { class: 'num', text: s.name })),
+    el('th', { class: 'num', text: 'Total' }),
+    el('th', { text: 'Engine data' }));
+  const body = active.map((r) => el('tr', {},
+    el('td', { text: fmtDay(r.day) }),
+    ...U_SERIES.map((s) => el('td', { class: 'num', text: fmtFull(r[uLane][s.key]) })),
+    el('td', { class: 'num', text: fmtFull(r[uLane].total) }),
+    el('td', { class: 'cell-sub',
+      text: !r.covered ? 'none' : r.partial ? 'partial' : 'full' })));
+  holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...body)));
+}
+
+function renderUEngines() {
+  const holder = $('u-engines');
+  const list = unified?.engine?.by_engine || [];
+  if (!list.length) {
+    holder.replaceChildren(el('div', { class: 'empty' },
+      el('span', { text: 'No engine configured. Add one in ' }),
+      el('a', { href: '/setup.html', text: 'Setup' }),
+      el('span', { text: ' to reconcile hermes against what an endpoint actually served.' })));
+    return;
+  }
+  const hermesByEngine = new Map(
+    (unified?.hermes?.by_engine || []).map((e) => [e.engine_id, e]));
+  // hermes' per-engine figure has no day dimension, so it always covers the
+  // whole window. Subtracting it from an engine total that covers fewer days
+  // would produce a residual for two different windows — so where the engine's
+  // coverage is short, the residual is withheld rather than guessed.
+  const totalDays = unified?.engine?.coverage?.days_total ?? 0;
+  let mismatched = false;
+  const head = el('tr', {},
+    el('th', { text: 'Engine' }),
+    el('th', { class: 'num', text: 'Engine · recorded' }),
+    el('th', { class: 'num', text: 'Hermes · window' }),
+    el('th', { class: 'num', text: 'Other clients' }));
+  const body = list.map((e) => {
+    const h = hermesByEngine.get(e.id);
+    const hTokens = h ? h.tokens : 0;
+    const sameWindow = e.available && e.coverage.days_covered === totalDays;
+    if (e.available && !sameWindow) mismatched = true;
+    const other = sameWindow ? Math.max(0, e.totals.tokens - hTokens) : null;
+    const status = !e.has_collector ? 'no collector — history unavailable'
+      : !e.available ? (e.error || 'unavailable')
+      : `${e.coverage.days_covered} of ${totalDays} days recorded` +
+        (e.mapped_models ? '' : ' · no models mapped');
+    return el('tr', {},
+      el('td', {},
+        el('div', { class: 'cell-main', text: e.label }),
+        el('div', { class: 'cell-sub', text: status })),
+      el('td', { class: 'num', text: e.available ? fmtCompact(e.totals.tokens) : '—' }),
+      el('td', { class: 'num', text: fmtCompact(hTokens) }),
+      el('td', { class: 'num', title: other === null && e.available
+        ? 'Withheld: the two columns cover different numbers of days' : '',
+        text: other === null ? '—' : fmtCompact(other) }));
+  });
+  holder.replaceChildren(
+    el('table', {}, el('thead', {}, head), el('tbody', {}, ...body)),
+    mismatched
+      ? el('div', { class: 'table-note',
+          text: 'Engine columns count only the days the collector recorded; the hermes column ' +
+            'covers the whole window. Where those differ the per-engine residual is left blank — ' +
+            'the reconciled totals above are computed per day and are unaffected.' })
+      : null);
+}
+
+function detailRow(label, value, sub) {
+  return el('div', { class: 'detail-row' },
+    el('div', { class: 'd-label', text: label }),
+    el('div', { class: 'd-value' },
+      document.createTextNode(value),
+      sub ? el('span', { class: 'd-sub', text: sub }) : null));
+}
+
+function renderUDetail(rows) {
+  const holder = $('u-detail');
+  if (!rows.length) { holder.replaceChildren(el('div', { class: 'empty', text: 'No days in scope.' })); return; }
+  const t = uSum(rows, uLane);
+  const busiest = rows.reduce((a, r) => (r[uLane].total > (a?.[uLane].total ?? -1) ? r : a), null);
+  const cov = unified?.engine?.coverage;
+  const cacheReads = uHermesSum(rows, 'cache_read');
+  const cloudCost = Number(unified?.hermes?.totals?.other?.cost || 0);
+  const estimated = rows.filter((r) => r.estimated).length;
+
+  holder.replaceChildren(
+    detailRow('Busiest day', busiest ? fmtDay(busiest.day) : '—',
+      busiest ? `${fmtCompact(busiest[uLane].total)} tokens` : ''),
+    detailRow('Daily average', fmtCompact(Math.round(t.total / rows.length)),
+      `over ${rows.length} day${rows.length === 1 ? '' : 's'} in scope`),
+    detailRow('Hermes cache reads', fmtCompact(cacheReads),
+      'prompt tokens served from cache — processed by neither side'),
+    detailRow('Cloud spend', fmtUsd(cloudCost),
+      'hermes, non-engine providers · estimated'),
+    detailRow('Engine coverage', cov ? `${cov.days_covered} / ${cov.days_total} days` : '—',
+      cov?.restarts ? `${cov.restarts} engine restart${cov.restarts === 1 ? '' : 's'} spanned` : 'no restarts spanned'),
+    detailRow('Split confidence', `${rows.length - estimated} / ${rows.length} days measured`,
+      estimated ? `${estimated} split by the window mix` : 'every day split from its own sessions'),
+  );
+}
+
+function renderUnified() {
+  if (!unified) return;
+  const rows = uRows();
+  renderUWarnings();
+  renderUTiles(rows);
+  renderUChart(rows);
+  renderUEngines();
+  renderUDetail(rows);
+}
+
+async function refreshUnified() {
+  if (unifiedInFlight) return;
+  unifiedInFlight = true;
+  $('u-content').classList.add('loading-dim');
+  try {
+    const res = await fetch(`/api/usage/unified?days=${uDays}`);
+    unified = await res.json();
+    renderUnified();
+  } catch {
+    $('u-warnings').replaceChildren(
+      el('div', { class: 'warn-row warn' },
+        el('span', { class: 'w-icon', text: '!' }),
+        el('span', { text: 'Stats server unreachable — showing the last successful reading, if any.' })));
+  } finally {
+    unifiedInFlight = false;
+    $('u-content').classList.remove('loading-dim');
+  }
+}
+
+// Slower than the Hermes tab's 30s: a cold 90-day window costs a multi-profile
+// fan-out upstream, and nothing here changes minute to minute.
+let unifiedPollTimer = null;
+const UNIFIED_POLL_MS = 60_000;
+function startUnifiedPoll() {
+  if (unifiedPollTimer) return;
+  refreshUnified();
+  unifiedPollTimer = setInterval(refreshUnified, UNIFIED_POLL_MS);
+}
+function stopUnifiedPoll() {
+  if (unifiedPollTimer) { clearInterval(unifiedPollTimer); unifiedPollTimer = null; }
+}
+
+document.querySelectorAll('.urange-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (uDays === Number(btn.dataset.days)) return;
+    uDays = Number(btn.dataset.days);
+    document.querySelectorAll('.urange-btn').forEach((b) =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    refreshUnified();
+  });
+});
+document.querySelectorAll('#u-lane-seg .seg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (uLane === btn.dataset.lane) return;
+    uLane = btn.dataset.lane;
+    document.querySelectorAll('#u-lane-seg .seg-btn').forEach((b) =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    $('u-chart-title').textContent = uLane === 'combined'
+      ? 'Reconciled tokens over time' : `Reconciled ${uLane} tokens over time`;
+    renderUnified();
+  });
+});
+document.querySelectorAll('#u-scope-seg .seg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (uScope === btn.dataset.scope) return;
+    uScope = btn.dataset.scope;
+    document.querySelectorAll('#u-scope-seg .seg-btn').forEach((b) =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    renderUnified();
+  });
+});
+$('u-tiles').addEventListener('click', (e) => {
+  const btn = e.target.closest('#u-hero-seg .seg-btn');
+  if (!btn || uHeroView === btn.dataset.view) return;
+  uHeroView = btn.dataset.view;
+  renderUTiles(uRows());
+});
+wireTableToggle('u-chart-toggle', 'u-chart', 'u-legend', 'u-chart-table');
+
+$('u-csv').addEventListener('click', () => {
+  const rows = uRows();
+  if (!rows.length) return;
+  const header = 'day,engine_data,split,hermes_on_engine,hermes_other,engine_other_clients,engine_total,total\n';
+  const lines = rows.map((r) => [
+    r.day,
+    !r.covered ? 'none' : r.partial ? 'partial' : 'full',
+    r.estimated ? 'estimated' : 'measured',
+    r[uLane].hermes_engine, r[uLane].hermes_other, r[uLane].engine_other,
+    r[uLane].engine_total, r[uLane].total,
+  ].join(','));
+  const blob = new Blob([header + lines.join('\n') + '\n'], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url,
+    download: `hermes-unified-${uLane}-${uDays}d-${new Date().toISOString().slice(0, 10)}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
 // The Hermes tab's recurring poll. Idempotent, so syncTabTimers() can call it
 // on every tab switch and visibility change without stacking intervals.
 let hermesPollTimer = null;
@@ -1391,6 +1911,7 @@ let activeTab = 'usage';
 // llama-server (or hermes) forever.
 function syncTabTimers() {
   const live = !document.hidden;
+  if (live && activeTab === 'usage') startUnifiedPoll(); else stopUnifiedPoll();
   if (live && activeTab === 'hermes') startHermesPoll(); else stopHermesPoll();
   if (live && activeTab === 'engine') startEnginePoll(); else stopEnginePoll();
 }
