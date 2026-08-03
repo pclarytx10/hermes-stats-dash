@@ -107,13 +107,13 @@
 
   .filters { display: flex; gap: 8px; align-items: center; margin: 18px 0 16px; }
   .filters .label { color: var(--text-muted); font-size: 13px; margin-right: 4px; }
-  .range-btn {
+  .range-btn, .hist-range-btn {
     appearance: none; border: 1px solid var(--border); background: var(--surface-1);
     color: var(--text-secondary); border-radius: 8px; padding: 5px 12px;
     font: inherit; font-size: 13px; cursor: pointer;
   }
-  .range-btn:hover { color: var(--text-primary); }
-  .range-btn[aria-pressed="true"] {
+  .range-btn:hover, .hist-range-btn:hover { color: var(--text-primary); }
+  .range-btn[aria-pressed="true"], .hist-range-btn[aria-pressed="true"] {
     color: var(--text-primary); font-weight: 600; border-color: var(--baseline);
   }
 
@@ -396,6 +396,28 @@
       <div class="card chart-card">
         <h2>Slots</h2>
         <div id="engine-slots"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Recorded throughput</h2>
+          <div class="legend" id="engine-hist-legend"></div>
+        </div>
+        <div class="filters" role="group" aria-label="History range" style="margin:0 0 10px">
+          <span class="label">Range</span>
+          <button class="hist-range-btn" data-span="900" aria-pressed="true">15m</button>
+          <button class="hist-range-btn" data-span="3600" aria-pressed="false">1h</button>
+          <button class="hist-range-btn" data-span="21600" aria-pressed="false">6h</button>
+          <button class="hist-range-btn" data-span="86400" aria-pressed="false">24h</button>
+          <button class="hist-range-btn" data-span="604800" aria-pressed="false">7d</button>
+          <button class="hist-range-btn" data-span="all" aria-pressed="false">All</button>
+        </div>
+        <canvas id="engine-hist-strip" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-hist-note"></div>
+        <div class="grid tiles" id="engine-hist-tiles" style="margin-top:14px"></div>
+        <div style="margin-top:10px">
+          <button class="toggle-btn" id="engine-hist-csv" type="button">Export CSV</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1615,18 +1637,18 @@ function sizeEngineCanvas(c, ctx) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { w: r.width, h: r.height };
 }
-function drawEngineStrip() {
-  const c = $('engine-strip');
+// Shared by the live and history strips: prefill above the midline,
+// generation below, each axis scaled to its own maximum. opt.marks flags
+// buckets with a missing sample (collector recorded ok=0); opt.breaks flags
+// a discontinuity (server restart) right before that column — drawn as a
+// break in the strip rather than differenced into a false spike.
+function drawStripCanvas(c, pre, gen, emptyMsg, opt) {
+  opt = opt || {};
   if (!c.isConnected || c.clientWidth === 0) return;
   const ctx = c.getContext('2d');
-  const pre = [], gen = [];
-  for (const d of engineDeltas) {
-    pre.push(d.livePre !== null && d.livePre !== undefined ? d.livePre : (d.preSec > 0 ? d.preTok / d.preSec : 0));
-    gen.push(d.liveGen !== null && d.liveGen !== undefined ? d.liveGen : (d.genSec > 0 ? d.genTok / d.genSec : 0));
-  }
   const { w: W, h: H } = sizeEngineCanvas(c, ctx);
   ctx.clearRect(0, 0, W, H);
-  const padL = 46, padR = 12, padT = 14, padB = 14;
+  const padL = 46, padR = 12, padT = 14, padB = opt.labels ? 24 : 14;
   const plotW = W - padL - padR, mid = padT + (H - padT - padB) / 2, half = (H - padT - padB) / 2 - 6;
   const rule = cssVar('--gridline'), faint = cssVar('--text-muted');
 
@@ -1635,7 +1657,7 @@ function drawEngineStrip() {
 
   if (!pre.length) {
     ctx.fillStyle = faint; ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('waiting for a second reading — rates need two points', W / 2, mid - 12);
+    ctx.fillText(emptyMsg, W / 2, mid - 12);
     return;
   }
 
@@ -1652,17 +1674,216 @@ function drawEngineStrip() {
   ctx.fillText(fmtCompact(maxGen), padL - 8, mid + half + 4);
   ctx.fillText('0', padL - 8, mid + 3.5);
 
-  const cPre = cssVar('--series-1'), cGen = cssVar('--series-2');
+  const cPre = cssVar('--series-1'), cGen = cssVar('--series-2'), alert = cssVar('--critical');
   for (let j = 0; j < n; j++) {
     const x = padL + plotW - (n - j) * slot + (slot - bw) / 2;
+    if (opt.breaks && opt.breaks[j]) {
+      ctx.strokeStyle = faint; ctx.globalAlpha = 0.5; ctx.beginPath();
+      ctx.moveTo(Math.round(x) - 0.5, mid - half); ctx.lineTo(Math.round(x) - 0.5, mid + half);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (opt.marks && opt.marks[j]) {
+      ctx.fillStyle = alert; ctx.fillRect(x, mid - 1.5, Math.max(bw, 1.5), 3);
+      continue;
+    }
+    ctx.globalAlpha = (opt.dimOlder === false || j === n - 1) ? 1 : 0.82;
     const hp = (pre[j] / maxPre) * half;
     if (hp > 0.4) { ctx.fillStyle = cPre; ctx.fillRect(x, mid - hp, bw, hp); }
     const hg = (gen[j] / maxGen) * half;
     if (hg > 0.4) { ctx.fillStyle = cGen; ctx.fillRect(x, mid + 1, bw, hg); }
+    ctx.globalAlpha = 1;
+  }
+
+  if (opt.labels) {
+    ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif';
+    for (const lb of opt.labels) {
+      ctx.textAlign = lb.frac <= 0 ? 'left' : (lb.frac >= 1 ? 'right' : 'center');
+      ctx.fillText(lb.text, padL + plotW * lb.frac, H - 6);
+    }
   }
 }
+
+function drawEngineStrip() {
+  const pre = [], gen = [];
+  for (const d of engineDeltas) {
+    pre.push(d.livePre !== null && d.livePre !== undefined ? d.livePre : (d.preSec > 0 ? d.preTok / d.preSec : 0));
+    gen.push(d.liveGen !== null && d.liveGen !== undefined ? d.liveGen : (d.genSec > 0 ? d.genTok / d.genSec : 0));
+  }
+  drawStripCanvas($('engine-strip'), pre, gen, 'waiting for a second reading — rates need two points');
+}
 window.addEventListener('resize', () => {
-  if (activeTab === 'engine' && !$('engine-content').hidden) drawEngineStrip();
+  if (activeTab !== 'engine' || $('engine-content').hidden) return;
+  drawEngineStrip();
+  drawEngineHistStrip();
+});
+
+// ── Engine tab: recorded history (served by the collector, proxied) ────
+let engineHist = null;         // {cols, bucket, from, to, metrics, rows} | null
+let engineHistCols = {};       // column name -> index into each row
+let engineHistSpan = 900;      // seconds, or 'all'
+let engineHistLoadedFor = null;
+
+function histTimeLabel(t, spanSec) {
+  const d = new Date(t * 1000);
+  const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return spanSec > 86400 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${hm}` : hm;
+}
+
+// Turns raw collector rows into per-bucket rates by differencing consecutive
+// pairs — mirrors the standalone telemetry page's histSeries(). A pair whose
+// bucket recorded no counters (collector was down) becomes a gap marker
+// instead of a zero; a pair whose epoch changed (server restart) becomes a
+// break instead of being differenced into a false spike.
+function engineHistSeries() {
+  if (!engineHist || !Array.isArray(engineHist.rows) || engineHist.rows.length < 2) return [];
+  const R = engineHist.rows, HC = engineHistCols, out = [];
+  const haveM = !!engineHist.metrics;
+  for (let i = 1; i < R.length; i++) {
+    const a = R[i - 1], b = R[i];
+    const gap = b[HC.n] > b[HC.n_ok];
+    const pair = a[HC.prompt_tokens] !== null && b[HC.prompt_tokens] !== null;
+    if (haveM && !pair) {
+      out.push({ t: b[HC.ts], dt: 0, pre: 0, gen: 0, preTok: 0, preSec: 0, genTok: 0, genSec: 0, busy: 0, gap: true, brk: false });
+      continue;
+    }
+    const dt = b[HC.ts] - a[HC.ts];
+    if (!(dt > 0)) continue;
+    const brk = b[HC.epoch] !== a[HC.epoch];
+    const can = pair && !brk;
+    const dpT = can ? Math.max(0, b[HC.prompt_tokens] - a[HC.prompt_tokens]) : 0;
+    const dpS = can ? Math.max(0, b[HC.prompt_seconds] - a[HC.prompt_seconds]) : 0;
+    const dgT = can ? Math.max(0, b[HC.predicted_tokens] - a[HC.predicted_tokens]) : 0;
+    const dgS = can ? Math.max(0, b[HC.predicted_seconds] - a[HC.predicted_seconds]) : 0;
+    out.push({
+      t: b[HC.ts], dt,
+      pre: dpS > 0 ? dpT / dpS : 0,
+      gen: (b[HC.gen_delta] > 0) ? b[HC.gen_delta] / dt : 0,
+      preTok: dpT, preSec: dpS, genTok: dgT, genSec: dgS,
+      busy: (b[HC.slots_generating] || 0) + (b[HC.slots_prefilling] || 0),
+      gap, brk,
+    });
+  }
+  return out;
+}
+
+function drawEngineHistStrip() {
+  const s = engineHistSeries();
+  if (!s.length) {
+    drawStripCanvas($('engine-hist-strip'), [], [], engineHist ? 'window contains no usable pairs' : 'no window loaded');
+    return;
+  }
+  const pre = [], gen = [], marks = [], breaks = [];
+  for (const row of s) { pre.push(row.pre); gen.push(row.gen); marks.push(row.gap); breaks.push(row.brk); }
+  const t0 = s[0].t, t1 = s[s.length - 1].t, sp = t1 - t0;
+  drawStripCanvas($('engine-hist-strip'), pre, gen, '', {
+    marks, breaks, dimOlder: false,
+    labels: [
+      { frac: 0, text: histTimeLabel(t0, sp) },
+      { frac: 0.5, text: histTimeLabel((t0 + t1) / 2, sp) },
+      { frac: 1, text: histTimeLabel(t1, sp) },
+    ],
+  });
+}
+
+function renderEngineHistSummary() {
+  const s = engineHistSeries();
+  const tilesHolder = $('engine-hist-tiles');
+  $('engine-hist-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-2)' }), el('span', { text: 'Generation' })));
+  if (!s.length) {
+    tilesHolder.replaceChildren();
+    drawEngineHistStrip();
+    return;
+  }
+  const haveM = !!engineHist.metrics;
+  let pT = 0, pS = 0, gT = 0, gS = 0, wall = 0, busy = 0, gaps = 0, restarts = 0, slotTok = 0;
+  for (const row of s) {
+    pT += row.preTok; pS += row.preSec; gT += row.genTok; gS += row.genSec;
+    wall += row.dt; busy += row.busy * row.dt; slotTok += row.gen * row.dt;
+    if (row.gap) gaps++;
+    if (row.brk) restarts++;
+  }
+  const preAvg = (haveM && pS > 0) ? pT / pS : null;
+  const genAvg = haveM ? (gS > 0 ? gT / gS : null) : (wall > 0 ? slotTok / wall : null);
+
+  tilesHolder.replaceChildren(
+    tileEl('Prefill · window avg', valueWithUnit(preAvg == null ? '—' : fmtNum(preAvg, 0), 'tok/s'),
+      haveM ? `${fmtCompact(pT)} prompt tokens over ${fmtNum(pS, 0)}s of prefill compute`
+            : 'Unavailable: /metrics is disabled on this server.'),
+    tileEl('Generation · window avg', valueWithUnit(genAvg == null ? '—' : fmtNum(genAvg, 1), 'tok/s'),
+      haveM ? `${fmtCompact(gT)} tokens over ${fmtNum(gS, 0)}s of decode compute`
+            : `${fmtCompact(slotTok)} tokens over ${fmtNum(wall / 60, 0)}min — slot-derived, not decode time`),
+    tileEl('Tokens in window', document.createTextNode(haveM ? `${fmtCompact(pT)} / ${fmtCompact(gT)}` : `— / ${fmtCompact(slotTok)}`),
+      (haveM ? 'prompt / generated, differenced across the window' : 'prompt unavailable; generated counted from slot progress') +
+        (restarts ? ` · ${restarts} restart${restarts === 1 ? '' : 's'} spanned` : '')),
+    tileEl('Utilisation', valueWithUnit(fmtNum(wall > 0 ? busy / wall : 0, 2), 'slots'),
+      gaps ? `${gaps} of ${s.length} buckets missed samples — server unreachable then` : 'continuous coverage, no missed samples'));
+
+  const mins = wall / 60;
+  $('engine-hist-note').textContent = `${s.length} bucket${s.length === 1 ? '' : 's'} · ` +
+    `${engineHist.bucket >= 60 ? fmtNum(engineHist.bucket / 60, 1) + 'min' : fmtNum(engineHist.bucket, 0) + 's'} per column · ` +
+    `${mins >= 90 ? fmtNum(mins / 60, 1) + 'h' : fmtNum(mins, 0) + 'min'} spanned`;
+  drawEngineHistStrip();
+}
+
+function setHistSpanButtons(span) {
+  document.querySelectorAll('.hist-range-btn').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.span === String(span))));
+}
+
+async function loadEngineHistory(span) {
+  engineHistSpan = span;
+  setHistSpanButtons(span);
+  if (!currentEngineId) return;
+  $('engine-hist-note').textContent = 'loading…';
+  try {
+    let from, to;
+    if (span === 'all') {
+      const r = await fetch(`/api/engine/range?engine=${encodeURIComponent(currentEngineId)}`);
+      const g = await r.json();
+      if (g.error) throw new Error(g.error);
+      if (!g.rows) throw new Error('collector has recorded nothing yet');
+      from = g.from - 1; to = g.to + 1;
+    } else {
+      to = Date.now() / 1000;
+      from = to - span;
+    }
+    const res = await fetch(`/api/engine/history?engine=${encodeURIComponent(currentEngineId)}&from=${from}&to=${to}&points=400`);
+    const j = await res.json();
+    if (j.error) throw new Error(j.error);
+    engineHist = j;
+    engineHistCols = {};
+    (j.cols || []).forEach((name, i) => { engineHistCols[name] = i; });
+    renderEngineHistSummary();
+  } catch (err) {
+    engineHist = null;
+    $('engine-hist-note').textContent = String(err?.message || err);
+    renderEngineHistSummary();
+  }
+}
+document.querySelectorAll('.hist-range-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const raw = btn.dataset.span;
+    loadEngineHistory(raw === 'all' ? 'all' : Number(raw));
+  });
+});
+
+$('engine-hist-csv').addEventListener('click', () => {
+  const s = engineHistSeries();
+  if (!s.length) return;
+  const header = 'timestamp_iso,dt_seconds,prefill_tok_s,generation_tok_s,prompt_tokens,prompt_seconds,generated_tokens,generation_seconds,busy_slots,gap,restart\n';
+  const lines = s.map((row) => [
+    new Date(row.t * 1000).toISOString(), row.dt.toFixed(2), row.pre.toFixed(3), row.gen.toFixed(3),
+    row.preTok, row.preSec.toFixed(2), row.genTok, row.genSec.toFixed(2), row.busy, row.gap ? 1 : 0, row.brk ? 1 : 0,
+  ].join(','));
+  const blob = new Blob([header + lines.join('\n') + '\n'], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: `${currentEngineId || 'engine'}-history-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 });
 
 // ── Engine tab: fetch orchestration, picker, empty states ──────────
@@ -1691,6 +1912,8 @@ function selectEngine(id) {
   currentEngineId = id;
   resetEngineSeries();
   renderEnginePicker();
+  engineHistLoadedFor = id;
+  loadEngineHistory(900); // reset to the default window — history isn't comparable across engines either
   if (activeTab === 'engine') pollEngineLive();
 }
 
@@ -1741,6 +1964,10 @@ async function pollEngineLive() {
 function startEnginePoll() {
   stopEnginePoll();
   if (!engineList.length) { loadEngineList(); return; }
+  if (engineHistLoadedFor !== currentEngineId) {
+    engineHistLoadedFor = currentEngineId;
+    loadEngineHistory(engineHistSpan);
+  }
   pollEngineLive();
   enginePollTimer = setInterval(pollEngineLive, ENGINE_POLL_MS);
 }
