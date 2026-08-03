@@ -142,6 +142,17 @@
   .engine-test-btn { font-size: 12px; padding: 5px 10px; }
   .engine-result { margin-top: 8px; font-size: 12px; }
   .engine-result .result-row { padding: 3px 0; border-bottom: none; }
+  .engine-row .field-hint { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+  .engine-btn-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .suggest-box { margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+  .suggest-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .suggest-chip {
+    font-size: 12px; padding: 3px 10px; border-radius: 999px;
+    border: 1px dashed var(--baseline); background: var(--page); color: var(--text-secondary);
+  }
+  .suggest-chip:hover { border-style: solid; color: var(--text-primary); }
+  .suggest-chip.added { border-style: solid; color: var(--good-text); border-color: var(--good-text); }
+  .suggest-chip .score { color: var(--text-muted); margin-left: 5px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -216,6 +227,8 @@
     <div class="hint" style="margin-bottom:12px">
       Telemetry sources for the Engine tab — each is a llama-server, plus
       optionally its telemetry collector. Neither URL holds credentials.
+      The model list feeds the Usage tab's reconciliation; the collector URL
+      is what gives that tab any engine history at all.
     </div>
     <div id="engine-rows"></div>
     <button class="link-btn" id="add-engine-btn" type="button">+ Add engine</button>
@@ -309,8 +322,13 @@ function newEngineRow(e) {
     placeholder: 'http://127.0.0.1:8080', spellcheck: 'false' });
   const collectorIn = el('input', { type: 'url', id: `${rid}-collector`, value: e.collectorUrl || '',
     placeholder: 'http://127.0.0.1:8081 (optional)', spellcheck: 'false' });
+  const modelsIn = el('input', { type: 'text', id: `${rid}-models`,
+    value: (e.models || []).join(', '),
+    placeholder: 'model-name.gguf, another-model', spellcheck: 'false' });
   const resultDiv = el('div', { class: 'engine-result' });
+  const suggestDiv = el('div', { class: 'suggest-box' });
   const testBtn = el('button', { type: 'button', class: 'engine-test-btn', text: 'Test connection' });
+  const suggestBtn = el('button', { type: 'button', class: 'engine-test-btn', text: 'Suggest models' });
   const removeBtn = el('button', { type: 'button', class: 'remove-btn',
     'aria-label': 'Remove engine', text: '✕ Remove' });
 
@@ -326,10 +344,64 @@ function newEngineRow(e) {
         el('label', { for: `${rid}-llama`, text: 'llama-server URL' }), llamaIn),
       el('div', { class: 'field' },
         el('label', { for: `${rid}-collector`, text: 'Collector URL (optional)' }), collectorIn)),
-    el('div', { style: 'margin-top:8px' }, testBtn),
-    resultDiv);
+    el('div', { class: 'field' },
+      el('label', { for: `${rid}-models`, text: 'hermes models served here (comma-separated)' }),
+      modelsIn,
+      el('div', { class: 'field-hint',
+        text: 'Used by the Usage tab to subtract hermes’ own traffic from this engine’s total, so the two are not double-counted. Left blank, this engine’s tokens are all attributed to other clients.' })),
+    el('div', { class: 'engine-btn-row' }, testBtn, suggestBtn),
+    resultDiv,
+    suggestDiv);
 
   removeBtn.addEventListener('click', () => row.remove());
+
+  // Adds a suggested name to the comma-separated field, keeping what's there.
+  const addModel = (name, chip) => {
+    const have = modelsIn.value.split(',').map((s) => s.trim()).filter(Boolean);
+    if (!have.some((h) => h.toLowerCase() === name.toLowerCase())) have.push(name);
+    modelsIn.value = have.join(', ');
+    chip.classList.add('added');
+    chip.textContent = '✓ ' + name;
+  };
+
+  suggestBtn.addEventListener('click', async () => {
+    suggestBtn.disabled = true; suggestBtn.textContent = 'Matching…';
+    try {
+      const res = await fetch('/api/engine/model-suggest', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ llamaUrl: llamaIn.value.trim() }),
+      });
+      const r = await res.json();
+      if (r.error && !r.candidates?.length) {
+        suggestDiv.replaceChildren(resultRow('fail', 'No suggestions', r.error));
+        return;
+      }
+      const head = el('div', {
+        text: `Serving ${String(r.model_path).split('/').pop()} — ` +
+          (r.candidates.length
+            ? 'closest hermes model names, click to add:'
+            : (r.note || 'no hermes model name resembles this file.')),
+      });
+      // A partial fan-out can hide the very model you're looking for, so the
+      // caveat is shown even when there are candidates to click.
+      const caveat = r.note && r.candidates.length
+        ? resultRow('skip', 'Partial match set', r.note) : null;
+      const chips = r.candidates.map((c) => {
+        const chip = el('button', { type: 'button', class: 'suggest-chip', text: c.model },
+          el('span', { class: 'score', text: c.score >= 1 ? 'exact' : `${Math.round(c.score * 100)}%` }));
+        chip.addEventListener('click', () => addModel(c.model, chip));
+        return chip;
+      });
+      // replaceChildren stringifies null (el() skips it) — filter explicitly.
+      suggestDiv.replaceChildren(
+        ...[head, caveat, el('div', { class: 'suggest-chips' }, ...chips)].filter(Boolean));
+    } catch (err) {
+      suggestDiv.replaceChildren(resultRow('fail', 'Suggest failed', String(err?.message || err)));
+    } finally {
+      suggestBtn.disabled = false; suggestBtn.textContent = 'Suggest models';
+    }
+  });
   testBtn.addEventListener('click', async () => {
     testBtn.disabled = true; testBtn.textContent = 'Testing…';
     try {
@@ -380,6 +452,7 @@ $('engines-save-btn').addEventListener('click', async () => {
       label: $(`${rid}-label`).value.trim(),
       llamaUrl: $(`${rid}-llama`).value.trim(),
       collectorUrl: $(`${rid}-collector`).value.trim(),
+      models: $(`${rid}-models`).value.split(',').map((s) => s.trim()).filter(Boolean),
     };
   });
   try {

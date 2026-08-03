@@ -46,6 +46,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const PORT = Number(process.env.PORT || 8788)
 const UPSTREAM_TIMEOUT_MS = 10_000
+// /api/analytics/usage is a SQL aggregation over a whole profile's session DB
+// and gets slower the wider the window: on a large default profile a 90-day
+// call routinely passes 10s. It needs its own budget, because a dropped
+// profile is not a cosmetic gap — the unified tab subtracts hermes' tokens
+// from the engine's total, so an undercounted profile silently inflates the
+// "other clients" residual.
+const ANALYTICS_TIMEOUT_MS = 45_000
 
 // Bind host. Loopback-only by default so the stats server — which proxies
 // upstream credentials and has no auth of its own — isn't reachable off the
@@ -140,7 +147,27 @@ function sanitizeEngineEntry(e) {
     label: String(e.label || '').trim() || id,
     llamaUrl,
     collectorUrl: /^https?:\/\//.test(collectorUrl) ? collectorUrl : '',
+    // hermes model names served by this engine. Nothing is attributed to an
+    // engine without an explicit entry here — the suggester proposes, the
+    // operator decides. Deduped case-insensitively; order is not meaningful.
+    models: dedupeModels(e.models),
   }
+}
+
+function dedupeModels(raw) {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set()
+  const out = []
+  for (const m of raw) {
+    const name = String(m || '').trim()
+    if (!name || name.length > 200) continue
+    const k = name.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(name)
+    if (out.length >= 32) break
+  }
+  return out
 }
 
 function engines() {
@@ -317,17 +344,17 @@ function authMode() {
  * a fresh root-HTML scrape in loopback mode. Returns parsed JSON or null —
  * never throws.
  */
-async function dashJson(apiPath, { retried = false } = {}) {
+async function dashJson(apiPath, { retried = false, timeoutMs } = {}) {
   const base = dashboardUrl()
   try {
     const res = await fetch(`${base}${apiPath}`, {
       headers: { accept: 'application/json', ...(await authHeaders(base)) },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs ?? UPSTREAM_TIMEOUT_MS),
     })
     if (res.status === 401 && !staticToken() && !staticCookie() && !retried) {
       storeLoginCookie(base, '')
       if (!(staticUsername() && staticPassword())) storeSessionToken(base, '')
-      return dashJson(apiPath, { retried: true })
+      return dashJson(apiPath, { retried: true, timeoutMs })
     }
     if (!res.ok) {
       console.warn(`[upstream] ${apiPath} -> ${res.status}`)
@@ -487,6 +514,28 @@ function mergeUsage(usages, days) {
   return { daily, by_model, totals, period_days: days }
 }
 
+/**
+ * Fan out `/api/analytics/usage` across every profile in the status payload.
+ * Each hermes profile has its own session DB, and the endpoint is
+ * single-profile, so the whole-workspace picture is the sum. Returns the
+ * profile list alongside the per-profile payloads (index-aligned, null where a
+ * profile failed) — callers that only want the aggregate pass the payloads
+ * straight to mergeUsage().
+ */
+async function fetchProfileUsages(days, status) {
+  const profiles =
+    Array.isArray(status?.profiles) && status.profiles.length ? status.profiles : ['default']
+  const opts = { timeoutMs: ANALYTICS_TIMEOUT_MS }
+  const usages = await Promise.all(
+    profiles.length === 1 && profiles[0] === 'default'
+      ? [dashJson(`/api/analytics/usage?days=${days}`, opts)]
+      : profiles.map((p) =>
+          dashJson(`/api/analytics/usage?days=${days}&profile=${encodeURIComponent(p)}`, opts)),
+  )
+  const missing = profiles.filter((_, i) => !usages[i] || typeof usages[i] !== 'object')
+  return { profiles, usages, missing, complete: missing.length === 0 }
+}
+
 async function buildOverview(days) {
   // Phase 1: everything that doesn't depend on the profile list.
   const [status, model, cron, profileSessions] = await Promise.all([
@@ -499,14 +548,7 @@ async function buildOverview(days) {
 
   // Phase 2: fan out usage per profile and merge. Fall back to the default
   // (unscoped) call if the profile list is unavailable.
-  const profiles =
-    Array.isArray(status?.profiles) && status.profiles.length ? status.profiles : ['default']
-  const usages = await Promise.all(
-    profiles.length === 1 && profiles[0] === 'default'
-      ? [dashJson(`/api/analytics/usage?days=${days}`)]
-      : profiles.map((p) =>
-          dashJson(`/api/analytics/usage?days=${days}&profile=${encodeURIComponent(p)}`)),
-  )
+  const { profiles, usages } = await fetchProfileUsages(days, status)
   const usage = mergeUsage(usages, days)
   const profilesWithData = usages.filter((u) => u && typeof u === 'object').length
 
@@ -808,6 +850,118 @@ async function testEngine(body) {
     }
   }
   return out
+}
+
+// ── Model → engine attribution ──────────────────────────────────────
+//
+// The unified Usage tab has to know which hermes models ran on which engine,
+// because that overlap is the only part of the two token populations that
+// would otherwise be double-counted. hermes names a model however its provider
+// config says; llama-server reports a filesystem path. Nothing infers the link
+// at request time — an operator saves it once, helped by the suggester below.
+
+/**
+ * Reduce a model name to a comparison key: last path segment (hermes writes
+ * `provider/model`, llama.cpp writes an absolute path), no `.gguf`, no
+ * punctuation. "…/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" → "qwen3 6 35b a3b ud q4 k m".
+ */
+function modelKey(name) {
+  return String(name || '')
+    .split(/[\\/]/)
+    .pop()
+    .replace(/\.gguf$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+/**
+ * 0..1 similarity between two model keys. Exact match and containment are
+ * scored above token overlap so a quantisation or suffix difference ranks
+ * below a true match but still surfaces as a candidate.
+ */
+function modelMatchScore(a, b) {
+  const ka = modelKey(a)
+  const kb = modelKey(b)
+  if (!ka || !kb) return 0
+  if (ka === kb) return 1
+  if (ka.includes(kb) || kb.includes(ka)) return 0.8
+  const ta = new Set(ka.split(' '))
+  const tb = new Set(kb.split(' '))
+  let shared = 0
+  for (const t of ta) if (tb.has(t)) shared++
+  const union = ta.size + tb.size - shared
+  return union > 0 ? 0.7 * (shared / union) : 0
+}
+
+const MODEL_SUGGEST_FLOOR = 0.3
+
+/**
+ * Rank the hermes models this workspace has actually used against the model
+ * file a llama-server reports at /props. Takes URLs from the request body, not
+ * saved config, so Setup can suggest for an engine row before it is saved.
+ */
+async function suggestEngineModels(body) {
+  const llamaUrl = trimSlash(body.llamaUrl || '')
+  if (!/^https?:\/\//.test(llamaUrl)) {
+    return { error: 'URL must start with http:// or https://' }
+  }
+  const [{ props, error }, status] = await Promise.all([
+    fetchProps({ llamaUrl }, 5_000),
+    dashJson('/api/status'),
+  ])
+  if (error) return { error: `llama-server ${error}`, model_path: null, candidates: [] }
+  const modelPath = props?.model_path || null
+  if (!modelPath) {
+    return { error: 'this server does not report a model path at /props', model_path: null, candidates: [] }
+  }
+
+  // A wide window on purpose: a model that hasn't been used this month is
+  // exactly the one an operator forgets to map.
+  const { usages, missing } = await fetchProfileUsages(90, status)
+  const merged = mergeUsage(usages, 90)
+  const known = merged?.by_model || []
+  // A profile that failed took its models with it, so "no match" would be a
+  // lie about what hermes has run. Say which profiles are missing instead.
+  const partial = missing.length
+    ? `${missing.length} profile${missing.length === 1 ? '' : 's'} did not answer (${missing.join(', ')}) — ` +
+      'a model used only there will not appear below'
+    : null
+  if (!known.length) {
+    return {
+      model_path: modelPath,
+      candidates: [],
+      note: partial || 'hermes reported no model usage in the last 90 days to match against',
+    }
+  }
+
+  const candidates = known
+    .map((m) => ({
+      model: m.model || 'unknown',
+      score: Number(modelMatchScore(m.model, modelPath).toFixed(3)),
+      tokens: Number(m.input_tokens || 0) + Number(m.output_tokens || 0),
+    }))
+    .filter((c) => c.score >= MODEL_SUGGEST_FLOOR)
+    .sort((a, b) => b.score - a.score || b.tokens - a.tokens)
+    .slice(0, 5)
+
+  return { model_path: modelPath, candidates, note: partial }
+}
+
+/**
+ * model key → engine id, over every configured engine. A model mapped to two
+ * engines is kept on the first (config order): its tokens must be subtracted
+ * from exactly one engine's total or the reconciliation double-counts.
+ */
+function engineModelIndex() {
+  const index = new Map()
+  for (const e of engines()) {
+    for (const m of e.models || []) {
+      const k = modelKey(m)
+      if (k && !index.has(k)) index.set(k, e.id)
+    }
+  }
+  return index
 }
 
 // ── Settings & connection test ──────────────────────────────────────
@@ -1136,6 +1290,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/engine/test') {
       sendJson(res, 200, await testEngine(await readJsonBody(req)))
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/engine/model-suggest') {
+      const result = await suggestEngineModels(await readJsonBody(req))
+      sendJson(res, result.error && !result.model_path ? 400 : 200, result)
       return
     }
   } catch (err) {
