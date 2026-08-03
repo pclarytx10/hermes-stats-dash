@@ -1225,6 +1225,408 @@ function attributionCoverage(sessions, days, limit) {
   }
 }
 
+// ── Unified usage: the engine side ──────────────────────────────────
+//
+// Daily token totals per engine, differenced out of the collector's monotonic
+// counters. Deliberately different from the Engine tab's history panel, which
+// renders *rates* and therefore drops any pair spanning a restart: totals want
+// the tokens, so a restart is counted and flagged rather than discarded.
+
+const DAY_MS = 86400_000
+const dayStartSec = (day) => Date.parse(`${day}T00:00:00Z`) / 1000
+const dayOf = (sec) => new Date(sec * 1000).toISOString().slice(0, 10)
+const shiftDay = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10)
+
+// Closed UTC days can never change, so they are computed once per engine and
+// kept. Only the current day is recomputed on each request.
+const engineDayCache = new Map() // engine id -> Map(day -> row)
+const ENGINE_DAY_CACHE_MAX = 400
+
+// Keyed on the collector URL as well as the engine id: repointing an engine at
+// a different collector in Setup makes every cached day meaningless.
+function cacheForEngine(engine) {
+  const key = `${engine.id} ${engine.collectorUrl}`
+  let m = engineDayCache.get(key)
+  if (!m) { m = new Map(); engineDayCache.set(key, m) }
+  return m
+}
+
+const emptyDay = (day) => ({
+  day, prefill: 0, generation: 0, buckets: 0, missing_buckets: 0, restarts: 0,
+  metrics: false, partial: false,
+})
+
+/**
+ * One engine's per-day tokens over `dayList`, plus what the collector actually
+ * has. Returns { available, error, daily: Map(day -> row), range }.
+ */
+async function engineDailyTokens(engine, dayList) {
+  if (!engine.collectorUrl) {
+    return { available: false, error: 'no collector configured', daily: new Map(), range: null }
+  }
+  const rangeRes = await proxyCollectorJson(engine, '/range')
+  if (rangeRes.status !== 200) {
+    return { available: false, error: rangeRes.body?.error || 'collector unavailable', daily: new Map(), range: null }
+  }
+  const range = rangeRes.body || {}
+  const cache = cacheForEngine(engine)
+  const today = dayList[dayList.length - 1]
+
+  // Today always recomputes; closed days come from cache when present. Days
+  // the collector demonstrably predates are settled as uncovered without a
+  // query — that is most of a 90-day window on a young collector.
+  const firstSample = Number(range.from || 0)
+  const firstRecordedDay = firstSample > 0 ? dayOf(firstSample) : null
+  const needed = dayList.filter(
+    (d) => d === today || (!cache.has(d) && (!firstRecordedDay || d >= firstRecordedDay)),
+  )
+  if (!needed.length) {
+    return { available: true, error: null, range, daily: pickCached(cache, dayList) }
+  }
+
+  // Query starts one day early: the delta for the first needed day needs the
+  // counter value as it stood at that day's midnight, which is the last bucket
+  // of the day before.
+  const from = dayStartSec(shiftDay(needed[0], -1))
+  const to = dayStartSec(today) + 86400
+  const wantPoints = Math.round((to - from) / 3600) // hourly, so buckets land on UTC hours
+  const points = Math.min(4000, Math.max(10, wantPoints))
+  const res = await proxyCollectorJson(engine, '/history', `from=${from}&to=${to}&points=${points}`)
+  if (res.status !== 200) {
+    return { available: false, error: res.body?.error || 'collector history failed', daily: new Map(), range }
+  }
+  const hist = res.body || {}
+  const C = {}
+  ;(hist.cols || []).forEach((name, i) => { C[name] = i })
+  const rows = Array.isArray(hist.rows) ? hist.rows : []
+  const haveMetrics = !!hist.metrics
+
+  const out = new Map()
+  const touch = (day) => {
+    if (!out.has(day)) out.set(day, emptyDay(day))
+    return out.get(day)
+  }
+  let prev = null
+  for (const r of rows) {
+    const ts = Number(r[C.ts])
+    if (!Number.isFinite(ts)) continue
+    const day = dayOf(ts)
+    const bucket = touch(day)
+    bucket.buckets++
+    // MAX() over a bucket of ok=0 rows yields NULL — the collector was down,
+    // so this bucket anchors nothing. Never treat it as a zero reading.
+    const prompt = r[C.prompt_tokens]
+    const predicted = r[C.predicted_tokens]
+    const slotGen = Number(r[C.gen_delta] || 0)
+    if (prompt === null && predicted === null) {
+      bucket.missing_buckets++
+      if (slotGen > 0) bucket.generation += slotGen // slots still recorded progress
+      continue
+    }
+    const epoch = Number(r[C.epoch] || 0)
+    const promptV = Number(prompt || 0)
+    const predictedV = Number(predicted || 0)
+    if (prev && prev.epoch === epoch) {
+      bucket.prefill += Math.max(0, promptV - prev.prompt)
+      bucket.generation += haveMetrics ? Math.max(0, predictedV - prev.predicted) : slotGen
+      prev = { epoch, prompt: promptV, predicted: predictedV }
+    } else if (prev) {
+      // llama-server restarted inside this bucket, and the bucket's counters
+      // are MAX() over rows from *both* epochs — so the reported value is
+      // normally the pre-restart peak, not a post-restart total. Differencing
+      // it recovers the pre-restart tail; the post-restart volume is hidden
+      // under that MAX, so re-anchor at zero and let the next bucket's
+      // cumulative reading account for everything since the restart.
+      bucket.restarts++
+      bucket.partial = true
+      bucket.prefill += Math.max(0, promptV - prev.prompt)
+      // gen_delta is a per-sample sum rather than a counter, so it survives a
+      // restart intact — prefer it here even when metrics are available.
+      bucket.generation += slotGen || Math.max(0, predictedV - prev.predicted)
+      prev = { epoch, prompt: 0, predicted: 0 }
+    } else {
+      // First reading of the query window: an anchor, not a measurement.
+      prev = { epoch, prompt: promptV, predicted: predictedV }
+    }
+    bucket.metrics = bucket.metrics || haveMetrics
+  }
+
+  // A day the collector only partly witnessed is not a day with less traffic,
+  // and must not be compared against a full day of hermes. Flag the day the
+  // recording started, and any day with buckets the collector missed.
+  const firstTs = Number(range.from || 0)
+  for (const [day, row] of out) {
+    if (row.missing_buckets > 0) row.partial = true
+    if (firstTs > 0 && firstTs > dayStartSec(day) && firstTs < dayStartSec(day) + 86400) {
+      row.partial = true
+      row.starts_mid_day = true
+    }
+  }
+
+  // Persist closed days; drop the anchor day if it fell outside the window.
+  for (const [day, row] of out) {
+    if (day !== today && dayList.includes(day)) cache.set(day, row)
+  }
+  while (cache.size > ENGINE_DAY_CACHE_MAX) cache.delete(cache.keys().next().value)
+
+  const daily = pickCached(cache, dayList)
+  for (const day of dayList) if (out.has(day)) daily.set(day, out.get(day))
+  return { available: true, error: null, range, daily }
+}
+
+function pickCached(cache, dayList) {
+  const m = new Map()
+  for (const d of dayList) if (cache.has(d)) m.set(d, cache.get(d))
+  return m
+}
+
+/**
+ * Every configured engine's daily tokens, summed. Counts sum across engines
+ * even though the Engine tab's rates deliberately do not — see
+ * docs/unified-usage-plan.md §4.
+ */
+async function buildEngineSide(dayList) {
+  const list = engines()
+  if (!list.length) {
+    return { available: false, reason: 'no_engines', daily: [], totals: null, by_engine: [], coverage: null }
+  }
+  const results = await Promise.all(list.map((e) => engineDailyTokens(e, dayList)))
+
+  const summed = new Map(dayList.map((d) => [d, { ...emptyDay(d), covered: false }]))
+  const byEngine = []
+  let anyAvailable = false
+  let firstSample = null
+
+  list.forEach((engine, i) => {
+    const r = results[i]
+    let prefill = 0
+    let generation = 0
+    let coveredDays = 0
+    for (const day of dayList) {
+      const row = r.daily.get(day)
+      if (!row) continue
+      prefill += row.prefill
+      generation += row.generation
+      coveredDays++
+      const agg = summed.get(day)
+      agg.prefill += row.prefill
+      agg.generation += row.generation
+      agg.missing_buckets += row.missing_buckets
+      agg.restarts += row.restarts
+      agg.covered = true
+      // Partial for any engine is partial for the sum: the day is not a
+      // like-for-like comparison against a full day of hermes.
+      agg.partial = agg.partial || row.partial
+    }
+    if (r.available) {
+      anyAvailable = true
+      const f = Number(r.range?.from || 0)
+      if (f > 0 && (firstSample === null || f < firstSample)) firstSample = f
+    }
+    byEngine.push({
+      id: engine.id,
+      label: engine.label,
+      available: r.available,
+      error: r.error,
+      has_collector: !!engine.collectorUrl,
+      mapped_models: (engine.models || []).length,
+      metrics: r.range ? !!r.range.metrics : null,
+      totals: { prefill: Math.round(prefill), generation: Math.round(generation),
+        tokens: Math.round(prefill + generation) },
+      coverage: {
+        days_covered: coveredDays,
+        first_sample: r.range?.from ?? null,
+        last_sample: r.range?.to ?? null,
+        ok_ratio: r.range?.rows ? Number((r.range.ok_rows / r.range.rows).toFixed(4)) : null,
+      },
+    })
+  })
+
+  const daily = dayList.map((d) => {
+    const r = summed.get(d)
+    return {
+      day: d,
+      covered: r.covered,
+      partial: r.partial,
+      prefill: Math.round(r.prefill),
+      generation: Math.round(r.generation),
+      tokens: Math.round(r.prefill + r.generation),
+      missing_buckets: r.missing_buckets,
+      restarts: r.restarts,
+    }
+  })
+  const totals = daily.reduce(
+    (a, r) => ({ prefill: a.prefill + r.prefill, generation: a.generation + r.generation,
+      tokens: a.tokens + r.tokens }),
+    { prefill: 0, generation: 0, tokens: 0 },
+  )
+  const coveredDays = daily.filter((r) => r.covered).length
+
+  return {
+    available: anyAvailable,
+    reason: anyAvailable ? null : 'no_collector_data',
+    daily,
+    totals,
+    by_engine: byEngine,
+    coverage: {
+      days_covered: coveredDays,
+      days_total: dayList.length,
+      complete: coveredDays === dayList.length,
+      first_sample: firstSample,
+      restarts: daily.reduce((a, r) => a + r.restarts, 0),
+    },
+  }
+}
+
+// ── Unified usage: the reconciliation ───────────────────────────────
+
+const LANES = ['prefill', 'generation', 'combined']
+
+function laneValue(side, lane) {
+  if (lane === 'prefill') return side.prefill
+  if (lane === 'generation') return side.generation
+  return side.prefill + side.generation
+}
+
+/**
+ * hermes + engine → one set of numbers, per lane and per day.
+ *
+ * `engine_other` is the residual after removing hermes' own engine-hosted
+ * traffic from what the endpoint processed: real traffic from other clients on
+ * the network, not an error term. It clamps at zero, and every clamp is
+ * reported with the most probable cause rather than silently flattened.
+ */
+function reconcile(hermes, engineSide, dayList) {
+  const hByDay = new Map(hermes.daily.map((r) => [r.day, r]))
+  const eByDay = new Map((engineSide.daily || []).map((r) => [r.day, r]))
+  let clampedDays = 0
+  let clampedTokens = 0
+  let clampedPartialDays = 0
+
+  const rows = dayList.map((day) => {
+    const h = hByDay.get(day) || { engine: emptySide(), other: emptySide(), estimated: false }
+    const e = eByDay.get(day)
+    const covered = !!e?.covered
+    const partial = !!e?.partial
+    const row = { day, covered, partial, estimated: !!h.estimated, restarts: e?.restarts || 0 }
+    for (const lane of LANES) {
+      const hermesEngine = laneValue(h.engine, lane)
+      const hermesOther = laneValue(h.other, lane)
+      const engineTotal = covered ? laneValue(e, lane) : 0
+      const residual = engineTotal - hermesEngine
+      if (covered && lane === 'combined' && residual < 0) {
+        clampedDays++
+        clampedTokens += -residual
+        if (partial) clampedPartialDays++
+      }
+      const engineOther = Math.max(0, residual)
+      row[lane] = {
+        hermes_engine: Math.round(hermesEngine),
+        hermes_other: Math.round(hermesOther),
+        engine_other: Math.round(engineOther),
+        engine_total: Math.round(engineTotal),
+        total: Math.round(hermesEngine + hermesOther + engineOther),
+      }
+    }
+    return row
+  })
+
+  const totals = {}
+  for (const lane of LANES) {
+    totals[lane] = rows.reduce(
+      (a, r) => ({
+        hermes_engine: a.hermes_engine + r[lane].hermes_engine,
+        hermes_other: a.hermes_other + r[lane].hermes_other,
+        engine_other: a.engine_other + r[lane].engine_other,
+        engine_total: a.engine_total + r[lane].engine_total,
+        total: a.total + r[lane].total,
+      }),
+      { hermes_engine: 0, hermes_other: 0, engine_other: 0, engine_total: 0, total: 0 },
+    )
+  }
+
+  // hermes' share of what the endpoint did, over the covered days only —
+  // comparing a 30-day hermes figure with 3 days of engine data would be
+  // arithmetic on two different windows.
+  const coveredEngineTotal = totals.combined.engine_total
+  const coveredHermesEngine = rows
+    .filter((r) => r.covered)
+    .reduce((a, r) => a + r.combined.hermes_engine, 0)
+  const hermesShare = coveredEngineTotal > 0
+    ? Number((coveredHermesEngine / coveredEngineTotal).toFixed(4))
+    : null
+
+  return {
+    daily: rows,
+    totals,
+    hermes_share_of_engine: hermesShare,
+    clamped: {
+      days: clampedDays,
+      partial_days: clampedPartialDays,
+      tokens: Math.round(clampedTokens),
+    },
+  }
+}
+
+function reconciliationWarnings(hermes, engineSide, reconciled, dayList) {
+  const w = []
+  const push = (code, severity, message) => w.push({ code, severity, message })
+
+  if (!hermes.complete) {
+    push('hermes_incomplete', 'warn',
+      `${hermes.profiles_missing.length} hermes profile(s) did not answer (${hermes.profiles_missing.join(', ')}). ` +
+      "hermes' side is undercounted, which inflates the engine's other-clients residual.")
+  }
+  if (!engineSide.available) {
+    push('no_engine_data', 'info',
+      engineSide.reason === 'no_engines'
+        ? 'No engine is configured, so this window shows hermes only. Add one in Setup.'
+        : 'No collector answered, so this window shows hermes only. The Engine tab needs a collector for history.')
+  } else if (!engineSide.coverage.complete) {
+    const c = engineSide.coverage
+    push('engine_coverage_partial', 'warn',
+      `Engine data covers ${c.days_covered} of ${c.days_total} days. ` +
+      'Days without it show hermes only, and the total is hermes for the full window plus other-client traffic for the recorded days.')
+  }
+  if (reconciled.clamped.days > 0) {
+    const c = reconciled.clamped
+    const over = Math.round(c.tokens).toLocaleString('en-US')
+    // A clamp on a day the collector only half-watched is expected arithmetic,
+    // not a symptom. Saying so is the difference between a useful warning and
+    // one people learn to ignore.
+    const explained = c.partial_days === c.days
+      ? 'All of those days are ones the collector only partly recorded, which is the expected cause.'
+      : c.partial_days > 0
+        ? `${c.partial_days} of them are days the collector only partly recorded; the rest are not explained by coverage — check the model map.`
+        : 'None of those days has a coverage gap, so the model map may attribute a model to an engine it does not run on.'
+    push('residual_clamped', c.partial_days === c.days ? 'info' : 'warn',
+      `On ${c.days} day(s) hermes reported more engine-hosted tokens than the engine recorded (${over} over). ${explained}`)
+  }
+  if (hermes.unmapped_local_models.length) {
+    push('unmapped_local_models', 'info',
+      `${hermes.unmapped_local_models.length} model(s) look locally hosted but are mapped to no engine ` +
+      `(${hermes.unmapped_local_models.map((m) => m.model).join(', ')}). Their tokens count as hermes-only.`)
+  }
+  const cov = hermes.attribution_coverage
+  if (cov?.available && cov.capped && !cov.covers_window) {
+    push('attribution_capped', 'info',
+      `The session sample reaches back ${cov.covered_days} of ${dayList.length} days, so earlier days are split ` +
+      "by the window's overall model mix rather than their own.")
+  }
+  const engineNoCollector = engineSide.by_engine?.filter((e) => !e.has_collector) || []
+  if (engineNoCollector.length) {
+    push('engine_without_collector', 'info',
+      `${engineNoCollector.map((e) => e.label).join(', ')} has no collector URL, so its traffic is absent from the total.`)
+  }
+  const engineUnmapped = engineSide.by_engine?.filter((e) => e.has_collector && !e.mapped_models) || []
+  if (engineUnmapped.length) {
+    push('engine_without_models', 'warn',
+      `${engineUnmapped.map((e) => e.label).join(', ')} has no hermes models mapped, so all of its traffic ` +
+      'is attributed to other clients. Map its models in Setup.')
+  }
+  return w
+}
+
 async function buildUnifiedUsage(days) {
   const status = await dashJson('/api/status')
   // Wider than the overview's sample: this list is what splits the daily
@@ -1235,18 +1637,26 @@ async function buildUnifiedUsage(days) {
     dashJson(`/api/profiles/sessions?limit=${sessionLimit}&order=recent`),
   ])
   const usage = mergeUsage(usages, days)
-  const hermes = buildHermesSide(days, usage, sessions)
+  const built = buildHermesSide(days, usage, sessions)
+  const hermes = {
+    ...built,
+    // A dropped profile understates hermes and inflates the residual, so
+    // this is a correctness flag for the reconciliation, not a status line.
+    complete: missing.length === 0,
+    profiles_total: profiles.length,
+    profiles_missing: missing,
+    attribution_coverage: attributionCoverage(sessions, days, sessionLimit),
+  }
+
+  const dayList = built.days
+  const engineSide = await buildEngineSide(dayList)
+  const reconciled = reconcile(hermes, engineSide, dayList)
 
   return {
-    hermes: {
-      ...hermes,
-      // A dropped profile understates hermes and inflates the residual, so
-      // this is a correctness flag for the reconciliation, not a status line.
-      complete: missing.length === 0,
-      profiles_total: profiles.length,
-      profiles_missing: missing,
-      attribution_coverage: attributionCoverage(sessions, days, sessionLimit),
-    },
+    hermes,
+    engine: engineSide,
+    reconciled,
+    warnings: reconciliationWarnings(hermes, engineSide, reconciled, dayList),
     meta: {
       days,
       dashboard_url: dashboardUrl(),
