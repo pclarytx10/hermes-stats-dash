@@ -256,6 +256,28 @@
   svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--text-muted); }
   .day-hit { fill: transparent; cursor: default; outline: none; }
   .day-hit:focus-visible { stroke: var(--text-primary); stroke-width: 1; stroke-dasharray: 0; }
+
+  /* ── Engine tab ── */
+  .engine-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .engine-identity-card h2 { font-size: 15px; color: var(--text-primary); margin: 0; }
+  .engine-strip-canvas { width: 100%; height: 140px; display: block; margin-top: 4px; }
+  .tile .val-unit { font-size: 13px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+  .tile.state-idle .value { color: var(--text-muted); }
+  .tile.state-generating .value { color: var(--series-2); }
+  .tile.state-prefilling .value { color: var(--series-1); }
+  .tile.state-queued .value { color: var(--critical); }
+
+  .slot-tag {
+    display: inline-block; border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600;
+    background: var(--gridline); color: var(--text-secondary);
+  }
+  .slot-tag.gen { background: color-mix(in srgb, var(--series-2) 18%, transparent); color: var(--series-2); }
+  .slot-tag.pre { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--series-1); }
+  .slot-bar-track { display: flex; align-items: center; gap: 6px; min-width: 120px; }
+  .slot-bar-rail { flex: 1; height: 6px; border-radius: 3px; background: var(--gridline); overflow: hidden; min-width: 40px; }
+  .slot-bar-fill { height: 100%; }
+  .slot-bar-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; flex: none; }
+  tr.slot-idle td { color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -344,7 +366,39 @@
     <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
   </div>
 
-  <div id="tab-engine" role="tabpanel" aria-labelledby="tab-engine-btn" hidden></div>
+  <div id="tab-engine" role="tabpanel" aria-labelledby="tab-engine-btn" hidden>
+    <div class="filters" role="group" aria-label="Engine picker" id="engine-picker-row" hidden>
+      <span class="label">Engine</span>
+      <div class="seg" id="engine-picker" role="group" aria-label="Select engine"></div>
+    </div>
+
+    <div id="engine-empty" class="card" hidden>
+      <div class="empty" id="engine-empty-text"></div>
+    </div>
+
+    <div id="engine-content" hidden>
+      <div class="card engine-identity-card">
+        <h2 id="engine-identity-title">—</h2>
+        <div class="engine-sub" id="engine-identity-sub"></div>
+      </div>
+
+      <div class="grid tiles" id="engine-tiles" style="margin-top:14px"></div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Token flow per interval</h2>
+          <div class="legend" id="engine-strip-legend"></div>
+        </div>
+        <canvas id="engine-strip" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-strip-note"></div>
+      </div>
+
+      <div class="card chart-card">
+        <h2>Slots</h2>
+        <div id="engine-slots"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1281,26 +1335,363 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ── Engine tab ──────────────────────────────────────────────────────
-// Phase 2 is the shell and poll lifecycle only; the live/history panels
-// (renderEnginePanel's real body) land in later phases.
 let engineList = [];
 let currentEngineId = null;
 let enginePollTimer = null;
 const ENGINE_POLL_MS = 4000;
+const ENGINE_MAXCOLS = 160;
 
-function renderEnginePanel(live) {
-  const holder = $('tab-engine');
-  if (!engineList.length) {
-    holder.replaceChildren(el('div', { class: 'card' },
-      el('div', { class: 'empty' },
-        el('span', { text: 'No llama.cpp engine configured. Add one in ' }),
-        el('a', { href: '/setup.html', text: 'Setup' }),
-        el('span', { text: '.' }))));
+// Per-engine running series, rebuilt from scratch on engine switch or a
+// detected server restart (counters going backwards) — none of it is
+// comparable across either boundary.
+let engineSamples = [];      // [{t, m}] raw metric snapshots, m may be null
+let engineDeltas = [];       // [{t, dt, preTok, preSec, genTok, genSec, decodes, livePre, liveGen}]
+let engineSlotPrev = {};     // slot id -> {task, decoded, processed}
+let engineTaskPrompt = {};   // task id -> {cache, total}
+let engineTaskOrder = [];
+let engineReqCount = 0;
+let engineHasPromptFields = false;
+
+function resetEngineSeries() {
+  engineSamples = []; engineDeltas = []; engineSlotPrev = {};
+  engineTaskPrompt = {}; engineTaskOrder = []; engineReqCount = 0;
+}
+
+function fmtNum(n, dp) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  dp = dp === undefined ? 1 : dp;
+  return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+function firstNum(list) {
+  for (const v of list) if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return 0;
+}
+function valueWithUnit(numText, unit) {
+  return el('span', {}, document.createTextNode(numText), unit ? el('span', { class: 'val-unit', text: unit }) : null);
+}
+function tileEl(label, valueNode, sub, extraClass) {
+  return el('div', { class: 'card tile' + (extraClass ? ' ' + extraClass : '') },
+    el('div', { class: 'label', text: label }),
+    el('div', { class: 'value' }, valueNode),
+    sub ? el('div', { class: 'sub', text: sub }) : null);
+}
+
+// Mirrors the standalone telemetry page's slot-progress reader: first
+// sighting of a slot only baselines it (a request already mid-flight would
+// otherwise dump its whole history into one interval); after that, a
+// changed task id means the slot's own counters restarted at zero, so the
+// current value *is* the delta rather than a difference.
+function readSlots(slots, dt) {
+  const live = { gen: 0, pre: 0, generating: 0, prefilling: 0, idle: 0 };
+  if (!Array.isArray(slots)) return null;
+  const next = {};
+  for (const s of slots) {
+    const id = String(s.id);
+    const task = s.id_task === undefined ? -1 : s.id_task;
+    const nt = s.next_token || {};
+    const dec = firstNum([nt.n_decoded, s.n_decoded]);
+    const proc = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
+    const cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
+    const total = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
+    const p = engineSlotPrev[id];
+    const sameTask = p && p.task === task;
+    const dDec = !p ? 0 : (sameTask ? Math.max(0, dec - p.decoded) : dec);
+    const dProc = !p ? 0 : (sameTask ? Math.max(0, proc - p.processed) : proc);
+    if (s.is_processing) {
+      live.gen += dDec; live.pre += dProc;
+      if (dec > 0) live.generating++; else live.prefilling++;
+    } else {
+      live.idle++;
+    }
+    if (task !== -1 && total > 0) {
+      if (!engineTaskPrompt[task]) engineTaskOrder.push(task);
+      engineTaskPrompt[task] = { cache, total };
+    }
+    if (task !== -1 && (!p || p.task !== task) && s.is_processing) engineReqCount++;
+    next[id] = { task, decoded: dec, processed: proc };
+  }
+  engineSlotPrev = next;
+  while (engineTaskOrder.length > 300) delete engineTaskPrompt[engineTaskOrder.shift()];
+  live.genRate = dt > 0 ? live.gen / dt : 0;
+  live.preRate = engineHasPromptFields ? (dt > 0 ? live.pre / dt : 0) : null;
+  return live;
+}
+
+function engineCacheReuse() {
+  let c = 0, t = 0;
+  for (const k in engineTaskPrompt) { c += engineTaskPrompt[k].cache; t += engineTaskPrompt[k].total; }
+  return t > 0 ? { pct: 100 * c / t, cached: c, total: t } : null;
+}
+
+function computeLiveRates() {
+  const w = engineDeltas.slice(-3);
+  let lp = 0, np = 0, lg = 0, ng = 0;
+  for (const d of w) {
+    if (d.livePre !== null && d.livePre !== undefined) { lp += d.livePre; np++; }
+    if (d.liveGen !== null && d.liveGen !== undefined) { lg += d.liveGen; ng++; }
+  }
+  return { livePre: np ? lp / np : null, liveGen: ng ? lg / ng : null };
+}
+function computeSettledRates() {
+  const s = engineDeltas.slice(-10);
+  let pT = 0, pS = 0, gT = 0, gS = 0;
+  for (const d of s) { pT += d.preTok; pS += d.preSec; gT += d.genTok; gS += d.genSec; }
+  return { preSettled: pS > 0 ? pT / pS : null, genSettled: gS > 0 ? gT / gS : null };
+}
+
+function ingestEngineLive(payload) {
+  const m = payload.metrics;
+  engineHasPromptFields = !!(payload.features && payload.features.hasPromptFields);
+  const prev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
+  if (prev && prev.m && m && Number(m.n_decode_total) < Number(prev.m.n_decode_total)) {
+    resetEngineSeries();
+  }
+  const now = Date.now();
+  const dtPrev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
+  const dt = dtPrev ? (now - dtPrev.t) / 1000 : 0;
+  const live = readSlots(payload.slots, dt);
+  engineSamples.push({ t: now, m });
+  if (engineSamples.length > ENGINE_MAXCOLS + 1) engineSamples.shift();
+  if (dtPrev && dt > 0 && dtPrev.m && m) {
+    engineDeltas.push({
+      t: now, dt,
+      preTok: Math.max(0, (m.prompt_tokens_total || 0) - (dtPrev.m.prompt_tokens_total || 0)),
+      preSec: Math.max(0, (m.prompt_seconds_total || 0) - (dtPrev.m.prompt_seconds_total || 0)),
+      genTok: Math.max(0, (m.tokens_predicted_total || 0) - (dtPrev.m.tokens_predicted_total || 0)),
+      genSec: Math.max(0, (m.tokens_predicted_seconds_total || 0) - (dtPrev.m.tokens_predicted_seconds_total || 0)),
+      decodes: Math.max(0, (m.n_decode_total || 0) - (dtPrev.m.n_decode_total || 0)),
+      livePre: live ? live.preRate : null,
+      liveGen: live ? live.genRate : null,
+    });
+    if (engineDeltas.length > ENGINE_MAXCOLS) engineDeltas.shift();
+  }
+  renderEngineLive(payload, live);
+}
+
+function renderEngineIdentity(payload) {
+  const eng = payload.engine || {};
+  const props = payload.props;
+  let title, sub;
+  if (props) {
+    const model = String(props.model_path || '').split('/').pop() || 'unknown model';
+    const bits = [model];
+    if (props.build_info) bits.push(props.build_info);
+    if (props.total_slots != null) bits.push(`${props.total_slots} slots`);
+    title = bits.join(' · ');
+    sub = [eng.llama_url, props.n_ctx ? `n_ctx ${fmtFull(props.n_ctx)}` : null,
+      props.endpoint_metrics === false ? 'metrics disabled on this server' : null]
+      .filter(Boolean).join(' · ');
+  } else {
+    title = eng.label || eng.id || 'Engine';
+    sub = [eng.llama_url, payload.props_error ? `model info unavailable (${payload.props_error})` : null]
+      .filter(Boolean).join(' · ');
+  }
+  $('engine-identity-title').textContent = title;
+  $('engine-identity-sub').textContent = sub;
+}
+
+function renderEngineLive(payload, live) {
+  renderEngineIdentity(payload);
+
+  const m = payload.metrics || {};
+  const { livePre, liveGen } = computeLiveRates();
+  const { preSettled, genSettled } = computeSettledRates();
+  const liveSource = liveGen !== null ? 'slots' : (engineDeltas.length ? 'decode' : 'none');
+
+  const tiles = [];
+  if (liveSource === 'slots' && livePre !== null) {
+    tiles.push(tileEl('Prefill · now', valueWithUnit(livePre < 0.5 ? '0' : fmtNum(livePre, 0), 'tok/s'),
+      `on completion ${preSettled != null ? fmtNum(preSettled, 0) + ' tok/s' : '—'}`));
+  } else if (liveSource === 'slots') {
+    tiles.push(tileEl('Prefill · now', valueWithUnit(preSettled == null ? '—' : fmtNum(preSettled, 0), 'tok/s'),
+      "this build's /slots omits prompt counters — differenced from /metrics instead"));
+  } else {
+    tiles.push(tileEl('Prefill · now', valueWithUnit('—', 'tok/s'), 'no slot data'));
+  }
+
+  if (liveSource === 'slots') {
+    tiles.push(tileEl('Generation · now', valueWithUnit(liveGen < 0.05 ? '0' : fmtNum(liveGen, 1), 'tok/s'),
+      `on completion ${genSettled != null ? fmtNum(genSettled, 1) + ' tok/s' : '—'}`,
+      liveGen >= 0.05 ? 'state-generating' : ''));
+  } else if (liveSource === 'decode') {
+    const r = engineDeltas.slice(-3);
+    let dTot = 0, dWall = 0;
+    for (const d of r) { dTot += d.decodes || 0; dWall += d.dt; }
+    const decRate = dWall > 0 ? dTot / dWall : null;
+    tiles.push(tileEl('Generation · now', valueWithUnit(decRate == null ? '—' : fmtNum(decRate, 1), 'dec/s'),
+      'no slot data — llama_decode() calls per second instead'));
+  } else {
+    tiles.push(tileEl('Generation · now', valueWithUnit('—', 'tok/s'), '—'));
+  }
+
+  const cr = engineCacheReuse();
+  tiles.push(tileEl('Prompt cache reuse', valueWithUnit(cr ? fmtNum(cr.pct, 1) : '—', '%'),
+    cr
+      ? `${fmtCompact(cr.cached)} reused of ${fmtCompact(cr.total)} prompt tokens across ${engineTaskOrder.length} requests`
+      : (!engineHasPromptFields
+          ? "Unavailable: this build's /slots does not report n_prompt_tokens_cache."
+          : 'Share of prompt tokens served from cache instead of reprocessed.')));
+
+  let stateTxt = 'idle', stateSub = 'No slot is processing.', stateClass = 'state-idle';
+  if (live) {
+    if (live.generating) {
+      stateTxt = 'generating'; stateClass = 'state-generating';
+      stateSub = `${live.generating} slot${live.generating === 1 ? '' : 's'} decoding`;
+    } else if (live.prefilling) {
+      stateTxt = 'prefilling'; stateClass = 'state-prefilling';
+      stateSub = `${live.prefilling} slot${live.prefilling === 1 ? '' : 's'} processing prompt`;
+    } else {
+      stateSub = `${live.idle} slot${live.idle === 1 ? '' : 's'} idle`;
+    }
+  } else if (Number(m.requests_processing) > 0) {
+    stateTxt = 'busy'; stateSub = 'slots endpoint unavailable — falling back to the gauge';
+  }
+  const deferred = Number(m.requests_deferred || 0);
+  if (deferred > 0) { stateSub += ` · ${deferred} deferred`; stateClass = 'state-queued'; }
+  tiles.push(tileEl('Server state', document.createTextNode(stateTxt), stateSub, stateClass));
+
+  $('engine-tiles').replaceChildren(...tiles);
+  renderEngineSlots(payload.slots, payload.slots_error);
+  drawEngineStrip();
+
+  $('engine-strip-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-2)' }), el('span', { text: 'Generation' })));
+  $('engine-strip-note').textContent = engineDeltas.length
+    ? `${engineDeltas.length} interval${engineDeltas.length === 1 ? '' : 's'} · ${fmtNum(engineDeltas[engineDeltas.length - 1].dt, 1)}s per column`
+    : 'waiting for a second reading — rates need two points';
+}
+
+function renderEngineSlots(slots, slotsError) {
+  const holder = $('engine-slots');
+  if (!Array.isArray(slots) || !slots.length) {
+    holder.replaceChildren(el('div', { class: 'empty',
+      text: 'No slot data' + (slotsError ? ` — ${slotsError}` : '') + '. Live token rates need this endpoint.' }));
     return;
   }
-  const label = live && live.engine ? live.engine.label : (engineList.find((e) => e.id === currentEngineId) || {}).label;
-  holder.replaceChildren(el('div', { class: 'card' },
-    el('div', { class: 'empty', text: live ? `Connected to ${label}. Live and history panels land in the next phase.` : `Loading ${label || 'engine'}…` })));
+  const showPrompt = engineHasPromptFields;
+  const head = el('tr', {},
+    el('th', { text: 'Slot' }), el('th', { text: 'State' }), el('th', { class: 'num', text: 'Task' }),
+    ...(showPrompt ? [el('th', { text: 'Prompt' }), el('th', { class: 'num', text: 'Cached' })] : []),
+    el('th', { class: 'num', text: 'Decoded' }), el('th', { class: 'num', text: 'Context' }));
+  const rows = slots.map((s) => {
+    const busy = !!s.is_processing;
+    const nt = s.next_token || {};
+    const dec = nt.n_decoded || 0;
+    const total = s.n_prompt_tokens || 0;
+    const cache = s.n_prompt_tokens_cache || 0;
+    const proc = s.n_prompt_tokens_processed || 0;
+    const done = Math.min(total, cache + proc);
+    const pct = total > 0 ? 100 * done / total : 0;
+    const state = !busy ? 'idle' : (dec > 0 ? 'generating' : 'prefilling');
+    const tagClass = !busy ? '' : (dec > 0 ? 'gen' : 'pre');
+    const barColor = dec > 0 ? 'var(--series-2)' : 'var(--series-1)';
+    return el('tr', { class: busy ? '' : 'slot-idle' },
+      el('td', { text: String(s.id) }),
+      el('td', {}, el('span', { class: 'slot-tag' + (tagClass ? ' ' + tagClass : ''), text: state })),
+      el('td', { class: 'num', text: (s.id_task == null || s.id_task === -1) ? '—' : String(s.id_task) }),
+      ...(showPrompt ? [
+        el('td', {}, total > 0
+          ? el('div', { class: 'slot-bar-track' },
+              el('div', { class: 'slot-bar-rail' },
+                el('div', { class: 'slot-bar-fill', style: `width:${pct.toFixed(1)}%;background:${barColor}` })),
+              el('span', { class: 'slot-bar-label', text: `${fmtCompact(done)} / ${fmtCompact(total)}` }))
+          : el('span', { class: 'cell-sub', text: '—' })),
+        el('td', { class: 'num', text: total > 0 ? `${fmtNum(100 * cache / total, 0)}%` : '—' }),
+      ] : []),
+      el('td', { class: 'num', text: (busy || dec) ? fmtFull(dec) : '—' }),
+      el('td', { class: 'num cell-sub', text: fmtCompact(s.n_ctx) }));
+  });
+  holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
+}
+
+// ── Engine live strip (canvas — 400+ columns, SVG would be too heavy) ──
+function cssVar(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function sizeEngineCanvas(c, ctx) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = c.getBoundingClientRect();
+  c.width = Math.max(1, Math.round(r.width * dpr));
+  c.height = Math.max(1, Math.round(r.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: r.width, h: r.height };
+}
+function drawEngineStrip() {
+  const c = $('engine-strip');
+  if (!c.isConnected || c.clientWidth === 0) return;
+  const ctx = c.getContext('2d');
+  const pre = [], gen = [];
+  for (const d of engineDeltas) {
+    pre.push(d.livePre !== null && d.livePre !== undefined ? d.livePre : (d.preSec > 0 ? d.preTok / d.preSec : 0));
+    gen.push(d.liveGen !== null && d.liveGen !== undefined ? d.liveGen : (d.genSec > 0 ? d.genTok / d.genSec : 0));
+  }
+  const { w: W, h: H } = sizeEngineCanvas(c, ctx);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 46, padR = 12, padT = 14, padB = 14;
+  const plotW = W - padL - padR, mid = padT + (H - padT - padB) / 2, half = (H - padT - padB) / 2 - 6;
+  const rule = cssVar('--gridline'), faint = cssVar('--text-muted');
+
+  ctx.strokeStyle = rule; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, Math.round(mid) + 0.5); ctx.lineTo(W - padR, Math.round(mid) + 0.5); ctx.stroke();
+
+  if (!pre.length) {
+    ctx.fillStyle = faint; ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('waiting for a second reading — rates need two points', W / 2, mid - 12);
+    return;
+  }
+
+  const maxPre = Math.max(1, ...pre), maxGen = Math.max(1, ...gen);
+  const n = pre.length, slot = plotW / Math.max(n, 24), bw = Math.max(1.5, slot - 1.6);
+
+  ctx.setLineDash([2, 4]); ctx.strokeStyle = rule; ctx.beginPath();
+  ctx.moveTo(padL, Math.round(mid - half) + 0.5); ctx.lineTo(W - padR, Math.round(mid - half) + 0.5);
+  ctx.moveTo(padL, Math.round(mid + half) + 0.5); ctx.lineTo(W - padR, Math.round(mid + half) + 0.5);
+  ctx.stroke(); ctx.setLineDash([]);
+
+  ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(fmtCompact(maxPre), padL - 8, mid - half + 4);
+  ctx.fillText(fmtCompact(maxGen), padL - 8, mid + half + 4);
+  ctx.fillText('0', padL - 8, mid + 3.5);
+
+  const cPre = cssVar('--series-1'), cGen = cssVar('--series-2');
+  for (let j = 0; j < n; j++) {
+    const x = padL + plotW - (n - j) * slot + (slot - bw) / 2;
+    const hp = (pre[j] / maxPre) * half;
+    if (hp > 0.4) { ctx.fillStyle = cPre; ctx.fillRect(x, mid - hp, bw, hp); }
+    const hg = (gen[j] / maxGen) * half;
+    if (hg > 0.4) { ctx.fillStyle = cGen; ctx.fillRect(x, mid + 1, bw, hg); }
+  }
+}
+window.addEventListener('resize', () => {
+  if (activeTab === 'engine' && !$('engine-content').hidden) drawEngineStrip();
+});
+
+// ── Engine tab: fetch orchestration, picker, empty states ──────────
+function showEngineEmpty(content) {
+  $('engine-content').hidden = true;
+  $('engine-empty').hidden = false;
+  const holder = $('engine-empty-text');
+  if (typeof content === 'string') holder.textContent = content;
+  else holder.replaceChildren(...(Array.isArray(content) ? content : [content]));
+}
+
+function renderEnginePicker() {
+  const row = $('engine-picker-row');
+  if (engineList.length < 2) { row.hidden = true; $('engine-picker').replaceChildren(); return; }
+  row.hidden = false;
+  $('engine-picker').replaceChildren(...engineList.map((e) =>
+    el('button', { class: 'seg-btn', type: 'button', 'data-id': e.id,
+      'aria-pressed': String(e.id === currentEngineId), text: e.label || e.id })));
+}
+$('engine-picker').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.seg-btn');
+  if (!btn || btn.dataset.id === currentEngineId) return;
+  selectEngine(btn.dataset.id);
+});
+function selectEngine(id) {
+  currentEngineId = id;
+  resetEngineSeries();
+  renderEnginePicker();
+  if (activeTab === 'engine') pollEngineLive();
 }
 
 async function loadEngineList() {
@@ -1312,17 +1703,38 @@ async function loadEngineList() {
     engineList = [];
   }
   if (!currentEngineId && engineList.length) currentEngineId = engineList[0].id;
-  renderEnginePanel(null);
+  renderEnginePicker();
+  if (!engineList.length) {
+    showEngineEmpty([
+      el('span', { text: 'No llama.cpp engine configured. Add one in ' }),
+      el('a', { href: '/setup.html', text: 'Setup' }),
+      el('span', { text: '.' }),
+    ]);
+  }
   if (activeTab === 'engine' && !enginePollTimer && engineList.length) startEnginePoll();
+}
+
+function engineAllFailed(payload) {
+  return !payload.metrics && !payload.slots && !payload.props;
 }
 
 async function pollEngineLive() {
   if (!currentEngineId) return;
   try {
     const res = await fetch(`/api/engine/live?engine=${encodeURIComponent(currentEngineId)}`);
-    renderEnginePanel(await res.json());
+    const payload = await res.json();
+    if (payload.error) { showEngineEmpty(payload.error); return; }
+    if (engineAllFailed(payload)) {
+      resetEngineSeries();
+      showEngineEmpty(`Cannot reach ${payload.engine?.label || currentEngineId} — ` +
+        `${payload.metrics_error || payload.slots_error || payload.props_error || 'unreachable'}.`);
+      return;
+    }
+    $('engine-empty').hidden = true;
+    $('engine-content').hidden = false;
+    ingestEngineLive(payload);
   } catch {
-    renderEnginePanel(null);
+    showEngineEmpty('Stats server unreachable.');
   }
 }
 
