@@ -95,6 +95,16 @@
   .status-dot.up { background: var(--good); }
   .status-dot.down { background: var(--critical); }
 
+  .tabs { display: flex; gap: 4px; margin: 16px 0 0; border-bottom: 1px solid var(--gridline); }
+  .tab-btn {
+    appearance: none; border: none; background: none; cursor: pointer;
+    font: inherit; font-size: 14px; font-weight: 600; color: var(--text-muted);
+    padding: 8px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab-btn:hover { color: var(--text-primary); }
+  .tab-btn[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+  [role="tabpanel"][hidden] { display: none; }
+
   .filters { display: flex; gap: 8px; align-items: center; margin: 18px 0 16px; }
   .filters .label { color: var(--text-muted); font-size: 13px; margin-right: 4px; }
   .range-btn {
@@ -259,71 +269,82 @@
     <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
   </header>
 
-  <div class="filters" role="group" aria-label="Date range">
-    <span class="label">Range</span>
-    <button class="range-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
-    <button class="range-btn" data-days="30" aria-pressed="true">Last 30 days</button>
-    <button class="range-btn" data-days="90" aria-pressed="false">Last 90 days</button>
+  <div class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button class="tab-btn" id="tab-usage-btn" role="tab" type="button"
+      aria-selected="true" aria-controls="tab-usage">Usage</button>
+    <button class="tab-btn" id="tab-engine-btn" role="tab" type="button"
+      aria-selected="false" aria-controls="tab-engine">Engine</button>
   </div>
 
-  <div id="content">
-    <div class="grid tiles" id="tiles"></div>
-
-    <div class="card activity-card" id="activity-card">
-      <div class="card-head">
-        <h2>Gateway activity</h2>
-        <span class="busy-badge" id="busy-badge"></span>
-      </div>
-      <div class="activity-grid" id="activity-grid"></div>
-      <div class="active-block" id="active-block"></div>
-      <div class="profiles-block" id="profiles-block"></div>
+  <div id="tab-usage" role="tabpanel" aria-labelledby="tab-usage-btn">
+    <div class="filters" role="group" aria-label="Date range">
+      <span class="label">Range</span>
+      <button class="range-btn" data-days="7"  aria-pressed="false">Last 7 days</button>
+      <button class="range-btn" data-days="30" aria-pressed="true">Last 30 days</button>
+      <button class="range-btn" data-days="90" aria-pressed="false">Last 90 days</button>
     </div>
 
-    <div class="card chart-card">
-      <div class="card-head">
-        <h2 id="chart-title">Token counts over time</h2>
-        <div class="head-controls">
-          <div class="seg" id="token-view-seg" role="group" aria-label="Token chart breakdown">
-            <button class="seg-btn" type="button" data-view="type" aria-pressed="true">By type</button>
-            <button class="seg-btn" type="button" data-view="profile" aria-pressed="false">By profile</button>
+    <div id="content">
+      <div class="grid tiles" id="tiles"></div>
+
+      <div class="card activity-card" id="activity-card">
+        <div class="card-head">
+          <h2>Gateway activity</h2>
+          <span class="busy-badge" id="busy-badge"></span>
+        </div>
+        <div class="activity-grid" id="activity-grid"></div>
+        <div class="active-block" id="active-block"></div>
+        <div class="profiles-block" id="profiles-block"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2 id="chart-title">Token counts over time</h2>
+          <div class="head-controls">
+            <div class="seg" id="token-view-seg" role="group" aria-label="Token chart breakdown">
+              <button class="seg-btn" type="button" data-view="type" aria-pressed="true">By type</button>
+              <button class="seg-btn" type="button" data-view="profile" aria-pressed="false">By profile</button>
+            </div>
+            <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
           </div>
-          <button class="toggle-btn" id="chart-toggle" aria-pressed="false">Table view</button>
+        </div>
+        <div class="chart-holder" id="chart-holder">
+          <div id="chart"></div>
+          <div class="tooltip" id="tooltip"></div>
+        </div>
+        <div class="legend" id="chart-legend"></div>
+        <div id="chart-table" hidden></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Usage by model</h2>
+          <button class="toggle-btn" id="model-toggle" aria-pressed="false">Table view</button>
+        </div>
+        <div class="chart-holder" id="model-holder">
+          <div id="model-chart"></div>
+          <div class="tooltip" id="model-tooltip"></div>
+        </div>
+        <div class="legend" id="model-legend"></div>
+        <div id="model-table" hidden></div>
+      </div>
+
+      <div class="grid cols">
+        <div class="card">
+          <h2>Top models</h2>
+          <div id="top-models"></div>
+        </div>
+        <div class="card">
+          <h2>Recent sessions</h2>
+          <div id="sessions"></div>
         </div>
       </div>
-      <div class="chart-holder" id="chart-holder">
-        <div id="chart"></div>
-        <div class="tooltip" id="tooltip"></div>
-      </div>
-      <div class="legend" id="chart-legend"></div>
-      <div id="chart-table" hidden></div>
     </div>
 
-    <div class="card chart-card">
-      <div class="card-head">
-        <h2>Usage by model</h2>
-        <button class="toggle-btn" id="model-toggle" aria-pressed="false">Table view</button>
-      </div>
-      <div class="chart-holder" id="model-holder">
-        <div id="model-chart"></div>
-        <div class="tooltip" id="model-tooltip"></div>
-      </div>
-      <div class="legend" id="model-legend"></div>
-      <div id="model-table" hidden></div>
-    </div>
-
-    <div class="grid cols">
-      <div class="card">
-        <h2>Top models</h2>
-        <div id="top-models"></div>
-      </div>
-      <div class="card">
-        <h2>Recent sessions</h2>
-        <div id="sessions"></div>
-      </div>
-    </div>
+    <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
   </div>
 
-  <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
+  <div id="tab-engine" role="tabpanel" aria-labelledby="tab-engine-btn" hidden></div>
 </div>
 
 <script>
@@ -1223,6 +1244,100 @@ applyTheme();
 
 refresh();
 setInterval(refresh, 30_000);
+
+// ── Tabs ────────────────────────────────────────────────────────────
+// Usage owns `days` and the date-range filter above; Engine has its own
+// time domain and poll cadence (added in later phases) — they are
+// deliberately not shared state.
+const TAB_IDS = ['usage', 'engine'];
+let activeTab = 'usage';
+
+function setActiveTab(tab, opts) {
+  opts = opts || {};
+  if (!TAB_IDS.includes(tab)) tab = 'usage';
+  const changed = tab !== activeTab;
+  activeTab = tab;
+  for (const id of TAB_IDS) {
+    $(`tab-${id}-btn`).setAttribute('aria-selected', String(id === tab));
+    $(`tab-${id}`).hidden = id !== tab;
+  }
+  if (!opts.skipHash) {
+    const hash = tab === 'usage' ? '' : `#${tab}`;
+    if (location.hash !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
+  }
+  if (changed) {
+    if (tab === 'engine') startEnginePoll(); else stopEnginePoll();
+  }
+}
+$('tab-usage-btn').addEventListener('click', () => setActiveTab('usage'));
+$('tab-engine-btn').addEventListener('click', () => setActiveTab('engine'));
+window.addEventListener('hashchange', () =>
+  setActiveTab(location.hash.replace('#', ''), { skipHash: true }));
+// A tab switch stops the engine poll; a backgrounded browser tab should too,
+// so an idle window doesn't poll llama-server forever.
+document.addEventListener('visibilitychange', () => {
+  if (activeTab !== 'engine') return;
+  if (document.hidden) stopEnginePoll(); else startEnginePoll();
+});
+
+// ── Engine tab ──────────────────────────────────────────────────────
+// Phase 2 is the shell and poll lifecycle only; the live/history panels
+// (renderEnginePanel's real body) land in later phases.
+let engineList = [];
+let currentEngineId = null;
+let enginePollTimer = null;
+const ENGINE_POLL_MS = 4000;
+
+function renderEnginePanel(live) {
+  const holder = $('tab-engine');
+  if (!engineList.length) {
+    holder.replaceChildren(el('div', { class: 'card' },
+      el('div', { class: 'empty' },
+        el('span', { text: 'No llama.cpp engine configured. Add one in ' }),
+        el('a', { href: '/setup.html', text: 'Setup' }),
+        el('span', { text: '.' }))));
+    return;
+  }
+  const label = live && live.engine ? live.engine.label : (engineList.find((e) => e.id === currentEngineId) || {}).label;
+  holder.replaceChildren(el('div', { class: 'card' },
+    el('div', { class: 'empty', text: live ? `Connected to ${label}. Live and history panels land in the next phase.` : `Loading ${label || 'engine'}…` })));
+}
+
+async function loadEngineList() {
+  try {
+    const res = await fetch('/api/engines');
+    const j = await res.json();
+    engineList = Array.isArray(j.engines) ? j.engines : [];
+  } catch {
+    engineList = [];
+  }
+  if (!currentEngineId && engineList.length) currentEngineId = engineList[0].id;
+  renderEnginePanel(null);
+  if (activeTab === 'engine' && !enginePollTimer && engineList.length) startEnginePoll();
+}
+
+async function pollEngineLive() {
+  if (!currentEngineId) return;
+  try {
+    const res = await fetch(`/api/engine/live?engine=${encodeURIComponent(currentEngineId)}`);
+    renderEnginePanel(await res.json());
+  } catch {
+    renderEnginePanel(null);
+  }
+}
+
+function startEnginePoll() {
+  stopEnginePoll();
+  if (!engineList.length) { loadEngineList(); return; }
+  pollEngineLive();
+  enginePollTimer = setInterval(pollEngineLive, ENGINE_POLL_MS);
+}
+function stopEnginePoll() {
+  if (enginePollTimer) { clearInterval(enginePollTimer); enginePollTimer = null; }
+}
+
+loadEngineList();
+setActiveTab(location.hash.replace('#', '') || 'usage', { skipHash: true });
 </script>
 </body>
 </html>
