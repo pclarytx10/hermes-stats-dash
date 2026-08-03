@@ -2568,11 +2568,10 @@ function stopEnginePoll() {
 }
 
 // ── Engine health badge ──────────────────────────────────────────────
-// Answers one question from the Usage tab, where someone is when a session
-// feels slow: is the engine underneath currently a bottleneck? A separate
-// route and timer from the Engine tab's own poll — /api/engine/health hits
-// only /metrics, so it stays the cheapest call in the system and the Usage
-// tab never blocks on it.
+// Answers one question from wherever someone is when a session feels slow:
+// is the engine underneath currently a bottleneck? A separate route and timer
+// from the Engine tab's own poll — /api/engine/health hits only /metrics, so
+// it stays the cheapest call in the system and no other tab blocks on it.
 let badgeEngine = null;        // {id, label} | null — hidden entirely when null
 let badgePollTimer = null;
 let badgeLastGood = null;      // last successful /api/engine/health payload

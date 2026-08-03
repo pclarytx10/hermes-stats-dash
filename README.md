@@ -13,29 +13,66 @@ What the desktop client doesn't cover is a lightweight, always-on view of
 **hermes' usage** — token counts over time, sessions, top models — or of
 **the llama.cpp engine underneath it** — live throughput, slot occupancy,
 whether requests are queueing. That gap is what this project fills: a small,
-standalone two-tab dashboard.
+standalone three-tab dashboard.
 
-- **Usage** — demand-side accounting from hermes' own rollups: what hermes
+- **Usage** — the two sides reconciled into one picture: total work done,
+  how much of it was hermes', and how much came from other clients on the
+  same endpoint.
+- **Hermes** — demand-side accounting from hermes' own rollups: what hermes
   sent, extracted from hermes-workspace's dashboard capability and trimmed
   to the stats surface.
 - **Engine** — supply-side telemetry read straight from a llama.cpp server's
   `/metrics`, `/slots`, and `/props`, plus recorded history from a small
   companion collector.
 
-**These are different populations, not two views of the same number.**
-llama.cpp sees every client on the endpoint, hermes included; hermes sees
-models Usage cannot, including ones not served by this llama.cpp instance at
-all. The dashboard says so explicitly (a one-line note above the tabs, and
-in the Engine header badge's wording) rather than implying one is a subset
-of the other — see [§1 of the design
-doc](docs/engine-telemetry-plan.md#1-project-statement) for the full
-reasoning.
+**Hermes and Engine are different populations, not two views of the same
+number.** llama.cpp sees every client on the endpoint, hermes included;
+hermes sees models the engine cannot, including ones not served by this
+llama.cpp instance at all. Neither total contains the other — see [§1 of the
+engine design doc](docs/engine-telemetry-plan.md#1-project-statement).
+
+The Usage tab is where the overlap between them is computed rather than left
+to the reader: hermes' engine-hosted tokens are subtracted from the engine's
+total, so **Hermes + Engine · other clients = Total** with nothing
+double-counted. How that is derived, and where it is approximate, is in
+[docs/unified-usage-plan.md](docs/unified-usage-plan.md).
 
 Zero runtime dependencies. Node ≥ 18.
 
 ## What this shows
 
-### Usage tab
+### Usage tab (reconciled)
+
+- **Reconciled totals** — one total for the window, split into hermes'
+  own tokens and the residual from other clients on the endpoint, with a
+  `Total / Split` hero toggle
+- **Reconciled tokens over time** — three smooth daily series (hermes on
+  engine, hermes elsewhere, engine · other clients) with a
+  **Combined / Prefill / Generation** lane toggle, a table-view twin and CSV
+  export. Days the collector never recorded are shaded, never drawn as zero
+- **Scope toggle** — `Full window` or `Engine coverage`. A collector younger
+  than the selected range would otherwise produce a total mixing 30 days of
+  hermes with 4 days of engine data; clipping to recorded days makes it one
+  window again
+- **Hermes share of engine** — how much of what the endpoint served was
+  hermes', computed over recorded days only
+- **Run locally** — the share of hermes' work that ran on an engine rather
+  than a hosted provider
+- **Cost avoided** — what the engine-hosted tokens would have cost at a
+  comparator's list price (default Gemini 3.5 Flash, $1.50/$9.00 per 1M).
+  API list price only: it excludes power, hardware and operator time, and
+  is not a claim that the two models are equivalent
+- **Engines** — per-engine totals, hermes' share of each, and the
+  other-client residual where the windows are comparable
+- **Window detail** — busiest day, daily average, hermes cache reads, cloud
+  spend, collector coverage, and how many days' splits were measured rather
+  than estimated
+- **Warnings** — a named line for every condition that makes the numbers
+  approximate: partial collector coverage, a hermes profile that did not
+  answer, a clamped residual (and whether coverage explains it), an engine
+  with no models mapped, models that look local but are unmapped
+
+### Hermes tab
 
 - **Token counts over time** — stacked daily token columns, switchable
   between **By type** (input / output / reasoning, cache reads in the tooltip)
@@ -74,7 +111,7 @@ Zero runtime dependencies. Node ≥ 18.
 
 ### Engine health badge
 
-A small badge in the shared header, visible from the Usage tab, answering
+A small badge in the shared header, visible from every tab, answering
 one question: *is the engine underneath currently a bottleneck?* It's keyed
 on `requests_deferred`, not slot occupancy — a fully-busy engine is normal
 (**Full**, amber); a *queueing* engine (**Queued**, red, shows the count) is
@@ -99,10 +136,11 @@ pages and both tabs.
 JSON API routes, all fanning out in parallel to upstreams and nulling a
 section on failure rather than failing the whole request.
 
-### Usage routes
+### Usage and Hermes routes
 
 | Route | Fans out to |
 |---|---|
+| `GET /api/usage/unified?days=N` | The Usage tab's single source. Splits hermes' usage by the engine model map, folds each collector's history into UTC days, reconciles the two, and returns the daily series, totals per lane, per-engine breakdown and warnings |
 | `GET /api/overview?days=N` | `/api/analytics/usage` (once per profile, merged), `/api/profiles/sessions`, `/api/status`, `/api/cron/jobs`, `/api/model/info` — see [Cross-profile aggregation](#cross-profile-aggregation) below |
 | `GET /api/settings` / `POST /api/settings` | reads/writes `~/.hermes-stats-dash/config.json` |
 | `POST /api/test` | probes a hermes dashboard URL + credentials, used by the Setup page |
@@ -116,13 +154,19 @@ section on failure rather than failing the whole request.
 | `GET /api/engine/range?engine=<id>` | Proxy to the collector's `/range`, for the "all" range button |
 | `GET /api/engine/health?engine=<id>` | The badge's data source. `/metrics` only, 3s timeout, `total_slots` cached from `/props` for 5 minutes |
 | `GET /api/engines` | `[{id, label}, ...]` for the tab's engine picker |
+| `POST /api/engine/model-suggest` | Ranks the hermes models actually in use against the file the engine reports at `/props`, for the Setup page's model map. Suggests only — nothing is attributed without a saved mapping |
 | `POST /api/engine/test` | Ad-hoc reachability probe for the Setup page's per-engine row (llama-server + collector, independent of saved config) |
 
 Every upstream call uses a short timeout (`UPSTREAM_TIMEOUT_MS`, 10s for
-Usage and the live/history/range engine routes; 3s for the health badge) so
-a stalled upstream degrades a section to null rather than hanging the
-request — `/metrics` and `/slots` are answered off llama-server's own task
-queue and can block for seconds under heavy decode.
+most routes; 3s for the health badge) so a stalled upstream degrades a
+section to null rather than hanging the request — `/metrics` and `/slots`
+are answered off llama-server's own task queue and can block for seconds
+under heavy decode. `/api/analytics/usage` is the exception, at 45s
+(`ANALYTICS_TIMEOUT_MS`): it is a SQL aggregation over a whole profile's
+session DB and a 90-day call on a large profile routinely passes 10s. A
+dropped profile there is not cosmetic — it understates hermes and inflates
+the reconciled other-clients residual — so it gets a real budget, and any
+profile that still fails is reported rather than merged around.
 
 `public/index.html` is the whole frontend for both tabs (vanilla JS + SVG
 for the Usage charts, canvas for the Engine strip charts — 400+ columns is
@@ -144,6 +188,56 @@ its owning profile). The one dimension hermes has no endpoint for —
 per-day-**per-model** volume — is still derived from that session list, so it
 is an approximation over the sampled window while the token totals and
 per-model totals come from the authoritative rollups.
+
+### Reconciling hermes against the engine
+
+The Usage tab's arithmetic, per UTC day and per lane:
+
+```
+Engine · other clients = max(0, engine_tokens − hermes_engine_tokens)
+Total = hermes_other + hermes_engine + Engine · other clients
+```
+
+hermes reporting 1M tokens against an engine-hosted model while the engine
+reports 2M is shown as **Hermes 1M · Engine 1M · Total 2M**. The engine's 2M
+appears nowhere, because half of it *is* the hermes 1M. The residual is real
+traffic from other clients — `llama-server` binds without auth, so anything
+on the LAN or tailnet can use it — and is labelled as such, never as
+"unaccounted".
+
+Producing that takes three joins, each with a limit worth knowing:
+
+- **Which hermes models are engine-hosted** comes from the model map above.
+  Nothing is inferred at request time.
+- **hermes' daily split** has no direct source: hermes' `daily` rollup has no
+  model dimension and its `by_model` rollup has no day dimension. So
+  `by_model` fixes the ratio between the two sides, the daily rollup is
+  apportioned by the per-day model mix derived from the session list, and the
+  result is scaled to the window total — the chart and the tiles cannot
+  disagree. Days with no session rows fall back to the window ratio and are
+  reported as estimated. Magnitudes are anchored to hermes' `totals` block,
+  which is what the Hermes tab shows, so the two tabs agree.
+- **The engine's daily totals** are differenced out of the collector's
+  monotonic counters at hourly buckets folded into UTC days. A restart is
+  counted (the pre-restart tail is recovered from the bucket and the counter
+  re-anchored at zero) and flagged, unlike the Engine tab's history panel,
+  which drops restart pairs because it renders rates rather than volumes.
+  Closed days are immutable and cached per engine; only today refetches.
+
+**Both lanes are exact, which the plan did not expect.** hermes'
+`input_tokens` is already net of cache reads (`cache_read_tokens` is a
+separate and much larger field — 1.1B against 95M here), and llama.cpp's
+`prompt_tokens_total` is already net of KV prefix reuse, so the two are on
+the same denominator with no correction. On a fully-covered day with little
+other traffic they track to within a few percent. Generation matches
+outright. See [§3 of the plan](docs/unified-usage-plan.md) for the
+measurement.
+
+**Where it is approximate**, and always said out loud on the tab: a
+collector younger than the window (use the Scope toggle), a hermes profile
+that failed to answer, days split by the window mix rather than their own
+sessions, and any day where hermes exceeds the engine — flagged with whether
+coverage explains it or the model map is suspect.
 
 ### Gateway activity & profiles
 
@@ -186,7 +280,7 @@ npm start          # serves http://127.0.0.1:8788
 ```
 
 With a hermes-agent dashboard running locally on the default port, that's
-it for the Usage tab. For a remote or auth-gated hermes, or to configure an
+it for the Hermes tab. For a remote or auth-gated hermes, or to configure an
 Engine tab, open `/setup.html`.
 
 No hermes handy? `node scripts/mock-hermes.mjs` fakes one on :9119
@@ -199,7 +293,7 @@ Everything is configurable from the **Setup page** (`/setup.html`), saved to
 `~/.hermes-stats-dash/config.json` (owner-only `0600` — it can hold hermes
 credentials; engine entries hold none).
 
-### Hermes connection (Usage tab)
+### Hermes connection
 
 Remote URL, credentials, a **Test connection** button that reports
 reachability / auth mode / whether a credential was cached, and a way to
@@ -214,7 +308,7 @@ forget cached tokens. Saved settings take precedence over the environment:
 | `HERMES_DASHBOARD_COOKIE` | – | Session cookie (v0.17+ interactive auth) |
 | `HERMES_DASHBOARD_USERNAME` / `_PASSWORD` | – | Password-provider login (v0.17+) |
 
-### Engines (Engine tab)
+### Engines (Engine and Usage tabs)
 
 A **list** — the real deployment this was built for has two llama.cpp
 servers with different models, builds, and context sizes. Each entry:
@@ -224,10 +318,12 @@ servers with different models, builds, and context sizes. Each entry:
   "engines": [
     { "id": "nfcmini",   "label": "nfcmini · Qwen3.6-35B",
       "llamaUrl": "http://127.0.0.1:8080",
-      "collectorUrl": "http://127.0.0.1:8081" },
+      "collectorUrl": "http://127.0.0.1:8081",
+      "models": ["Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"] },
     { "id": "mini795s7", "label": "mini795s7 · Gemma-4-E4B",
       "llamaUrl": "http://10.0.0.65:8080",
-      "collectorUrl": "http://10.0.0.65:8081" }
+      "collectorUrl": "http://10.0.0.65:8081",
+      "models": ["gemma-4-E4B-it-Q4_K_M.gguf"] }
   ]
 }
 ```
@@ -238,6 +334,15 @@ install prompt instead of a chart. The Setup page's **Engines** card lets
 you add/remove/edit rows and **Test connection** each one (reachability,
 whether `/metrics` is enabled, whether the collector answers) before saving.
 
+`models` is the **model map**: the hermes model names this engine serves. It
+is what the Usage tab subtracts, so hermes' own traffic is not counted twice
+against the engine's total. hermes names a model whatever its provider
+config says and llama-server reports a filesystem path, so the join cannot
+be inferred safely — **Suggest models** ranks the models hermes has actually
+used against the engine's `/props` file and you click the ones that are
+right. An engine with no models mapped has *all* of its traffic attributed
+to other clients, and the Usage tab warns about it.
+
 For a single-engine deployment with no saved config, these two env vars are
 an equivalent fallback:
 
@@ -245,6 +350,28 @@ an equivalent fallback:
 |---|---|
 | `LLAMA_SERVER_URL` | e.g. `http://127.0.0.1:8080` |
 | `LLAMA_COLLECTOR_URL` | e.g. `http://127.0.0.1:8081` (optional) |
+
+### Cost-avoidance comparator (Usage tab)
+
+The Usage tab prices hermes' engine-hosted tokens against a hosted model to
+answer "what did running this locally save in API fees". The default is
+Gemini 3.5 Flash at its published list price ($1.50 in / $9.00 out per 1M
+tokens, verified August 2026); override it in the config file:
+
+```json
+{
+  "comparator": {
+    "model": "Gemini 3.5 Flash",
+    "input_per_m": 1.5,
+    "output_per_m": 9.0,
+    "cached_input_per_m": 0.15
+  }
+}
+```
+
+It is a list-price comparison and the tile says so: it excludes electricity,
+hardware and operator time, and asserts no quality equivalence between the
+local model and the comparator.
 
 **Address choice for a remote engine:** prefer a LAN IP over mDNS
 (`*.local`) — mDNS resolution costs ~100ms per call, negligible for a human
