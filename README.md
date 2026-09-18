@@ -501,6 +501,47 @@ Drop `--remote` from `ExecStart` (or change it to `--host <addr>`) to bind
 somewhere other than every interface — see [Local vs. remote
 access](#local-vs-remote-access) below.
 
+## Updating a deployment
+
+**The dashboard** runs from a git checkout (`~/hermes-stats-dash`, as in the
+unit above), so an update is a pull and a restart. Saved settings live in
+`~/.hermes-stats-dash/config.json`, outside the checkout, and survive it:
+
+```sh
+cd ~/hermes-stats-dash
+git pull --ff-only origin main
+node --check server.mjs                        # refuse to restart onto a syntax error
+systemctl --user restart hermes-stats-dash.service
+journalctl --user -u hermes-stats-dash.service -n 5 --no-pager
+```
+
+The log should show the listening address, the upstream dashboard URL and
+the auth mode. `curl -s http://127.0.0.1:8788/api/usage/unified?days=7`
+confirms hermes and the engines both answer; its `warnings` array is the
+same list the Usage tab shows.
+
+**A collector** is a single copied file, not a checkout. Push the reference
+copy from this repo to each engine host and restart its unit:
+
+```sh
+scp docs/collect.py <engine-host>:llamacpp-telemetry/collect.py
+ssh <engine-host> 'systemctl --user restart llamacpp-telemetry.service'
+curl http://<engine-host>:<collector-port>/range
+```
+
+The database (`telemetry.db`) sits beside the script and is kept across a
+restart, so history continues. The collector's arguments are per-host (see
+above); check them with `systemctl --user cat llamacpp-telemetry.service`
+rather than assuming the defaults. If the host was rebuilt and the unit is
+gone, it's a fresh install: follow the collector steps above, including
+`loginctl enable-linger`.
+
+**After an engine host changes** — a new model, port, or LAN address — update
+its entry under Setup → Engines (or `POST /api/settings`), run **Test
+connection**, and re-check the model map with **Suggest models**. Keep names
+hermes used under the old model in the map: the Usage tab's 30- and 90-day
+windows still contain that traffic.
+
 ## Local vs. remote access
 
 By default the server binds **`127.0.0.1`** — reachable only from the same
