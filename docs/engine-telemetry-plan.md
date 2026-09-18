@@ -610,7 +610,24 @@ Gathered 2026-07-31 against the live deployment.
   `--server http://127.0.0.1:8081 --port 8082`
 - Python 3.12.3 (`/usr/bin/python3`); `Linger=yes` re-enabled
 - Addresses: LAN `10.0.0.66`, Tailscale `100.98.104.78`
-- Dashboard config updated to `mini795s7 · Qwen3.8-27B`,
-  `llamaUrl` `http://10.0.0.66:8081`, `collectorUrl` `http://10.0.0.66:8082`.
-  Model map left empty: the suggester's candidates (score ≤ 0.35) were Q6
-  builds, not this Q4_K_M file
+- Dashboard config updated to `llamaUrl` `http://10.0.0.66:8081`,
+  `collectorUrl` `http://10.0.0.66:8082`
+
+Later the same day:
+
+- `--metrics` added, so the Engine tab's live panel and health badge work
+- The unit's `--metrics` line was missing its trailing `\`, so systemd had
+  been silently dropping `--alias`; fixed
+- Switched to **`Qwen3.8-27B-UD-Q6_K.gguf`** (`unsloth/Qwen3.8-27B-GGUF`, SHA-256
+  `c9c20681…63cd436`), byte-identical to nfcmini's copy, at
+  `/opt/models/gguf/qwen3.8-27b/`, `--parallel 2` (131072 ctx per slot), MTP
+  drafting kept. The Q4_K_M file is still on disk as a fallback
+- nfcmini itself had moved to the same model (`Qwen3.8-27B-UD-Q6_K.gguf`,
+  `--alias Qwen3.8_27B_Q6`); its dashboard entry was relabelled and remapped
+- **Both engines serve under the same alias, `Qwen3.8_27B_Q6`, by choice.**
+  `engineModelIndex()` gives a model mapped to two engines to the first one in
+  config order (nfcmini), so the Usage tab never double-subtracts. The cost is
+  that the per-engine split on the Usage tab is rolled up: hermes traffic
+  served by mini795s7 is subtracted from nfcmini, and appears on mini795s7 as
+  other clients. The Engine tab is unaffected, because each engine reads its
+  own collector. A distinct alias on one host would restore the split

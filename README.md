@@ -316,14 +316,15 @@ servers with different models, builds, and context sizes. Each entry:
 ```json
 {
   "engines": [
-    { "id": "nfcmini",   "label": "nfcmini · Qwen3.6-35B",
+    { "id": "nfcmini",   "label": "nfcmini · Qwen3.8-27B Q6",
       "llamaUrl": "http://127.0.0.1:8080",
       "collectorUrl": "http://127.0.0.1:8081",
-      "models": ["Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"] },
-    { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B",
+      "models": ["/home/patrickm/models/Qwen3.8-27B-UD-Q6_K.gguf",
+                 "Qwen3.8_27B_Q6"] },
+    { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B Q6",
       "llamaUrl": "http://10.0.0.66:8081",
       "collectorUrl": "http://10.0.0.66:8082",
-      "models": [] }
+      "models": ["Qwen3.8_27B_Q6"] }
   ]
 }
 ```
@@ -341,7 +342,10 @@ config says and llama-server reports a filesystem path, so the join cannot
 be inferred safely — **Suggest models** ranks the models hermes has actually
 used against the engine's `/props` file and you click the ones that are
 right. An engine with no models mapped has *all* of its traffic attributed
-to other clients, and the Usage tab warns about it.
+to other clients, and the Usage tab warns about it. A model name mapped to more than one
+engine is attributed to the first in config order, so it is never subtracted
+twice — but the Usage tab can then no longer split that model's hermes traffic
+between those engines. Give each host a distinct `--alias` if the split matters.
 
 For a single-engine deployment with no saved config, these two env vars are
 an equivalent fallback:
