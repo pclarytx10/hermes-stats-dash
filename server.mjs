@@ -1093,12 +1093,22 @@ function buildHermesSide(days, usage, sessions) {
   // by ~1% on this deployment — and `totals` is what the Hermes tab's hero
   // tile shows, so anchoring to it keeps the two tabs from contradicting each
   // other over the same window. Falls back to by_model if totals is absent.
+  //
+  // hermes' window is a rolling days × 24h, so its daily rollup — and totals,
+  // which is that rollup's sum — carry a partial leading day before
+  // dayList[0]. That day is taken out of the anchor: left in, step 4 smears it
+  // across every in-window day, and each one reads ~1–3% above what the
+  // engine recorded.
   const shareOf = (a, b) => (a + b > 0 ? a / (a + b) : 0)
   const shareIn = shareOf(engTot.input, othTot.input)
   const shareOut = shareOf(engTot.output, othTot.output)
+  const inWindow = new Set(dayList)
+  const outside = (usage?.daily || []).filter((r) => !inWindow.has(r.day))
+  const outsideIn = outside.reduce((a, r) => a + Number(r.input_tokens || 0), 0)
+  const outsideOut = outside.reduce((a, r) => a + Number(r.output_tokens || 0), 0)
   const T = usage?.totals || {}
-  const totalIn = Number(T.total_input || 0) || engTot.input + othTot.input
-  const totalOut = Number(T.total_output || 0) || engTot.output + othTot.output
+  const totalIn = Math.max(0, (Number(T.total_input || 0) || engTot.input + othTot.input) - outsideIn)
+  const totalOut = Math.max(0, (Number(T.total_output || 0) || engTot.output + othTot.output) - outsideOut)
   const authEngineIn = totalIn * shareIn
   const authOtherIn = totalIn * (1 - shareIn)
   const authEngineOut = totalOut * shareOut
@@ -1520,7 +1530,11 @@ function reconcile(hermes, engineSide, dayList) {
       const hermesOther = laneValue(h.other, lane)
       const engineTotal = covered ? laneValue(e, lane) : 0
       const residual = engineTotal - hermesEngine
-      if (covered && lane === 'combined' && residual < 0) {
+      // A request in flight at midnight lands on different days in hermes
+      // (request time) and the collector (5s samples): a few tokens either
+      // way. Still clamped, but not worth a warning.
+      const noise = Math.max(100, engineTotal * 0.001)
+      if (covered && lane === 'combined' && residual < -noise) {
         clampedDays++
         clampedTokens += -residual
         if (partial) clampedPartialDays++

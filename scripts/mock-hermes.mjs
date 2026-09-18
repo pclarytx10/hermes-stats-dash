@@ -47,15 +47,20 @@ function rand(seed) {
 // N copies of the same data. Profiles not listed contribute nothing.
 const PROFILE_WEIGHT = { default: 1, work: 0.6, research: 0.45, sandbox: 0.15 }
 
+// Like the real endpoint, the window is a rolling days × 24h, so it spans
+// days + 1 calendar days: the leading one holds only the part of that day
+// after the cutoff.
 function dailyRows(days, weight = 1) {
   const rows = []
   const now = new Date()
-  for (let i = days - 1; i >= 0; i--) {
+  const elapsed = (now.getUTCHours() * 60 + now.getUTCMinutes()) / 1440
+  for (let i = days; i >= 0; i--) {
     const d = new Date(now)
     d.setDate(now.getDate() - i)
     const seed = Math.floor(d.getTime() / 86400000)
     if (rand(seed) < 0.18) continue // some idle days
-    const busy = (0.4 + rand(seed + 1) * (d.getDay() % 6 === 0 ? 0.4 : 1.6)) * weight
+    const part = i === days ? 1 - elapsed : 1
+    const busy = (0.4 + rand(seed + 1) * (d.getDay() % 6 === 0 ? 0.4 : 1.6)) * weight * part
     rows.push({
       day: d.toISOString().slice(0, 10),
       input_tokens: Math.round(220_000 * busy),
