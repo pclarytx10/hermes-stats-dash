@@ -320,10 +320,10 @@ servers with different models, builds, and context sizes. Each entry:
       "llamaUrl": "http://127.0.0.1:8080",
       "collectorUrl": "http://127.0.0.1:8081",
       "models": ["Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"] },
-    { "id": "mini795s7", "label": "mini795s7 · Gemma-4-E4B",
-      "llamaUrl": "http://10.0.0.65:8080",
-      "collectorUrl": "http://10.0.0.65:8081",
-      "models": ["gemma-4-E4B-it-Q4_K_M.gguf"] }
+    { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B",
+      "llamaUrl": "http://10.0.0.66:8081",
+      "collectorUrl": "http://10.0.0.66:8082",
+      "models": [] }
   ]
 }
 ```
@@ -402,6 +402,11 @@ python3 ~/llamacpp-telemetry/collect.py \
   --interval 5 \
   --port 8081
 ```
+
+`--server` and `--port` assume llama-server on `:8080` and the collector on
+`:8081`. They are per-host: on a host where `:8080` is taken (mini795s7 runs
+open-webui there), llama-server moves to `:8081` and the collector to `:8082`,
+as in the example config above.
 
 Stdlib only, no dependencies, works on any Python 3. In production, run it
 as a **systemd user unit** so it survives logout and restarts on crash:

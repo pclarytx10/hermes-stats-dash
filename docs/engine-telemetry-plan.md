@@ -193,7 +193,7 @@ choice covered below):
 | Engine | llama-server | Collector | Dashboard dials |
 |---|---|---|---|
 | nfcmini · Qwen3.6-35B | same host | same host | **loopback** (`127.0.0.1`) |
-| mini795s7 · Gemma-4-E4B | over the LAN | over the LAN | **LAN IP** |
+| mini795s7 · Qwen3.8-27B (Gemma-4-E4B until 2026-09) | over the LAN | over the LAN | **LAN IP** |
 
 For the *dashboard's own traffic*, only nfcmini ever needs to reach mini795s7 —
 the browser talks to `:8788` and nothing else, because the dashboard proxies
@@ -227,6 +227,12 @@ the LAN path succeeds, even though both nodes are on the `theclarys.org` tailnet
 and each lists the other. Both hosts run `ufw`. Until that is diagnosed, the
 cross-host hop is **plaintext over the LAN**, and the plan assumes so.
 
+> **Update 2026-09-18:** mini795s7 was rebuilt and DHCP moved it to
+> `10.0.0.66` (Tailscale `100.98.104.78`) — the "hard-coded LAN IP" risk below
+> materialized. Its llama-server is now on `:8081` and its collector on
+> `:8082`; the figures above are the 2026-07-31 measurements against the old
+> address and ports. See the addendum at the end of this document.
+
 ### Configuration
 
 The single-endpoint shape in the first draft does not survive contact with this
@@ -252,6 +258,9 @@ connection** probe reporting reachability, whether `/metrics` is enabled, and
 whether a collector answers. No entry holds credentials, so none needs
 redaction. `LLAMA_SERVER_URL` / `LLAMA_COLLECTOR_URL` remain as a single-engine
 env fallback for a bare deployment.
+
+(The example above is the 2026-07-31 config; the current mini795s7 entry is in
+the README and the addendum below.)
 
 ### Frontend model
 
@@ -587,3 +596,21 @@ Gathered 2026-07-31 against the live deployment.
   non-functional to nfcmini)
 - nfcmini addresses: LAN `10.0.0.151` / `10.0.0.216`, Tailscale `100.81.234.124`
 - Both hosts run `ufw` (rules not readable without sudo)
+
+**mini795s7 rebuilt** (found 2026-09-18, collector redeployed the same day):
+
+- The host was rebuilt or repurposed. The collector directory, its systemd user
+  unit and all recorded history were gone; `Linger` was back to `no`
+- llama-server build `b10615-f280b2698` from `/opt/llamacpp/build-vulkan`,
+  **1 slot**, `n_ctx` 262144,
+  `/opt/models/gguf/qwen3.8-27b/Qwen3.8-27B-Q4_K_M.gguf`, `0.0.0.0:8081`,
+  again started **without `--metrics`** (collector runs in slots-only mode;
+  the dashboard shows the engine as unreachable with `metrics_disabled`)
+- `:8080` is now open-webui, so the collector runs with
+  `--server http://127.0.0.1:8081 --port 8082`
+- Python 3.12.3 (`/usr/bin/python3`); `Linger=yes` re-enabled
+- Addresses: LAN `10.0.0.66`, Tailscale `100.98.104.78`
+- Dashboard config updated to `mini795s7 · Qwen3.8-27B`,
+  `llamaUrl` `http://10.0.0.66:8081`, `collectorUrl` `http://10.0.0.66:8082`.
+  Model map left empty: the suggester's candidates (score ≤ 0.35) were Q6
+  builds, not this Q4_K_M file
