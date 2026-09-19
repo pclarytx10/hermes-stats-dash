@@ -369,7 +369,15 @@ async function dashJson(apiPath, { retried = false, timeoutMs } = {}) {
 
 // ── Overview aggregation ────────────────────────────────────────────
 
+// An absent query parameter is `null` from searchParams.get, and Number(null)
+// is a finite 0 — so a missing value has to be rejected before the numeric
+// check, or it clamps to `min` instead of falling back to `def`.
+function isAbsent(raw) {
+  return raw === null || raw === undefined || String(raw).trim() === ''
+}
+
 function clampInt(raw, { def, min, max }) {
+  if (isAbsent(raw)) return def
   const n = Number(raw)
   if (!Number.isFinite(n)) return def
   return Math.min(max, Math.max(min, Math.trunc(n)))
@@ -607,6 +615,7 @@ async function buildOverview(days) {
 const HEALTH_TIMEOUT_MS = 3_000
 
 function clampFloat(raw, { def, min, max }) {
+  if (isAbsent(raw)) return def
   const n = Number(raw)
   if (!Number.isFinite(n)) return def
   return Math.min(max, Math.max(min, n))
