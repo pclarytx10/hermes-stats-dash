@@ -613,6 +613,18 @@ Gathered 2026-07-31 against the live deployment.
 - Dashboard config updated to `llamaUrl` `http://10.0.0.66:8081`,
   `collectorUrl` `http://10.0.0.66:8082`
 
+**nfcmini ports shifted** (2026-09-19):
+
+- llama-server moved `:8080` → **`:8081`** and the collector `:8081` →
+  **`:8082`**, so neither host now uses the ports the install docs default to
+- The collector kept polling `127.0.0.1:8080` across the change: it recorded
+  ~16 minutes of failed samples (`down: Connection refused`) while `/range`
+  still served metadata cached from before, so the Engine tab read as an idle
+  engine rather than a broken collector. Fixed by pointing `--server` at
+  `:8081`; `telemetry.db` survived, leaving a gap rather than a reset
+- Dashboard entry updated to `llamaUrl` `http://127.0.0.1:8081`,
+  `collectorUrl` `http://127.0.0.1:8082`
+
 Later the same day:
 
 - `--metrics` added, so the Engine tab's live panel and health badge work

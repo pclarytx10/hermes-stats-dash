@@ -317,8 +317,8 @@ servers with different models, builds, and context sizes. Each entry:
 {
   "engines": [
     { "id": "nfcmini",   "label": "nfcmini · Qwen3.8-27B Q6",
-      "llamaUrl": "http://127.0.0.1:8080",
-      "collectorUrl": "http://127.0.0.1:8081",
+      "llamaUrl": "http://127.0.0.1:8081",
+      "collectorUrl": "http://127.0.0.1:8082",
       "models": ["/home/patrickm/models/Qwen3.8-27B-UD-Q6_K.gguf",
                  "Qwen3.8_27B_Q6"] },
     { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B Q6",
@@ -408,9 +408,15 @@ python3 ~/llamacpp-telemetry/collect.py \
 ```
 
 `--server` and `--port` assume llama-server on `:8080` and the collector on
-`:8081`. They are per-host: on a host where `:8080` is taken (mini795s7 runs
-open-webui there), llama-server moves to `:8081` and the collector to `:8082`,
-as in the example config above.
+`:8081`, which are only defaults — **both hosts in the example config above
+have moved off them**: mini795s7 runs open-webui on `:8080`, so llama-server
+took `:8081` and the collector `:8082`, and nfcmini was later shifted the same
+way. Read a host's actual ports out of its unit
+(`systemctl --user cat llamacpp-telemetry.service`, `ss -ltnp`) rather than
+assuming. When llama-server moves, `--server` has to follow: a collector left
+pointing at the old port records failed samples (`down:` in its journal) and
+its `/range` keeps serving stale metadata, which looks like an idle engine
+rather than a broken collector.
 
 Stdlib only, no dependencies, works on any Python 3. In production, run it
 as a **systemd user unit** so it survives logout and restarts on crash:
@@ -465,8 +471,11 @@ anything on the LAN can read the recorded history; `127.0.0.1` avoids that
 at the cost of the flexibility above. Neither this dashboard nor
 `docs/collect.py` enforces one choice — pick per deployment.
 
-Verify a collector is up: `curl http://<collector-host>:8081/range` should
-return `{"from":..., "to":..., "rows":N, ...}`.
+Verify a collector is up: `curl http://<collector-host>:<collector-port>/range`
+should return `{"from":..., "to":..., "rows":N, ...}`. Check it is *recording*,
+not merely answering, by calling it twice: `rows` **and** `ok_rows` should both
+climb by about `interval⁻¹` per second. `rows` climbing alone means it is
+polling an address llama-server no longer holds.
 
 ## Running this dashboard as a service
 
