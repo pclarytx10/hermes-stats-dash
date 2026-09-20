@@ -352,6 +352,20 @@
      inside its card rather than letting it widen the whole page. */
   #lb-deployments { overflow-x: auto; }
   #lb-deployments table { min-width: 560px; }
+
+  .lb-sub-head {
+    font-size: 12px; font-weight: 600; color: var(--text-muted);
+    margin: 20px 0 8px; padding-top: 14px; border-top: 1px solid var(--gridline);
+  }
+  #lb-latency { overflow-x: auto; }
+  #lb-latency table { min-width: 460px; }
+  .lb-lat-swatch {
+    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 7px; vertical-align: middle; flex: none;
+  }
+  /* Only past 2x, where the gap stops being noise and starts being a reason
+     to look at the box. */
+  .lb-lat-slow { color: var(--critical); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -563,6 +577,11 @@
         <canvas id="lb-hist-strip" class="engine-strip-canvas"></canvas>
         <div class="engine-sub" id="lb-hist-note"></div>
         <div class="grid tiles" id="lb-hist-tiles" style="margin-top:14px"></div>
+
+        <h3 class="lb-sub-head">Latency per deployment</h3>
+        <div id="lb-latency"></div>
+        <div class="engine-sub" id="lb-latency-note"></div>
+
         <div style="margin-top:10px">
           <button class="toggle-btn" id="lb-hist-csv" type="button">Export CSV</button>
         </div>
@@ -2308,6 +2327,11 @@ function lbHistSeries() {
       color: lbColorFor(id),
       points, requests, failures, cooldowns, breaks,
       mean_lpot_s: dCount > 0 ? dSum / dCount : null,
+      // How many completions that mean rests on. Not the same as `requests`:
+      // a request that failed, or was still streaming when the window closed,
+      // never reaches the histogram. Shown, because a 10× gap over nine
+      // samples and over nine thousand are different claims.
+      measured: dCount,
       state: last[C.state],
     });
   }
@@ -2411,6 +2435,7 @@ function renderLbHistSummary() {
   const tiles = $('lb-hist-tiles');
   if (!series.length) {
     tiles.replaceChildren();
+    renderLbLatency([]);
     drawLbHistStrip();
     return;
   }
@@ -2432,14 +2457,8 @@ function renderLbHistSummary() {
       cooldowns > 0
         ? 'a deployment was pulled from rotation — the pool was short a box for part of this window'
         : 'no deployment was pulled from rotation',
-      cooldowns > 0 ? 'state-queued' : ''),
-    tileEl('Latency per output token',
-      document.createTextNode(series.some((s) => s.mean_lpot_s != null)
-        ? series.filter((s) => s.mean_lpot_s != null)
-            .map((s) => `${fmtNum(s.mean_lpot_s * 1000, 1)}`).join(' / ')
-        : '—'),
-      series.filter((s) => s.mean_lpot_s != null).map((s) => s.model_id).join(' / ') +
-        (series.some((s) => s.mean_lpot_s != null) ? ' — ms, window mean' : '')));
+      cooldowns > 0 ? 'state-queued' : ''));
+  renderLbLatency(series);
 
   const bits = [`${series.length} deployment${series.length === 1 ? '' : 's'}`];
   if (lbHist?.bucket) {
@@ -2449,6 +2468,84 @@ function renderLbHistSummary() {
   if (restarts) bits.push(`${restarts} proxy restart${restarts === 1 ? '' : 's'} spanned — the line breaks rather than spiking`);
   $('lb-hist-note').textContent = bits.join(' · ');
   drawLbHistStrip();
+}
+
+/**
+ * Per-deployment latency over the recorded window.
+ *
+ * `least-busy` balances on in-flight count, which says nothing about how fast
+ * a box actually is — so a pool can look evenly balanced while one deployment
+ * takes an order of magnitude longer per token. That gap is invisible in the
+ * request-rate chart above and is the thing this table exists to show.
+ *
+ * Every figure is differenced out of the histogram across the window, so it
+ * describes the selected range rather than all time.
+ */
+function renderLbLatency(series) {
+  const holder = $('lb-latency');
+  const timed = series.filter((s) => s.mean_lpot_s != null && s.measured > 0);
+  if (!timed.length) {
+    holder.replaceChildren(el('div', { class: 'empty',
+      text: series.length
+        ? 'No completion finished inside this window, so there is nothing to time. ' +
+          'LiteLLM records latency per output token only when a request completes.'
+        : 'No deployment reported in this window.' }));
+    $('lb-latency-note').textContent = '';
+    return;
+  }
+  // Ranked fastest first: the comparison is the point, and the baseline should
+  // be the top row rather than something the reader has to hunt for.
+  timed.sort((a, b) => a.mean_lpot_s - b.mean_lpot_s);
+  const fastest = timed[0].mean_lpot_s;
+  const labelFor = (id) =>
+    (lbLive?.deployments || []).find((d) => d.model_id === id)?.engine?.label || id;
+
+  const head = el('tr', {},
+    el('th', { text: 'Deployment' }),
+    el('th', { class: 'num', text: 'ms/token' }),
+    el('th', { class: 'num', text: 'vs fastest' }),
+    el('th', { class: 'num', text: 'Completions timed' }),
+    el('th', { class: 'num', text: 'Routed' }));
+
+  const rows = timed.map((s, i) => {
+    const ratio = fastest > 0 ? s.mean_lpot_s / fastest : null;
+    // A mean over a handful of completions is a hint, not a measurement, and
+    // the row should say which one it is rather than letting the number stand
+    // unqualified next to one built from thousands.
+    const thin = s.measured < 20;
+    return el('tr', {},
+      el('td', {},
+        el('span', { class: 'lb-lat-swatch', style: `background:${s.color}` }),
+        el('span', { class: 'cell-main', text: labelFor(s.model_id) })),
+      el('td', { class: 'num cell-main', text: fmtNum(s.mean_lpot_s * 1000, 1) }),
+      el('td', { class: 'num' }, ratio == null || i === 0
+        ? el('span', { class: 'cell-sub', text: i === 0 ? 'baseline' : '—' })
+        : el('span', { class: ratio >= 2 ? 'lb-lat-slow' : 'cell-sub',
+                       text: `${fmtNum(ratio, 1)}×` })),
+      el('td', { class: 'num' },
+        el('span', { class: thin ? 'cell-sub' : '', text: fmtFull(s.measured) }),
+        thin ? el('div', { class: 'cell-sub', text: 'thin sample' }) : null),
+      el('td', { class: 'num cell-sub', text: fmtFull(s.requests) }));
+  });
+  holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
+
+  const slowest = timed[timed.length - 1];
+  const spread = fastest > 0 ? slowest.mean_lpot_s / fastest : null;
+  const bits = [];
+  if (timed.length > 1 && spread != null && spread >= 1.2) {
+    bits.push(
+      `${labelFor(slowest.model_id)} is ${fmtNum(spread, 1)}× slower per output token than ` +
+      `${labelFor(timed[0].model_id)} over this window. Routing is by in-flight count, not speed, ` +
+      'so a slower box keeps its share of the pool.');
+  } else if (timed.length > 1) {
+    bits.push('The deployments are within ~20% of each other per output token over this window.');
+  }
+  if (timed.some((s) => s.measured < 20)) {
+    bits.push('Rows marked thin rest on fewer than 20 timed completions — treat them as a hint, not a measurement.');
+  }
+  bits.push('Mean over completions that finished inside the selected range, prefill included — ' +
+            'a cold prefill on a distant box inflates this as much as slow decode does.');
+  $('lb-latency-note').textContent = bits.join(' ');
 }
 
 function setLbSpanButtons(span) {
