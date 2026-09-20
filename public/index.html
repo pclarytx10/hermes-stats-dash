@@ -2181,8 +2181,13 @@ function lbRenderShare(payload) {
           el('div', { class: 'slot-bar-fill', style: `width:${pct.toFixed(1)}%;background:${lbColorFor(d.model_id)}` })),
         el('span', { class: 'slot-bar-label',
           text: `${fmtNum(pct, 1)}% · ${fmtCompact(d.requests)}` })),
+      // Three states, not two. "No baseline yet" lasts one poll; "baseline,
+      // but nothing routed since" is an idle pool and can last hours. Keying
+      // this on sincePct collapsed them, because sincePct is null in both
+      // cases — so an idle pool claimed to be waiting for a reading it had
+      // already taken.
       el('div', { class: 'cell-sub',
-        text: sincePct == null
+        text: !lbFirst
           ? 'waiting for a second reading'
           : (sinceTotal === 0
               ? 'nothing routed since this page opened'
