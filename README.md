@@ -13,7 +13,8 @@ What the desktop client doesn't cover is a lightweight, always-on view of
 **hermes' usage** — token counts over time, sessions, top models — or of
 **the llama.cpp engine underneath it** — live throughput, slot occupancy,
 whether requests are queueing. That gap is what this project fills: a small,
-standalone three-tab dashboard.
+standalone dashboard of three tabs, plus a fourth when a load-balancing proxy
+sits between them.
 
 - **Usage** — the two sides reconciled into one picture: total work done,
   how much of it was hermes', and how much came from other clients on the
@@ -21,6 +22,9 @@ standalone three-tab dashboard.
 - **Hermes** — demand-side accounting from hermes' own rollups: what hermes
   sent, extracted from hermes-workspace's dashboard capability and trimmed
   to the stats surface.
+- **Load balancing** — *only when a LiteLLM proxy is configured.* Which
+  deployment the proxy routed each request to, and whether any of them is
+  failing or has been cooled down out of rotation.
 - **Engine** — supply-side telemetry read straight from a llama.cpp server's
   `/metrics`, `/slots`, and `/props`, plus recorded history from a small
   companion collector.
@@ -87,6 +91,50 @@ Zero runtime dependencies. Node ≥ 18.
 - **Totals** — tokens, sessions, API calls, cost for the selected window
 - **Top models** — token volume, sessions, and API calls per model
 - **Recent sessions** — latest activity with model and token counts
+
+### Load balancing tab (LiteLLM)
+
+Hidden unless a LiteLLM proxy is enabled under Setup → Load balancing. A
+proxy is a *router*, not a worker: the tokens it counts are the same tokens
+the engines behind it already report, so **nothing on this tab feeds the
+Usage tab's reconciliation** — folding it in would double-count every
+request. What it adds is the one thing neither other tab can see: the
+routing decision.
+
+- **Live panel** — requests routed and the live rate, failures at the proxy
+  with an error rate, in-flight requests, mean end-to-end latency split into
+  the LLM call and LiteLLM's own overhead, time to first token, and tokens
+  through the proxy
+- **Routing share** — a bar per deployment: its share of everything routed
+  since the proxy started, *and* its share of what has been routed since the
+  page was opened. The cumulative split is dominated by whatever happened
+  hours ago; the second number is the one that answers "is it balancing
+  right now"
+- **Deployments** — one row per deployment: requests, successes, failures
+  (broken out by HTTP status), health state (healthy / partial outage /
+  outage), **cooldowns**, and latency per output token. A non-zero cooldown
+  is the clearest evidence the pool was *not* actually balanced for part of
+  the window — LiteLLM took a box out of rotation after repeated failures
+- **Recorded routing** — the same 15m/1h/6h/24h/7d/all range picker as the
+  Engine tab, over a per-deployment request-rate chart with a window summary
+  and CSV export. A proxy restart breaks the line rather than spiking it, and
+  a collector outage is shaded rather than drawn as zero
+- **Named to match** — LiteLLM identifies a deployment by the `model_info.id`
+  in its config. Where that id equals a configured engine's id, the rows are
+  labelled with the engine's label, so the tab names the same hosts the
+  Engine tab does. Where it doesn't, the raw id is shown and the tab says so
+
+**Requirements on the proxy side**, both of which this tab reports by name
+when they're missing:
+
+- `litellm_settings.callbacks: ["prometheus"]` in the LiteLLM config, **and
+  `prometheus_client` installed in the proxy's environment**. The callback
+  mounts `/metrics` at startup; if the import fails the proxy exits, and if
+  it is installed after the proxy started, `/metrics` stays unmounted (404)
+  until a restart
+- A key. LiteLLM serves `/metrics` behind the same auth as its API, so this
+  needs the proxy's `master_key` or a virtual key with permission — the only
+  credential this app holds besides the hermes one
 
 ### Engine tab
 
@@ -157,6 +205,22 @@ section on failure rather than failing the whole request.
 | `POST /api/engine/model-suggest` | Ranks the hermes models actually in use against the file the engine reports at `/props`, for the Setup page's model map. Suggests only — nothing is attributed without a saved mapping |
 | `POST /api/engine/test` | Ad-hoc reachability probe for the Setup page's per-engine row (llama-server + collector, independent of saved config) |
 
+### LiteLLM routes
+
+| Route | Behaviour |
+|---|---|
+| `GET /api/litellm/live` | The Load balancing tab's live source. Fetches the proxy's `/metrics/` with the configured key, parses the Prometheus text **with labels** (unlike the engine routes — for LiteLLM the label set *is* the data), folds the label explosion down to one row per `model_id`, and joins each to a configured engine where the ids match. `{enabled: false}` when no proxy is configured, which is what hides the tab |
+| `GET /api/litellm/history?from=&to=&points=` | Validated, clamped proxy to the collector's `/litellm/history` |
+| `GET /api/litellm/range` | Proxy to the collector's `/litellm/range`, for the "all" range button |
+| `POST /api/litellm/test` | Ad-hoc probe for the Setup page — metrics endpoint and collector reported separately, since either can be the broken one |
+
+LiteLLM emits every counter once per *(api key × team × user agent × client
+IP × …)* combination. Summing over everything but `model_id` is the whole
+reduction both here and in the collector: the load-balancing question is only
+ever "which box". Failures are the exception — they keep their
+`exception_status`, because "which box is failing" is half the answer and
+"with what" is the other half.
+
 Every upstream call uses a short timeout (`UPSTREAM_TIMEOUT_MS`, 10s for
 most routes; 3s for the health badge) so a stalled upstream degrades a
 section to null rather than hanging the request — `/metrics` and `/slots`
@@ -168,9 +232,10 @@ dropped profile there is not cosmetic — it understates hermes and inflates
 the reconciled other-clients residual — so it gets a real budget, and any
 profile that still fails is reported rather than merged around.
 
-`public/index.html` is the whole frontend for both tabs (vanilla JS + SVG
-for the Usage charts, canvas for the Engine strip charts — 400+ columns is
-more than SVG wants to redraw every poll). No build step.
+`public/index.html` is the whole frontend for every tab (vanilla JS + SVG
+for the Usage charts, canvas for the Engine strip charts and the Load
+balancing routing chart — 400+ columns is more than SVG wants to redraw
+every poll). No build step.
 
 ### Cross-profile aggregation
 
@@ -355,6 +420,43 @@ an equivalent fallback:
 | `LLAMA_SERVER_URL` | e.g. `http://127.0.0.1:8080` |
 | `LLAMA_COLLECTOR_URL` | e.g. `http://127.0.0.1:8081` (optional) |
 
+### LiteLLM (Load balancing tab)
+
+One optional entry, off unless enabled on the Setup page. Unlike an engine,
+this one *does* hold a credential:
+
+```json
+{
+  "litellm": {
+    "enabled": true,
+    "label": "nfcmini · LiteLLM",
+    "url": "http://127.0.0.1:8080",
+    "apiKey": "sk-…",
+    "collectorUrl": "http://127.0.0.1:8082"
+  }
+}
+```
+
+| Field | Purpose |
+|---|---|
+| `enabled` | `false` hides the tab entirely without discarding the rest of the entry. A `#lb` deep link falls back to Usage rather than landing on a hidden tab |
+| `url` | The proxy's base URL. The metrics endpoint is fetched at `/metrics/` — LiteLLM mounts it as a sub-app, so the bare `/metrics` answers a 307 redirect, and asking for the slash saves a round trip on every poll |
+| `apiKey` | The proxy's `master_key` or a virtual key. Never leaves the server: the Setup page reports only whether one is held and from where, exactly as it does for the hermes password. Omit it and set `LITELLM_MASTER_KEY` in the environment instead to keep the key out of this file |
+| `collectorUrl` | A collector running with `--litellm` against this proxy — usually the *same* collector as that host's engine. Without it the tab shows live counters only |
+
+Equivalent env vars for a deployment that would rather not persist the key:
+`LITELLM_URL`, `LITELLM_COLLECTOR_URL`, and either `LITELLM_API_KEY` or
+`LITELLM_MASTER_KEY` — the second is the name LiteLLM's own config reads, so
+`EnvironmentFile=` pointed at the proxy's env file supplies it directly. A
+key saved from the Setup page takes precedence over both.
+
+**Why this is not in the Usage tab.** With hermes pointed at the proxy the
+path is hermes → LiteLLM → the engines. LiteLLM's token counters count the
+same tokens the engines' counters already do; it routes work, it does not do
+any. Adding it to the reconciliation would double-count every request that
+went through it. The Load balancing tab therefore stands alone, and says so
+at the top.
+
 ### Cost-avoidance comparator (Usage tab)
 
 The Usage tab prices hermes' engine-hosted tokens against a hosted model to
@@ -383,7 +485,7 @@ clicking a page but wasteful for something polled every few seconds.
 Tailscale would be preferable (authenticated, encrypted) if it works between
 the two hosts; if not, a plaintext LAN hop is what this dashboard assumes.
 
-## Engine tab prerequisite: the telemetry collector
+## Engine and Load balancing prerequisite: the telemetry collector
 
 The Engine tab's **live** panel and the **health badge** need only
 `llamaUrl` — a llama.cpp server started with `--metrics` is enough. The
@@ -442,6 +544,46 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 ```
+
+### Collecting LiteLLM alongside it (`--litellm`)
+
+The Load balancing tab's **History** panel needs a collector too, and it is
+the *same* collector: `--litellm <url>` makes `collect.py` poll a LiteLLM
+proxy's `/metrics/` on the same interval, into its own tables
+(`litellm_samples`, `litellm_deployments`) and its own read-only routes
+(`/litellm/range`, `/litellm/history`). Only the host that runs the proxy
+needs the flag; other hosts run the identical file without it.
+
+The key comes from the environment in preference to `--litellm-key`, because
+an argument is visible in `ps(1)` to every user on the box. Both
+`LITELLM_API_KEY` and `LITELLM_MASTER_KEY` are read — the latter is the name
+LiteLLM's own config uses, so the unit can point straight at the proxy's
+existing env file and the key is never copied into a second place:
+
+```ini
+# ~/.config/systemd/user/llamacpp-telemetry.service — the proxy's host
+[Service]
+Type=simple
+EnvironmentFile=%h/litellm/litellm.env      # already holds LITELLM_MASTER_KEY
+ExecStart=/usr/bin/python3 %h/llamacpp-telemetry/collect.py \
+  --db %h/llamacpp-telemetry/telemetry.db \
+  --server http://127.0.0.1:8081 \
+  --litellm http://127.0.0.1:8080 \
+  --interval 5 \
+  --port 8082
+```
+
+The collector prints `no key — /metrics is likely to answer 401` at startup
+when it has none. The dashboard reads the same two variable names, so giving
+`hermes-stats-dash.service` the same `EnvironmentFile=` configures the tab
+without writing the key into `config.json` at all.
+
+The two populations never mix: a LiteLLM outage records a failed LiteLLM
+sample and leaves llama-server sampling untouched, and vice versa. Verify
+with `curl http://<host>:<collector-port>/litellm/range` — it should return
+a `deployments` array naming each `model_info.id` the proxy has routed to.
+An empty array means the proxy answered but has served nothing yet: LiteLLM
+creates a deployment's series only on its first request.
 
 ```sh
 systemctl --user daemon-reload
@@ -539,11 +681,16 @@ curl http://<engine-host>:<collector-port>/range
 ```
 
 The database (`telemetry.db`) sits beside the script and is kept across a
-restart, so history continues. The collector's arguments are per-host (see
-above); check them with `systemctl --user cat llamacpp-telemetry.service`
-rather than assuming the defaults. If the host was rebuilt and the unit is
-gone, it's a fresh install: follow the collector steps above, including
-`loginctl enable-linger`.
+restart, so history continues — the LiteLLM tables are created on first
+start, so an existing database picks them up without migration. The
+collector's arguments are per-host (see above); check them with
+`systemctl --user cat llamacpp-telemetry.service` rather than assuming the
+defaults. If the host was rebuilt and the unit is gone, it's a fresh install:
+follow the collector steps above, including `loginctl enable-linger`.
+
+A collector still running an older copy of `collect.py` answers 404 on the
+`/litellm/*` routes; the Load balancing tab and the Setup page's test both
+say so by name rather than showing it as "no data recorded yet".
 
 **After an engine host changes** — a new model, port, or LAN address — update
 its entry under Setup → Engines (or `POST /api/settings`), run **Test
@@ -599,6 +746,12 @@ This auth model applies to the Usage tab's hermes connection only. The
 Engine tab's llama.cpp and collector connections have no auth of their own
 (see [Collector bind address](#collector-bind-address---bind) above) —
 that is a property of the upstream, not something this app adds.
+
+LiteLLM is the one other upstream that *does* authenticate: it serves
+`/metrics` behind the same gate as its API, so the Load balancing tab needs a
+key. It is a single static key sent as `Authorization: Bearer …`, with none
+of the discovery, caching or re-login the hermes path needs, and it is stored
+in the same owner-only `config.json`.
 
 ## Provenance
 

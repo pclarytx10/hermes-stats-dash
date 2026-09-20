@@ -342,6 +342,16 @@
   .slot-bar-fill { height: 100%; }
   .slot-bar-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; flex: none; }
   tr.slot-idle td { color: var(--text-muted); }
+
+  .lb-share-row { padding: 8px 0; border-bottom: 1px solid var(--gridline); }
+  .lb-share-row:last-child { border-bottom: none; }
+  .lb-share-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; }
+  .lb-share-row .slot-bar-rail { height: 10px; border-radius: 5px; }
+  .lb-share-row .cell-sub { margin-top: 4px; }
+  /* Eight columns is more than a phone is ever going to fit; scroll the table
+     inside its card rather than letting it widen the whole page. */
+  #lb-deployments { overflow-x: auto; }
+  #lb-deployments table { min-width: 560px; }
 </style>
 </head>
 <body>
@@ -361,6 +371,8 @@
       aria-selected="true" aria-controls="tab-usage">Usage</button>
     <button class="tab-btn" id="tab-hermes-btn" role="tab" type="button"
       aria-selected="false" aria-controls="tab-hermes">Hermes</button>
+    <button class="tab-btn" id="tab-lb-btn" role="tab" type="button"
+      aria-selected="false" aria-controls="tab-lb" hidden>Load balancing</button>
     <button class="tab-btn" id="tab-engine-btn" role="tab" type="button"
       aria-selected="false" aria-controls="tab-engine">Engine</button>
   </div>
@@ -495,6 +507,67 @@
     </div>
 
     <div class="card error-card" id="error-card" hidden style="margin-top:14px"></div>
+  </div>
+
+  <div id="tab-lb" role="tabpanel" aria-labelledby="tab-lb-btn" hidden>
+    <p class="attribution-note">
+      <strong>Load balancing</strong> is the proxy's own view: of the requests it accepted, which
+      deployment it sent each one to, and how that deployment answered. These are the same tokens the
+      <strong>Engine</strong> tab counts — the proxy sits in front of the engines, it does not
+      generate anything — so nothing here is added to the Usage tab's reconciliation. What it adds is
+      the routing decision itself: whether the pool is balanced, whether a box has started failing,
+      and whether one has been cooled down and quietly taken out of rotation.
+    </p>
+
+    <div id="lb-empty" class="card" hidden>
+      <div class="empty" id="lb-empty-text"></div>
+    </div>
+
+    <div id="lb-content" hidden>
+      <div class="card engine-identity-card">
+        <h2 id="lb-identity-title">—</h2>
+        <div class="engine-sub" id="lb-identity-sub"></div>
+      </div>
+
+      <div class="grid tiles" id="lb-tiles" style="margin-top:14px"></div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Routing share</h2>
+          <div class="legend" id="lb-share-legend"></div>
+        </div>
+        <div id="lb-share"></div>
+        <div class="engine-sub" id="lb-share-note"></div>
+      </div>
+
+      <div class="card chart-card">
+        <h2>Deployments</h2>
+        <div id="lb-deployments"></div>
+        <div class="engine-sub" id="lb-deployments-note"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Recorded routing</h2>
+          <div class="legend" id="lb-hist-legend"></div>
+        </div>
+        <div class="filters" role="group" aria-label="History range" style="margin:0 0 10px">
+          <span class="label">Range</span>
+          <button class="lb-range-btn" data-span="900" aria-pressed="true">15m</button>
+          <button class="lb-range-btn" data-span="3600" aria-pressed="false">1h</button>
+          <button class="lb-range-btn" data-span="21600" aria-pressed="false">6h</button>
+          <button class="lb-range-btn" data-span="86400" aria-pressed="false">24h</button>
+          <button class="lb-range-btn" data-span="604800" aria-pressed="false">7d</button>
+          <button class="lb-range-btn" data-span="all" aria-pressed="false">All</button>
+        </div>
+        <canvas id="lb-hist-strip" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="lb-hist-note"></div>
+        <div class="grid tiles" id="lb-hist-tiles" style="margin-top:14px"></div>
+        <div style="margin-top:10px">
+          <button class="toggle-btn" id="lb-hist-csv" type="button">Export CSV</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="tab-engine" role="tabpanel" aria-labelledby="tab-engine-btn" hidden>
@@ -1899,11 +1972,15 @@ function stopHermesPoll() {
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────
-// Three views over two populations. Usage reconciles the other two into one
-// picture; Hermes owns `days` and the date-range filter; Engine has its own
-// time domain and poll cadence. None of that state is shared — each tab's
-// window means something different.
-const TAB_IDS = ['usage', 'hermes', 'engine'];
+// Four views over three populations. Usage reconciles hermes and the engines
+// into one picture; Hermes owns `days` and the date-range filter; Load
+// balancing and Engine each have their own time domain and poll cadence. None
+// of that state is shared — each tab's window means something different.
+//
+// Load balancing is conditional: its button stays hidden until /api/litellm/live
+// says a proxy is configured, so an install without one sees the same three
+// tabs it always had.
+const TAB_IDS = ['usage', 'hermes', 'lb', 'engine'];
 let activeTab = 'usage';
 
 // One place decides which timers run: the visible tab's, and only while the
@@ -1913,12 +1990,16 @@ function syncTabTimers() {
   const live = !document.hidden;
   if (live && activeTab === 'usage') startUnifiedPoll(); else stopUnifiedPoll();
   if (live && activeTab === 'hermes') startHermesPoll(); else stopHermesPoll();
+  if (live && activeTab === 'lb') startLbPoll(); else stopLbPoll();
   if (live && activeTab === 'engine') startEnginePoll(); else stopEnginePoll();
 }
 
 function setActiveTab(tab, opts) {
   opts = opts || {};
   if (!TAB_IDS.includes(tab)) tab = 'usage';
+  // A #lb hash on an install with no proxy would otherwise land on a tab whose
+  // button is hidden and whose panel is empty.
+  if (tab === 'lb' && lbEnabled === false) tab = 'usage';
   activeTab = tab;
   for (const id of TAB_IDS) {
     $(`tab-${id}-btn`).setAttribute('aria-selected', String(id === tab));
@@ -1935,6 +2016,555 @@ TAB_IDS.forEach((id) =>
 window.addEventListener('hashchange', () =>
   setActiveTab(location.hash.replace('#', ''), { skipHash: true }));
 document.addEventListener('visibilitychange', syncTabTimers);
+
+// ── Load balancing tab (LiteLLM) ────────────────────────────────────
+//
+// LiteLLM's counters are cumulative since the proxy process started, so every
+// "right now" number here is a difference between two polls, and every "since
+// start" number is the raw counter with its epoch named. A proxy restart zeroes
+// all of them at once; it is detected from process_start_time_seconds rather
+// than from counters going backwards, because a deployment's series only comes
+// into existence after its first request and so has no meaningful "backwards".
+
+let lbEnabled = null;          // null until the first poll answers
+let lbPollTimer = null;
+const LB_POLL_MS = 4000;
+const LB_SERIES_VARS = ['--series-1', '--series-2', '--series-3', '--series-4', '--series-5'];
+
+let lbFirst = null;            // first sample this page saw: the "since opened" baseline
+let lbPrev = null;             // previous sample, for the live rate
+let lbLive = null;             // latest payload
+let lbProcessStart = null;
+
+function lbColor(i) { return `var(${LB_SERIES_VARS[i % LB_SERIES_VARS.length]})`; }
+
+// Deployment order is by request volume, which can reorder between polls; the
+// colour has to follow the deployment, not its rank, or the chart reshuffles.
+const lbColorIndex = new Map();
+function lbColorFor(modelId) {
+  if (!lbColorIndex.has(modelId)) lbColorIndex.set(modelId, lbColorIndex.size);
+  return lbColor(lbColorIndex.get(modelId));
+}
+
+function lbResetSeries() {
+  lbFirst = null; lbPrev = null;
+}
+
+function lbSnapshot(payload) {
+  const m = new Map();
+  for (const d of payload.deployments || []) m.set(d.model_id, d.requests || 0);
+  return {
+    t: Date.now() / 1000,
+    requests: payload.metrics?.requests_total || 0,
+    failed: payload.metrics?.requests_failed || 0,
+    perDeployment: m,
+  };
+}
+
+function lbShowEmpty(content) {
+  $('lb-content').hidden = true;
+  $('lb-empty').hidden = false;
+  const holder = $('lb-empty-text');
+  if (typeof content === 'string') holder.textContent = content;
+  else holder.replaceChildren(...(Array.isArray(content) ? content : [content]));
+}
+
+const LB_METRICS_ERRORS = {
+  unauthorized: 'the proxy rejected the configured key. LiteLLM serves /metrics behind the same auth as its API — it needs the master key, or a virtual key with permission.',
+  metrics_not_mounted: 'the proxy answered, but /metrics is not mounted. Add "prometheus" to litellm_settings.callbacks, make sure prometheus_client is installed in the proxy\'s environment, and restart it — the callback mounts the endpoint at startup and silently gives up if the import fails.',
+  timeout: 'the proxy did not answer in time.',
+  unreachable: 'nothing is listening at that address.',
+  unexpected_response: 'that address answered, but not with LiteLLM metrics.',
+};
+
+function lbRenderIdentity(payload) {
+  const ll = payload.litellm || {};
+  $('lb-identity-title').textContent = ll.label || 'LiteLLM';
+  const bits = [ll.url];
+  const n = (payload.deployments || []).length;
+  bits.push(n ? `${n} deployment${n === 1 ? '' : 's'} reporting` : 'no deployment has handled a request yet');
+  if (payload.process_start) {
+    bits.push(`proxy up since ${fmtWhen(payload.process_start)}`);
+  }
+  if (!ll.has_collector) bits.push('no collector — live counters only');
+  $('lb-identity-sub').textContent = bits.filter(Boolean).join(' · ');
+}
+
+function lbRenderTiles(payload) {
+  const m = payload.metrics || {};
+  const now = lbSnapshot(payload);
+  // Two windows, both named: the rate over the last poll interval, and the
+  // totals the proxy has accumulated since it started.
+  let liveRate = null;
+  if (lbPrev && now.t > lbPrev.t && now.requests >= lbPrev.requests) {
+    liveRate = (now.requests - lbPrev.requests) / (now.t - lbPrev.t) * 60;
+  }
+  const failRate = m.requests_total > 0 ? m.requests_failed / m.requests_total : null;
+  const secs = (v, dp) => (v == null ? '—' : fmtNum(v, dp === undefined ? 2 : dp));
+
+  $('lb-tiles').replaceChildren(
+    tileEl('Requests routed', valueWithUnit(fmtCompact(m.requests_total), ''),
+      liveRate == null
+        ? 'since the proxy started — a second reading gives a rate'
+        : `${fmtNum(liveRate, 1)}/min over the last interval · since the proxy started`),
+    tileEl('Failed at the proxy',
+      valueWithUnit(fmtCompact(m.requests_failed), failRate == null ? '' : ` · ${fmtNum(failRate * 100, 1)}%`),
+      'client did not get a success response — routing failures and upstream errors both land here',
+      m.requests_failed > 0 ? 'state-queued' : ''),
+    tileEl('In flight', valueWithUnit(fmtNum(m.in_flight, 0), ''),
+      'requests open on the proxy right now, across every deployment'),
+    tileEl('End-to-end latency', valueWithUnit(secs(m.mean_total_latency_s), 's'),
+      m.mean_api_latency_s == null
+        ? 'mean over every request since the proxy started'
+        : `${secs(m.mean_api_latency_s)}s of that was the LLM call itself`),
+    tileEl('Time to first token', valueWithUnit(secs(m.mean_ttft_s), 's'),
+      'mean — on a shared engine this is where a queued prefill shows up'),
+    tileEl('Proxy overhead', valueWithUnit(m.mean_overhead_s == null ? '—' : fmtNum(m.mean_overhead_s * 1000, 0), 'ms'),
+      m.mean_queue_s == null
+        ? 'LiteLLM processing, excluding the LLM call'
+        : `plus ${fmtNum(m.mean_queue_s * 1000, 0)}ms mean queue time before processing started`),
+    tileEl('Tokens through the proxy',
+      document.createTextNode(`${fmtCompact(m.input_tokens || 0)} / ${fmtCompact(m.output_tokens || 0)}`),
+      'input / output — the same tokens the Engine tab counts, not additional work'));
+}
+
+function lbRenderShare(payload) {
+  const deployments = payload.deployments || [];
+  const holder = $('lb-share');
+  $('lb-share-legend').replaceChildren(...deployments.map((d) =>
+    el('span', { class: 'key' },
+      el('span', { class: 'swatch', style: `background:${lbColorFor(d.model_id)}` }),
+      el('span', { text: d.engine?.label || d.model_id }))));
+
+  if (!deployments.length) {
+    holder.replaceChildren(el('div', { class: 'empty',
+      text: 'LiteLLM emits per-deployment series only after a deployment has served a request. Nothing has been routed since the proxy started.' }));
+    $('lb-share-note').textContent = '';
+    return;
+  }
+
+  // "Since opened" is the honest answer to "is it balancing now": the
+  // cumulative split is dominated by whatever happened hours ago.
+  const now = lbSnapshot(payload);
+  let sinceTotal = 0;
+  const since = new Map();
+  if (lbFirst) {
+    for (const [id, v] of now.perDeployment) {
+      const base = lbFirst.perDeployment.get(id) || 0;
+      const d = Math.max(0, v - base);
+      since.set(id, d);
+      sinceTotal += d;
+    }
+  }
+
+  holder.replaceChildren(...deployments.map((d) => {
+    const pct = d.share == null ? 0 : d.share * 100;
+    const sinceV = since.get(d.model_id);
+    const sincePct = sinceTotal > 0 ? (sinceV / sinceTotal) * 100 : null;
+    return el('div', { class: 'lb-share-row' },
+      el('div', { class: 'lb-share-head' },
+        el('span', { class: 'cell-main', text: d.engine?.label || d.model_id }),
+        el('span', { class: 'cell-sub', text: d.api_base || '' })),
+      el('div', { class: 'slot-bar-track' },
+        el('div', { class: 'slot-bar-rail' },
+          el('div', { class: 'slot-bar-fill', style: `width:${pct.toFixed(1)}%;background:${lbColorFor(d.model_id)}` })),
+        el('span', { class: 'slot-bar-label',
+          text: `${fmtNum(pct, 1)}% · ${fmtCompact(d.requests)}` })),
+      el('div', { class: 'cell-sub',
+        text: sincePct == null
+          ? 'waiting for a second reading'
+          : (sinceTotal === 0
+              ? 'nothing routed since this page opened'
+              : `${fmtNum(sincePct, 1)}% of the ${fmtCompact(sinceTotal)} routed since this page opened`) }));
+  }));
+
+  const spread = deployments.length > 1 && deployments[0].share != null
+    ? deployments[0].share - deployments[deployments.length - 1].share : null;
+  $('lb-share-note').textContent = spread == null
+    ? 'Share of every request the proxy has routed since it started.'
+    : `Share of every request routed since the proxy started. Widest gap between deployments: ` +
+      `${fmtNum(spread * 100, 1)} points — session affinity keeps a conversation on one box, so an ` +
+      `even split is not expected over a short window.`;
+}
+
+const LB_STATE_TEXT = {
+  healthy: 'healthy',
+  partial_outage: 'partial outage',
+  outage: 'outage',
+};
+
+function lbRenderDeployments(payload) {
+  const deployments = payload.deployments || [];
+  const holder = $('lb-deployments');
+  if (!deployments.length) {
+    holder.replaceChildren(el('div', { class: 'empty', text: 'No deployment has reported yet.' }));
+    $('lb-deployments-note').textContent = '';
+    return;
+  }
+  const head = el('tr', {},
+    el('th', { text: 'Deployment' }), el('th', { text: 'Endpoint' }),
+    el('th', { class: 'num', text: 'Requests' }), el('th', { class: 'num', text: 'Success' }),
+    el('th', { class: 'num', text: 'Failed' }), el('th', { text: 'State' }),
+    el('th', { class: 'num', text: 'Cooled down' }), el('th', { class: 'num', text: 'ms/token' }));
+  const rows = deployments.map((d) => {
+    const state = d.state_name ? (LB_STATE_TEXT[d.state_name] || d.state_name) : 'not reported';
+    const stateClass = d.state_name === 'healthy' ? 'gen' : (d.state_name ? 'pre' : '');
+    const failures = d.exception_statuses?.length
+      ? d.exception_statuses.map((s) => `${s.status}×${fmtFull(s.count)}`).join(' ')
+      : null;
+    return el('tr', {},
+      el('td', { class: 'cell-main', text: d.engine?.label || d.model_id }),
+      el('td', { class: 'cell-sub', text: d.api_base || d.model_name || '—' }),
+      el('td', { class: 'num', text: fmtFull(d.requests) }),
+      el('td', { class: 'num', text: fmtFull(d.success) }),
+      el('td', { class: 'num' },
+        el('span', { text: fmtFull(d.failure) }),
+        failures ? el('div', { class: 'cell-sub', text: failures }) : null),
+      el('td', {}, el('span', { class: 'slot-tag' + (stateClass ? ' ' + stateClass : ''), text: state })),
+      el('td', { class: 'num', text: d.cooled_down ? fmtFull(d.cooled_down) : '—' }),
+      el('td', { class: 'num',
+        text: d.latency_per_output_token_s == null ? '—' : fmtNum(d.latency_per_output_token_s * 1000, 1) }));
+  });
+  holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
+
+  const unmapped = deployments.filter((d) => !d.engine).map((d) => d.model_id);
+  $('lb-deployments-note').textContent =
+    'Counters are cumulative since the proxy started. "Cooled down" counts the times LiteLLM took ' +
+    'a deployment out of rotation after repeated failures — a non-zero value there is the clearest ' +
+    'sign the pool was not actually balanced for part of the window.' +
+    (unmapped.length
+      ? ` No engine is configured with the id ${unmapped.join(', ')}, so ${unmapped.length === 1 ? 'that row is' : 'those rows are'} ` +
+        'labelled by LiteLLM\'s model_info.id. Matching the two makes this table name the same hosts the Engine tab does.'
+      : '');
+}
+
+// ── Load balancing: recorded history ─────────────────────────────────
+let lbHist = null;             // {cols, dep_cols, bucket, from, to, rows, dep_rows}
+let lbHistSpan = 900;
+let lbHistLoaded = false;
+let lbHasCollector = null;
+
+/**
+ * Per-deployment request rate, differenced out of the collector's monotonic
+ * counters. Same reconstruction as the Engine tab's history: a pair spanning a
+ * proxy restart (epoch change) is dropped rather than differenced into a false
+ * spike, and a bucket the collector missed is a gap rather than a zero.
+ */
+function lbHistSeries() {
+  if (!lbHist || !Array.isArray(lbHist.dep_rows) || lbHist.dep_rows.length < 2) return [];
+  const C = {};
+  (lbHist.dep_cols || []).forEach((name, i) => { C[name] = i; });
+  const byId = new Map();
+  for (const r of lbHist.dep_rows) {
+    const id = r[C.model_id];
+    if (!byId.has(id)) byId.set(id, []);
+    byId.get(id).push(r);
+  }
+  const out = [];
+  for (const [id, rows] of byId) {
+    rows.sort((a, b) => a[C.ts] - b[C.ts]);
+    const points = [];
+    let requests = 0, failures = 0, cooldowns = 0, lpotSum = 0, lpotCount = 0, breaks = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const a = rows[i - 1], b = rows[i];
+      const dt = b[C.ts] - a[C.ts];
+      if (!(dt > 0)) continue;
+      const brk = b[C.epoch] !== a[C.epoch];
+      const dReq = brk ? 0 : Math.max(0, (b[C.requests] || 0) - (a[C.requests] || 0));
+      const dFail = brk ? 0 : Math.max(0, (b[C.failure] || 0) - (a[C.failure] || 0));
+      const dCool = brk ? 0 : Math.max(0, (b[C.cooled_down] || 0) - (a[C.cooled_down] || 0));
+      if (brk) breaks++;
+      requests += dReq; failures += dFail; cooldowns += dCool;
+      points.push({ t: b[C.ts], v: (dReq / dt) * 60, dt, requests: dReq, failures: dFail,
+                    cooldowns: dCool, brk, state: b[C.state] });
+    }
+    const last = rows[rows.length - 1];
+    lpotSum = last[C.lpot_sum] || 0;
+    lpotCount = last[C.lpot_count] || 0;
+    const first = rows[0];
+    // The histogram is cumulative too, so the window's mean is the difference
+    // of both its sum and its count — not the last value.
+    const dSum = Math.max(0, lpotSum - (first[C.lpot_sum] || 0));
+    const dCount = Math.max(0, lpotCount - (first[C.lpot_count] || 0));
+    out.push({
+      model_id: id,
+      api_base: last[C.api_base] || null,
+      color: lbColorFor(id),
+      points, requests, failures, cooldowns, breaks,
+      mean_lpot_s: dCount > 0 ? dSum / dCount : null,
+      state: last[C.state],
+    });
+  }
+  out.sort((a, b) => b.requests - a.requests || a.model_id.localeCompare(b.model_id));
+  return out;
+}
+
+// Buckets where the collector recorded a failed poll — drawn as shaded bands so
+// an outage does not read as a quiet period.
+function lbHistGaps() {
+  if (!lbHist || !Array.isArray(lbHist.rows)) return [];
+  const C = {};
+  (lbHist.cols || []).forEach((name, i) => { C[name] = i; });
+  return lbHist.rows.filter((r) => r[C.n] > r[C.n_ok]).map((r) => r[C.ts]);
+}
+
+/**
+ * A multi-series line chart over time. drawStripCanvas() above is a two-lane
+ * up/down chart — right for prefill vs generation, wrong for N deployments,
+ * which need a shared axis to be comparable at all.
+ */
+function drawLbHistStrip() {
+  const c = $('lb-hist-strip');
+  if (!c.isConnected || c.clientWidth === 0) return;
+  const ctx = c.getContext('2d');
+  const { w: W, h: H } = sizeEngineCanvas(c, ctx);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 46, padR = 12, padT = 12, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const rule = cssVar('--gridline'), faint = cssVar('--text-muted');
+  const base = padT + plotH;
+
+  ctx.strokeStyle = rule; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, Math.round(base) + 0.5); ctx.lineTo(W - padR, Math.round(base) + 0.5); ctx.stroke();
+
+  const series = lbHistSeries().filter((s) => s.points.length);
+  if (!series.length) {
+    ctx.fillStyle = faint; ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(lbHist ? 'window contains no usable pairs' : 'no window loaded', W / 2, padT + plotH / 2);
+    return;
+  }
+
+  let t0 = Infinity, t1 = -Infinity, max = 0;
+  for (const s of series) {
+    for (const p of s.points) {
+      if (p.t < t0) t0 = p.t;
+      if (p.t > t1) t1 = p.t;
+      if (p.v > max) max = p.v;
+    }
+  }
+  if (!(t1 > t0)) t1 = t0 + 1;
+  max = Math.max(max, 1);
+  const x = (t) => padL + ((t - t0) / (t1 - t0)) * plotW;
+  const y = (v) => base - (v / max) * plotH;
+
+  ctx.setLineDash([2, 4]); ctx.strokeStyle = rule; ctx.beginPath();
+  ctx.moveTo(padL, Math.round(padT) + 0.5); ctx.lineTo(W - padR, Math.round(padT) + 0.5);
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(`${fmtNum(max, max >= 10 ? 0 : 1)}/min`, padL - 8, padT + 4);
+  ctx.fillText('0', padL - 8, base + 3.5);
+
+  const bucket = lbHist?.bucket || 0;
+  ctx.fillStyle = faint; ctx.globalAlpha = 0.14;
+  for (const gt of lbHistGaps()) {
+    const gx = x(gt), gw = Math.max(2, (bucket / (t1 - t0)) * plotW);
+    ctx.fillRect(gx - gw, padT, gw, plotH);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.lineWidth = 1.6; ctx.lineJoin = 'round';
+  for (const s of series) {
+    ctx.strokeStyle = cssVar(s.color.replace(/^var\(|\)$/g, ''));
+    ctx.beginPath();
+    let open = false;
+    for (const p of s.points) {
+      // A restart breaks the line rather than joining across it: the two sides
+      // are different counter epochs and the segment between them is not a rate.
+      if (p.brk) { open = false; continue; }
+      if (!open) { ctx.moveTo(x(p.t), y(p.v)); open = true; }
+      else ctx.lineTo(x(p.t), y(p.v));
+    }
+    ctx.stroke();
+  }
+
+  const sp = t1 - t0;
+  ctx.fillStyle = faint; ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif';
+  for (const lb of [{ frac: 0, t: t0 }, { frac: 0.5, t: (t0 + t1) / 2 }, { frac: 1, t: t1 }]) {
+    ctx.textAlign = lb.frac <= 0 ? 'left' : (lb.frac >= 1 ? 'right' : 'center');
+    ctx.fillText(histTimeLabel(lb.t, sp), padL + plotW * lb.frac, H - 6);
+  }
+}
+
+function renderLbHistSummary() {
+  const series = lbHistSeries();
+  $('lb-hist-legend').replaceChildren(...series.map((s) =>
+    el('span', { class: 'key' },
+      el('span', { class: 'swatch', style: `background:${s.color}` }),
+      el('span', { text: s.model_id }))));
+
+  const tiles = $('lb-hist-tiles');
+  if (!series.length) {
+    tiles.replaceChildren();
+    drawLbHistStrip();
+    return;
+  }
+  const total = series.reduce((a, s) => a + s.requests, 0);
+  const failures = series.reduce((a, s) => a + s.failures, 0);
+  const cooldowns = series.reduce((a, s) => a + s.cooldowns, 0);
+  const restarts = series.reduce((a, s) => a + s.breaks, 0);
+  const gaps = lbHistGaps().length;
+
+  tiles.replaceChildren(
+    tileEl('Routed in window', document.createTextNode(fmtCompact(total)),
+      total > 0
+        ? series.map((s) => `${s.model_id} ${fmtNum((s.requests / total) * 100, 0)}%`).join(' · ')
+        : 'no request was routed in this window'),
+    tileEl('Failures in window', document.createTextNode(fmtCompact(failures)),
+      total > 0 ? `${fmtNum((failures / total) * 100, 1)}% of routed requests` : '—',
+      failures > 0 ? 'state-queued' : ''),
+    tileEl('Cooldowns', document.createTextNode(fmtCompact(cooldowns)),
+      cooldowns > 0
+        ? 'a deployment was pulled from rotation — the pool was short a box for part of this window'
+        : 'no deployment was pulled from rotation',
+      cooldowns > 0 ? 'state-queued' : ''),
+    tileEl('Latency per output token',
+      document.createTextNode(series.some((s) => s.mean_lpot_s != null)
+        ? series.filter((s) => s.mean_lpot_s != null)
+            .map((s) => `${fmtNum(s.mean_lpot_s * 1000, 1)}`).join(' / ')
+        : '—'),
+      series.filter((s) => s.mean_lpot_s != null).map((s) => s.model_id).join(' / ') +
+        (series.some((s) => s.mean_lpot_s != null) ? ' — ms, window mean' : '')));
+
+  const bits = [`${series.length} deployment${series.length === 1 ? '' : 's'}`];
+  if (lbHist?.bucket) {
+    bits.push(`${lbHist.bucket >= 60 ? fmtNum(lbHist.bucket / 60, 1) + 'min' : fmtNum(lbHist.bucket, 0) + 's'} per point`);
+  }
+  if (gaps) bits.push(`${gaps} bucket${gaps === 1 ? '' : 's'} the collector could not reach the proxy (shaded)`);
+  if (restarts) bits.push(`${restarts} proxy restart${restarts === 1 ? '' : 's'} spanned — the line breaks rather than spiking`);
+  $('lb-hist-note').textContent = bits.join(' · ');
+  drawLbHistStrip();
+}
+
+function setLbSpanButtons(span) {
+  document.querySelectorAll('.lb-range-btn').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.span === String(span))));
+}
+
+async function loadLbHistory(span) {
+  lbHistSpan = span;
+  setLbSpanButtons(span);
+  $('lb-hist-note').textContent = 'loading…';
+  try {
+    let from, to;
+    if (span === 'all') {
+      const r = await fetch('/api/litellm/range');
+      const g = await r.json();
+      if (g.error) throw new Error(g.error);
+      if (!g.rows) throw new Error('collector has recorded nothing yet');
+      from = g.from - 1; to = g.to + 1;
+    } else {
+      to = Date.now() / 1000;
+      from = to - span;
+    }
+    const res = await fetch(`/api/litellm/history?from=${from}&to=${to}&points=400`);
+    const j = await res.json();
+    if (j.error) throw new Error(j.error);
+    lbHist = j;
+    renderLbHistSummary();
+  } catch (err) {
+    lbHist = null;
+    renderLbHistSummary();
+    $('lb-hist-note').textContent = String(err?.message || err);
+  }
+}
+
+document.querySelectorAll('.lb-range-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const raw = btn.dataset.span;
+    loadLbHistory(raw === 'all' ? 'all' : Number(raw));
+  });
+});
+
+$('lb-hist-csv').addEventListener('click', () => {
+  const series = lbHistSeries();
+  if (!series.length) return;
+  const header = 'timestamp_iso,deployment,api_base,dt_seconds,requests,requests_per_min,failures,cooldowns,deployment_state,restart\n';
+  const lines = [];
+  for (const s of series) {
+    for (const p of s.points) {
+      lines.push([
+        new Date(p.t * 1000).toISOString(), s.model_id, s.api_base || '',
+        p.dt.toFixed(2), p.requests, p.v.toFixed(3), p.failures, p.cooldowns,
+        p.state == null ? '' : p.state, p.brk ? 1 : 0,
+      ].join(','));
+    }
+  }
+  const blob = new Blob([header + lines.join('\n') + '\n'], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url,
+    download: `litellm-routing-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+// ── Load balancing: fetch orchestration ──────────────────────────────
+async function pollLbLive() {
+  let payload;
+  try {
+    const res = await fetch('/api/litellm/live');
+    payload = await res.json();
+  } catch {
+    lbShowEmpty('Stats server unreachable.');
+    return;
+  }
+  const wasEnabled = lbEnabled;
+  lbEnabled = !!payload.enabled;
+  if (wasEnabled !== lbEnabled) applyLbVisibility();
+  if (!lbEnabled) {
+    stopLbPoll();
+    return;
+  }
+  if (payload.metrics_error) {
+    lbResetSeries();
+    const url = payload.litellm?.url || 'the proxy';
+    lbShowEmpty(`${url} — ${LB_METRICS_ERRORS[payload.metrics_error] || payload.metrics_error}`);
+    return;
+  }
+  // A restarted proxy zeroed every counter: the page's own baseline is from a
+  // different epoch and differencing across it would be meaningless.
+  if (lbProcessStart != null && payload.process_start !== lbProcessStart) lbResetSeries();
+  lbProcessStart = payload.process_start ?? lbProcessStart;
+
+  $('lb-empty').hidden = true;
+  $('lb-content').hidden = false;
+  lbLive = payload;
+  lbRenderIdentity(payload);
+  lbRenderTiles(payload);
+  lbRenderShare(payload);
+  lbRenderDeployments(payload);
+  const snap = lbSnapshot(payload);
+  if (!lbFirst) lbFirst = snap;
+  lbPrev = snap;
+  lbHasCollector = !!payload.litellm?.has_collector;
+}
+
+function applyLbVisibility() {
+  $('tab-lb-btn').hidden = !lbEnabled;
+  if (!lbEnabled && activeTab === 'lb') setActiveTab('usage');
+}
+
+function startLbPoll() {
+  if (lbPollTimer) return;
+  pollLbLive();
+  // Deferred to the tab becoming visible: the history call hits the collector,
+  // and a canvas in a hidden panel has no width to draw into anyway.
+  if (!lbHistLoaded) {
+    lbHistLoaded = true;
+    if (lbHasCollector !== false) loadLbHistory(lbHistSpan);
+    else $('lb-hist-note').textContent =
+      'No collector is configured for this proxy. Run one against it ' +
+      '(docs/collect.py --litellm) and set its URL under Setup → Load balancing ' +
+      'to get recorded history.';
+  } else {
+    renderLbHistSummary();
+  }
+  lbPollTimer = setInterval(pollLbLive, LB_POLL_MS);
+}
+function stopLbPoll() {
+  if (lbPollTimer) { clearInterval(lbPollTimer); lbPollTimer = null; }
+}
 
 // ── Engine tab ──────────────────────────────────────────────────────
 let engineList = [];
@@ -2292,6 +2922,7 @@ function drawEngineStrip() {
   drawStripCanvas($('engine-strip'), pre, gen, 'waiting for a second reading — rates need two points');
 }
 window.addEventListener('resize', () => {
+  if (activeTab === 'lb' && !$('lb-content').hidden) { drawLbHistStrip(); return; }
   if (activeTab !== 'engine' || $('engine-content').hidden) return;
   drawEngineStrip();
   drawEngineHistStrip();
@@ -2677,6 +3308,12 @@ document.addEventListener('visibilitychange', () => {
 });
 
 loadEngineList();
+// Whether the Load balancing tab exists at all is a server-side fact, so the
+// button starts hidden and is revealed by this one probe. Done before
+// setActiveTab so a #lb deep link is honoured rather than bounced to Usage.
+pollLbLive().then(() => {
+  if (lbEnabled && location.hash === '#lb') setActiveTab('lb', { skipHash: true });
+});
 setActiveTab(location.hash.replace('#', '') || 'usage', { skipHash: true });
 // The header status line (model, platforms, auth mode) is fed by /api/overview,
 // which the Hermes tab's poll owns. Landing anywhere else still needs it once.

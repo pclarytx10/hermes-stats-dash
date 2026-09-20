@@ -153,6 +153,9 @@
   .suggest-chip:hover { border-style: solid; color: var(--text-primary); }
   .suggest-chip.added { border-style: solid; color: var(--good-text); border-color: var(--good-text); }
   .suggest-chip .score { color: var(--text-muted); margin-left: 5px; font-size: 11px; }
+
+  .ll-row2 { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; margin-bottom: 14px; }
+  @media (max-width: 520px) { .ll-row2 { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -239,6 +242,56 @@
   </div>
 
   <div class="card">
+    <h2>Load balancing (LiteLLM)</h2>
+    <div class="hint" style="margin-bottom:12px">
+      A LiteLLM proxy in front of the engines. Enabling this adds a
+      <strong>Load balancing</strong> tab showing which deployment the proxy
+      routed each request to, and whether any of them is failing or cooled down.
+      It does not change the Usage tab: LiteLLM counts the same tokens the
+      engines already report, so folding it in there would double-count.
+    </div>
+
+    <div class="field">
+      <label style="font-weight:400">
+        <input type="checkbox" id="ll-enabled" /> Enable the Load balancing tab
+      </label>
+    </div>
+
+    <div class="ll-row2">
+      <div class="field" style="margin:0">
+        <label for="ll-label">Label</label>
+        <input type="text" id="ll-label" placeholder="LiteLLM" spellcheck="false" />
+      </div>
+      <div class="field" style="margin:0">
+        <label for="ll-url">Proxy URL</label>
+        <input type="url" id="ll-url" placeholder="http://127.0.0.1:8080" spellcheck="false" />
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="ll-key">API key</label>
+      <input type="password" id="ll-key" name="hsd-litellm-key" autocomplete="new-password" spellcheck="false" />
+      <div class="hint">LiteLLM serves <code>/metrics</code> behind the same auth as its API, so this needs the proxy's <code>master_key</code> (or a virtual key). Stored in the same owner-only config file as the hermes credentials.</div>
+      <div class="clear-row" id="ll-key-clear-row" hidden>
+        <input type="checkbox" id="ll-clear-key" /><label for="ll-clear-key" style="font-weight:400;display:inline">clear the saved key</label>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="ll-collector">Collector URL <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <input type="url" id="ll-collector" placeholder="http://127.0.0.1:8082 (optional)" spellcheck="false" />
+      <div class="hint">The collector on the proxy's host, run with <code>--litellm</code>. Usually the same collector as that host's engine — without it the tab shows live counters only, with no recorded history.</div>
+    </div>
+
+    <div class="actions">
+      <button id="ll-test-btn">Test connection</button>
+      <button id="ll-save-btn" class="primary">Save</button>
+      <span class="save-note" id="ll-save-note"></span>
+    </div>
+    <div class="engine-result" id="ll-result" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
     <h2>Current state</h2>
     <div class="state-line" id="state-line">Loading…</div>
     <div style="margin-top:8px">
@@ -297,7 +350,92 @@ async function loadSettings() {
     enginesLoaded = true;
     loadEngines(settings.engines);
   }
+  loadLitellm(settings.litellm);
 }
+
+// ── LiteLLM ──────────────────────────────────────────────────────────
+function loadLitellm(ll) {
+  ll = ll || {};
+  $('ll-enabled').checked = !!ll.enabled;
+  if (!$('ll-url').value) $('ll-url').value = ll.url || '';
+  if (!$('ll-label').value) $('ll-label').value = ll.label && ll.label !== 'LiteLLM' ? ll.label : '';
+  if (!$('ll-collector').value) $('ll-collector').value = ll.collectorUrl || '';
+  $('ll-key').placeholder = ll.has_api_key
+    ? (ll.api_key_source === 'env'
+        ? 'set from LITELLM_API_KEY — leave blank to keep'
+        : 'saved — leave blank to keep')
+    : '';
+  $('ll-key-clear-row').hidden = ll.api_key_source !== 'saved';
+}
+
+function litellmBody() {
+  return {
+    enabled: $('ll-enabled').checked,
+    url: $('ll-url').value.trim(),
+    label: $('ll-label').value.trim(),
+    collectorUrl: $('ll-collector').value.trim(),
+    apiKey: $('ll-key').value,
+    clearApiKey: $('ll-clear-key').checked,
+  };
+}
+
+$('ll-test-btn').addEventListener('click', async () => {
+  const btn = $('ll-test-btn');
+  btn.disabled = true; btn.textContent = 'Testing…';
+  $('ll-save-note').textContent = '';
+  try {
+    const res = await fetch('/api/litellm/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(litellmBody()),
+    });
+    const r = await res.json();
+    const rows = [resultRow(r.litellm.ok ? 'ok' : 'fail', 'LiteLLM /metrics',
+      [r.litellm.error, r.litellm.detail,
+        r.litellm.ok ? (r.litellm.has_key ? 'key accepted' : 'no key needed') : null,
+        r.litellm.latency_ms != null ? `${r.litellm.latency_ms} ms` : null]
+        .filter(Boolean).join(' · '))];
+    if (r.collector) {
+      rows.push(resultRow(r.collector.ok ? 'ok' : 'fail', 'Collector (LiteLLM history)',
+        [r.collector.error,
+          r.collector.ok && r.collector.rows != null ? `${r.collector.rows} rows recorded` : null,
+          r.collector.ok && r.collector.deployments?.length
+            ? `deployments: ${r.collector.deployments.join(', ')}` : null,
+          r.collector.latency_ms != null ? `${r.collector.latency_ms} ms` : null]
+          .filter(Boolean).join(' · ')));
+    }
+    $('ll-result').replaceChildren(...rows);
+  } catch (err) {
+    $('ll-result').replaceChildren(resultRow('fail', 'Test failed', String(err?.message || err)));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test connection';
+  }
+});
+
+$('ll-save-btn').addEventListener('click', async () => {
+  const btn = $('ll-save-btn');
+  btn.disabled = true;
+  const note = $('ll-save-note');
+  note.textContent = '';
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ litellm: litellmBody() }),
+    });
+    const r = await res.json();
+    if (r.error) { note.className = 'save-note fail'; note.textContent = r.error; }
+    else {
+      note.className = 'save-note ok'; note.textContent = 'Saved';
+      $('ll-key').value = ''; $('ll-clear-key').checked = false;
+      loadLitellm(r.settings.litellm);
+    }
+  } catch (err) {
+    note.className = 'save-note fail'; note.textContent = String(err?.message || err);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ── Engines (llama.cpp) ──────────────────────────────────────────────
 let enginesLoaded = false;

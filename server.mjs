@@ -190,6 +190,40 @@ function engineById(id) {
   return list.find((e) => e.id === id) || null
 }
 
+// ── LiteLLM (load-balancing proxy) config ────────────────────────────
+//
+// One optional entry, off unless enabled on the Setup page. Unlike an engine
+// this one *does* hold a credential: LiteLLM serves /metrics behind the same
+// auth as its API, so the proxy's master key (or a virtual key) is needed to
+// read it — hence `apiKey` is redacted out of sanitizedSettings() the way the
+// hermes password is.
+
+const ENV_LITELLM_URL = trimSlash(process.env.LITELLM_URL || '')
+const ENV_LITELLM_COLLECTOR_URL = trimSlash(process.env.LITELLM_COLLECTOR_URL || '')
+// LITELLM_MASTER_KEY is the name LiteLLM's own config reads, so a deployment
+// can point this process at the proxy's existing env file rather than copying
+// the key into a second one.
+const ENV_LITELLM_KEY =
+  process.env.LITELLM_API_KEY || process.env.LITELLM_MASTER_KEY || ''
+
+function litellm() {
+  const c = config.litellm && typeof config.litellm === 'object' ? config.litellm : {}
+  const url = trimSlash(c.url || '') || ENV_LITELLM_URL
+  if (!/^https?:\/\//.test(url)) return null
+  // Saved config decides; the env vars only supply a URL for a bare install.
+  if (config.litellm && c.enabled === false) return null
+  const collectorUrl = trimSlash(c.collectorUrl || '') || ENV_LITELLM_COLLECTOR_URL
+  return {
+    url,
+    label: String(c.label || '').trim() || 'LiteLLM',
+    apiKey: String(c.apiKey || ENV_LITELLM_KEY),
+    collectorUrl: /^https?:\/\//.test(collectorUrl) ? collectorUrl : '',
+  }
+}
+
+const litellmKeySource = () =>
+  config.litellm?.apiKey ? 'saved' : ENV_LITELLM_KEY ? 'env' : null
+
 // ── Scraped session-token cache (loopback / pre-v17 mode) ───────────
 
 // Accepts both the current and legacy variable names the dashboard has
@@ -856,6 +890,295 @@ async function testEngine(body) {
         const j = await res.json().catch(() => null)
         out.collector = { ok: true, url: collectorUrl, latency_ms: Date.now() - t1, rows: j?.rows ?? null }
       }
+    }
+  }
+  return out
+}
+
+// ── LiteLLM (load-balancing proxy) telemetry ────────────────────────
+//
+// A third population, and deliberately not folded into the other two. LiteLLM
+// counts requests it *routed*; llama.cpp counts work it *did*; hermes counts
+// what it *asked for*. hermes → LiteLLM → the engines means LiteLLM's tokens
+// are the same tokens the engines already report, so adding them anywhere near
+// the Usage tab's reconciliation would double-count. This tab answers a
+// question neither other tab can: of the requests that went to the pool, which
+// box got them, and did any box start failing or get cooled down.
+
+const LITELLM_METRICS_PATH = '/metrics/'
+
+/**
+ * Prometheus text → [{ name, labels, value }]. `parseProm` above drops labels,
+ * which is right for llama-server (unlabelled series) and useless here: for
+ * LiteLLM the label set *is* the data — `model_id` is which deployment served
+ * the request.
+ */
+const PROM_LABEL_RE = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g
+
+function parsePromLabeled(text) {
+  const out = []
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim()
+    if (!line || line[0] === '#') continue
+    const sp = line.lastIndexOf(' ')
+    if (sp < 0) continue
+    let name = line.slice(0, sp).trim()
+    const value = Number(line.slice(sp + 1))
+    if (!Number.isFinite(value)) continue
+    const labels = {}
+    const br = name.indexOf('{')
+    if (br >= 0) {
+      const body = name.slice(br + 1).replace(/\}$/, '')
+      name = name.slice(0, br)
+      PROM_LABEL_RE.lastIndex = 0
+      let m
+      while ((m = PROM_LABEL_RE.exec(body))) {
+        labels[m[1]] = m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\n/g, '\n')
+      }
+    }
+    out.push({ name, labels, value })
+  }
+  return out
+}
+
+async function fetchLitellmMetrics(ll, timeoutMs) {
+  const headers = ll.apiKey ? { authorization: `Bearer ${ll.apiKey}` } : {}
+  const { res, error } = await upstreamFetch(`${ll.url}${LITELLM_METRICS_PATH}`, {
+    timeoutMs,
+    headers,
+  })
+  if (error) return { rows: null, error }
+  // 401 is the single most likely misconfiguration (no key, or a key without
+  // permission) and 404 the second (the proxy started before prometheus_client
+  // was installed, so the callback never mounted). Both are worth naming.
+  if (res.status === 401 || res.status === 403) return { rows: null, error: 'unauthorized' }
+  if (res.status === 404) return { rows: null, error: 'metrics_not_mounted' }
+  if (!res.ok) return { rows: null, error: `http_${res.status}` }
+  const rows = parsePromLabeled(await res.text())
+  if (!rows.some((r) => r.name.startsWith('litellm_'))) {
+    return { rows: null, error: 'unexpected_response' }
+  }
+  return { rows, error: null }
+}
+
+// Counter families keep prometheus_client's `_total` suffix on the wire;
+// histograms expose `_sum` / `_count`. Mapped to stable names here so neither
+// the frontend nor the collector tracks LiteLLM's exposition naming.
+const LITELLM_PROXY_COUNTERS = {
+  litellm_proxy_total_requests_metric_total: 'requests_total',
+  litellm_proxy_failed_requests_metric_total: 'requests_failed',
+  litellm_input_tokens_metric_total: 'input_tokens',
+  litellm_output_tokens_metric_total: 'output_tokens',
+  litellm_total_tokens_metric_total: 'total_tokens',
+  litellm_output_reasoning_tokens_metric_total: 'reasoning_tokens',
+  litellm_deployment_successful_fallbacks_total: 'fallbacks_ok',
+  litellm_deployment_failed_fallbacks_total: 'fallbacks_failed',
+}
+const LITELLM_PROXY_HISTOGRAMS = {
+  litellm_llm_api_latency_metric: 'api_latency',
+  litellm_llm_api_time_to_first_token_metric: 'ttft',
+  litellm_request_total_latency_metric: 'total_latency',
+  litellm_request_queue_time_seconds: 'queue',
+  litellm_overhead_latency_metric: 'overhead',
+}
+const LITELLM_DEP_COUNTERS = {
+  litellm_deployment_total_requests_total: 'requests',
+  litellm_deployment_success_responses_total: 'success',
+  litellm_deployment_failure_responses_total: 'failure',
+  litellm_deployment_cooled_down_total: 'cooled_down',
+}
+
+/**
+ * Fold the label explosion down to what the tab asks. LiteLLM emits each
+ * counter once per (api key × team × user agent × client IP × …) combination;
+ * summing over everything but `model_id` is the whole reduction. Failures keep
+ * their `exception_status` because "which box is failing" is only half the
+ * answer — "with what" is the other half.
+ */
+function reduceLitellmMetrics(rows) {
+  const proxy = {}
+  const deployments = new Map()
+  const statuses = new Map()
+  let processStart = null
+  const add = (o, k, v) => { o[k] = (o[k] || 0) + v }
+
+  for (const { name, labels, value } of rows) {
+    if (name === 'process_start_time_seconds') { processStart = value; continue }
+    if (name === 'litellm_in_flight_requests') { add(proxy, 'in_flight', value); continue }
+    const pc = LITELLM_PROXY_COUNTERS[name]
+    if (pc) add(proxy, pc, value)
+    else {
+      for (const [base, col] of Object.entries(LITELLM_PROXY_HISTOGRAMS)) {
+        if (name === `${base}_sum`) add(proxy, `${col}_sum`, value)
+        else if (name === `${base}_count`) add(proxy, `${col}_count`, value)
+      }
+    }
+
+    const id = labels.model_id
+    if (!id) continue
+    let d = deployments.get(id)
+    if (!d) {
+      d = { model_id: id, api_base: null, model_name: null, requests: 0, success: 0,
+            failure: 0, cooled_down: 0, state: null, lpot_sum: 0, lpot_count: 0 }
+      deployments.set(id, d)
+    }
+    if (labels.api_base) d.api_base = labels.api_base
+    if (labels.litellm_model_name) d.model_name = labels.litellm_model_name
+    const dc = LITELLM_DEP_COUNTERS[name]
+    if (dc) {
+      d[dc] += value
+      if (dc === 'failure' && value > 0 && labels.exception_status) {
+        const k = `${id} ${labels.exception_status}`
+        statuses.set(k, (statuses.get(k) || 0) + value)
+      }
+    } else if (name === 'litellm_deployment_state') {
+      // A gauge. Several label sets can report one deployment; the worst state
+      // among them is the one that matters (0 healthy, 1 partial, 2 outage).
+      d.state = d.state == null ? value : Math.max(d.state, value)
+    } else if (name === 'litellm_deployment_latency_per_output_token_sum') {
+      d.lpot_sum += value
+    } else if (name === 'litellm_deployment_latency_per_output_token_count') {
+      d.lpot_count += value
+    }
+  }
+
+  for (const [k, v] of statuses) {
+    const [id, status] = k.split(' ')
+    const d = deployments.get(id)
+    if (d) (d.exception_statuses ||= []).push({ status, count: v })
+  }
+  for (const d of deployments.values()) {
+    d.exception_statuses?.sort((a, b) => b.count - a.count)
+  }
+  return { proxy, deployments: [...deployments.values()], process_start: processStart }
+}
+
+const DEPLOYMENT_STATES = { 0: 'healthy', 1: 'partial_outage', 2: 'outage' }
+
+/**
+ * The Load balancing tab's live source. One deployment's `model_id` is the
+ * `model_info.id` an operator wrote in LiteLLM's config; when that happens to
+ * match a configured engine id — which is the sane way to name them — the
+ * engine's label and llama_url are joined on so the tab can say "nfcmini"
+ * rather than "the thing at 127.0.0.1:8081".
+ */
+async function buildLitellmLive(ll) {
+  const { rows, error } = await fetchLitellmMetrics(ll, UPSTREAM_TIMEOUT_MS)
+  const base = {
+    litellm: { url: ll.url, label: ll.label, has_collector: !!ll.collectorUrl },
+    generated_at: new Date().toISOString(),
+  }
+  if (error) return { ...base, metrics: null, metrics_error: error, deployments: [] }
+
+  const { proxy, deployments, process_start } = reduceLitellmMetrics(rows)
+  const engineById_ = new Map(engines().map((e) => [e.id, e]))
+  const total = deployments.reduce((a, d) => a + d.requests, 0)
+  const enriched = deployments
+    .map((d) => {
+      const engine = engineById_.get(d.model_id) || null
+      const mean = d.lpot_count > 0 ? d.lpot_sum / d.lpot_count : null
+      return {
+        ...d,
+        state_name: d.state == null ? null : DEPLOYMENT_STATES[d.state] || 'unknown',
+        share: total > 0 ? d.requests / total : null,
+        latency_per_output_token_s: mean,
+        engine: engine ? { id: engine.id, label: engine.label, llama_url: engine.llamaUrl } : null,
+      }
+    })
+    .sort((a, b) => b.requests - a.requests || a.model_id.localeCompare(b.model_id))
+
+  const meanOf = (sum, count) => (count > 0 ? sum / count : null)
+  return {
+    ...base,
+    metrics_error: null,
+    process_start,
+    metrics: {
+      ...proxy,
+      requests_total: proxy.requests_total || 0,
+      requests_failed: proxy.requests_failed || 0,
+      in_flight: proxy.in_flight || 0,
+      mean_api_latency_s: meanOf(proxy.api_latency_sum, proxy.api_latency_count),
+      mean_ttft_s: meanOf(proxy.ttft_sum, proxy.ttft_count),
+      mean_total_latency_s: meanOf(proxy.total_latency_sum, proxy.total_latency_count),
+      mean_queue_s: meanOf(proxy.queue_sum, proxy.queue_count),
+      mean_overhead_s: meanOf(proxy.overhead_sum, proxy.overhead_count),
+    },
+    deployments: enriched,
+  }
+}
+
+async function proxyLitellmCollector(ll, path, query) {
+  if (!ll.collectorUrl) {
+    return { status: 404, body: { error: 'no collector configured for LiteLLM' } }
+  }
+  const qs = query ? `?${query}` : ''
+  const { res, error } = await upstreamFetch(`${ll.collectorUrl}${path}${qs}`, {
+    timeoutMs: UPSTREAM_TIMEOUT_MS,
+  })
+  if (error) return { status: 502, body: { error: `collector ${error}` } }
+  // A collector running a pre-LiteLLM copy of collect.py answers 404 on these
+  // routes. Say that, rather than letting it read as "no data recorded yet".
+  if (res.status === 404) {
+    return { status: 502, body: { error: 'collector has no /litellm routes — update docs/collect.py on that host' } }
+  }
+  if (!res.ok) return { status: 502, body: { error: `collector http ${res.status}` } }
+  try {
+    return { status: 200, body: await res.json() }
+  } catch {
+    return { status: 502, body: { error: 'collector returned invalid JSON' } }
+  }
+}
+
+/**
+ * Setup-page probe. Takes URLs and the key from the request body, not saved
+ * config, so a row can be tested before Save — and reports the metrics
+ * endpoint and the collector's LiteLLM routes as two separate results, because
+ * either can be the broken one.
+ */
+async function testLitellm(body) {
+  const url = trimSlash(body.url || '')
+  const collectorUrl = trimSlash(body.collectorUrl || '')
+  // An empty key field means "keep the saved one", matching the hermes form.
+  const apiKey = String(body.apiKey || '') || litellm()?.apiKey || ''
+  const out = { litellm: { ok: false, url } }
+  if (!/^https?:\/\//.test(url)) {
+    out.litellm.error = 'URL must start with http:// or https://'
+    return out
+  }
+  const t0 = Date.now()
+  const { rows, error } = await fetchLitellmMetrics({ url, apiKey }, 5_000)
+  out.litellm.latency_ms = Date.now() - t0
+  out.litellm.has_key = !!apiKey
+  if (error) {
+    out.litellm.error = error
+    if (error === 'unauthorized') {
+      out.litellm.detail = apiKey
+        ? 'the proxy rejected this key — LiteLLM /metrics needs the master key or a key with permission'
+        : 'no key given, and this proxy requires one for /metrics'
+    } else if (error === 'metrics_not_mounted') {
+      out.litellm.detail =
+        'reachable, but /metrics is not mounted — add "prometheus" to litellm_settings.callbacks, ' +
+        'install prometheus_client, and restart the proxy'
+    }
+  } else {
+    const { deployments } = reduceLitellmMetrics(rows)
+    out.litellm.ok = true
+    out.litellm.deployments = deployments.map((d) => d.model_id)
+    out.litellm.detail = deployments.length
+      ? `${deployments.length} deployment${deployments.length === 1 ? '' : 's'} reporting: ${deployments.map((d) => d.model_id).join(', ')}`
+      : 'metrics served, but no deployment has handled a request yet — ' +
+        'LiteLLM only emits per-deployment series after the first call'
+  }
+  if (collectorUrl) {
+    if (!/^https?:\/\//.test(collectorUrl)) {
+      out.collector = { ok: false, url: collectorUrl, error: 'URL must start with http:// or https://' }
+    } else {
+      const t1 = Date.now()
+      const { status, body: r } = await proxyLitellmCollector({ collectorUrl }, '/litellm/range')
+      out.collector = status === 200
+        ? { ok: true, url: collectorUrl, latency_ms: Date.now() - t1, rows: r?.rows ?? null,
+            deployments: (r?.deployments || []).map((d) => d.model_id) }
+        : { ok: false, url: collectorUrl, latency_ms: Date.now() - t1, error: r?.error || `http ${status}` }
     }
   }
   return out
@@ -1714,6 +2037,20 @@ function sanitizedSettings() {
     auth_mode: authMode(),
     config_file: CONFIG_FILE,
     engines: engines(),
+    // The key never leaves the server — the form reports whether one is held
+    // and from where, the same contract the hermes password uses.
+    litellm: (() => {
+      const ll = litellm()
+      const saved = config.litellm && typeof config.litellm === 'object' ? config.litellm : {}
+      return {
+        enabled: !!ll,
+        url: ll?.url || trimSlash(saved.url || '') || ENV_LITELLM_URL,
+        label: ll?.label || String(saved.label || '').trim() || 'LiteLLM',
+        collectorUrl: ll?.collectorUrl || trimSlash(saved.collectorUrl || '') || ENV_LITELLM_COLLECTOR_URL,
+        has_api_key: !!(saved.apiKey || ENV_LITELLM_KEY),
+        api_key_source: litellmKeySource(),
+      }
+    })(),
     comparator: comparator(),
   }
 }
@@ -1768,6 +2105,30 @@ function applySettings(body) {
       next.push(e)
     }
     config.engines = next
+  }
+  if (body.litellm && typeof body.litellm === 'object') {
+    const l = body.litellm
+    const url = trimSlash(l.url || '')
+    const collectorUrl = trimSlash(l.collectorUrl || '')
+    const enabled = l.enabled !== false
+    if (enabled && !/^https?:\/\//.test(url)) {
+      return { error: 'LiteLLM URL must start with http:// or https://' }
+    }
+    if (collectorUrl && !/^https?:\/\//.test(collectorUrl)) {
+      return { error: 'LiteLLM collector URL must start with http:// or https://' }
+    }
+    const prev = config.litellm && typeof config.litellm === 'object' ? config.litellm : {}
+    // A blank key field keeps the saved one — the form cannot echo it back.
+    const apiKey = l.clearApiKey
+      ? ''
+      : (typeof l.apiKey === 'string' && l.apiKey ? l.apiKey : prev.apiKey || '')
+    config.litellm = {
+      enabled,
+      url,
+      label: String(l.label || '').trim() || 'LiteLLM',
+      collectorUrl,
+      ...(apiKey ? { apiKey } : {}),
+    }
   }
   if (body.resetComparator) {
     delete config.comparator
@@ -2043,6 +2404,35 @@ const server = http.createServer(async (req, res) => {
       const points = clampInt(url.searchParams.get('points'), { def: 600, min: 10, max: 4000 })
       const { status, body } = await proxyCollectorJson(engine, '/history', `from=${from}&to=${to}&points=${points}`)
       sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/litellm/live') {
+      const ll = litellm()
+      if (!ll) { sendJson(res, 200, { litellm: null, enabled: false }); return }
+      sendJson(res, 200, { enabled: true, ...(await buildLitellmLive(ll)) })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/litellm/range') {
+      const ll = litellm()
+      if (!ll) { sendJson(res, 404, { error: 'LiteLLM is not enabled' }); return }
+      const { status, body } = await proxyLitellmCollector(ll, '/litellm/range')
+      sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/litellm/history') {
+      const ll = litellm()
+      if (!ll) { sendJson(res, 404, { error: 'LiteLLM is not enabled' }); return }
+      const now = Date.now() / 1000
+      const to = clampFloat(url.searchParams.get('to'), { def: now, min: 0, max: now + 86400 })
+      const from = clampFloat(url.searchParams.get('from'), { def: to - 3600, min: 0, max: to })
+      const points = clampInt(url.searchParams.get('points'), { def: 600, min: 10, max: 4000 })
+      const { status, body } = await proxyLitellmCollector(
+        ll, '/litellm/history', `from=${from}&to=${to}&points=${points}`)
+      sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/litellm/test') {
+      sendJson(res, 200, await testLitellm(await readJsonBody(req)))
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/engine/test') {
