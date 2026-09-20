@@ -2326,7 +2326,18 @@ function lbHistSeries() {
   for (const [id, rows] of byId) {
     rows.sort((a, b) => a[C.ts] - b[C.ts]);
     const points = [];
-    let requests = 0, failures = 0, cooldowns = 0, lpotSum = 0, lpotCount = 0, breaks = 0;
+    let requests = 0, failures = 0, cooldowns = 0, breaks = 0;
+    // One bucket's worth of a cumulative histogram. Same rules as the window
+    // version: a pair spanning a restart is not a mean, and a NULL count means
+    // the column was not being recorded yet — neither is a zero.
+    const pairMean = (a, b, brk, sumCol, countCol) => {
+      if (brk) return { mean: null, count: 0 };
+      const ac = a[C[countCol]], bc = b[C[countCol]];
+      if (ac == null || bc == null) return { mean: null, count: 0 };
+      const dCount = Math.max(0, bc - ac);
+      const dSum = Math.max(0, (b[C[sumCol]] || 0) - (a[C[sumCol]] || 0));
+      return { mean: dCount > 0 ? dSum / dCount : null, count: dCount };
+    };
     for (let i = 1; i < rows.length; i++) {
       const a = rows[i - 1], b = rows[i];
       const dt = b[C.ts] - a[C.ts];
@@ -2337,8 +2348,12 @@ function lbHistSeries() {
       const dCool = brk ? 0 : Math.max(0, (b[C.cooled_down] || 0) - (a[C.cooled_down] || 0));
       if (brk) breaks++;
       requests += dReq; failures += dFail; cooldowns += dCool;
+      const lpotP = pairMean(a, b, brk, 'lpot_sum', 'lpot_count');
+      const ttftP = pairMean(a, b, brk, 'ttft_sum', 'ttft_count');
       points.push({ t: b[C.ts], v: (dReq / dt) * 60, dt, requests: dReq, failures: dFail,
-                    cooldowns: dCool, brk, state: b[C.state] });
+                    cooldowns: dCool, brk, state: b[C.state],
+                    lpot: lpotP.mean, lpotN: lpotP.count,
+                    ttft: ttftP.mean, ttftN: ttftP.count });
     }
     const last = rows[rows.length - 1];
     const lpot = histWindowMean(rows, C, 'lpot_sum', 'lpot_count');
@@ -2672,13 +2687,23 @@ document.querySelectorAll('.lb-range-btn').forEach((btn) => {
 $('lb-hist-csv').addEventListener('click', () => {
   const series = lbHistSeries();
   if (!series.length) return;
-  const header = 'timestamp_iso,deployment,api_base,dt_seconds,requests,requests_per_min,failures,cooldowns,deployment_state,restart\n';
+  // The latency columns are per bucket, not the window aggregate the table
+  // shows — repeating one number down a time series would be useless. Each
+  // carries its own completion count, because a bucket holding one completion
+  // and one holding fifty must not be averaged as equals downstream. Blank
+  // means not measurable for that bucket (no completion finished, the column
+  // predates its collector, or the pair spans a restart) — never zero.
+  const header = 'timestamp_iso,deployment,api_base,dt_seconds,requests,requests_per_min,' +
+    'failures,cooldowns,ms_per_token,token_completions,ttft_seconds,ttft_completions,' +
+    'deployment_state,restart\n';
   const lines = [];
   for (const s of series) {
     for (const p of s.points) {
       lines.push([
         new Date(p.t * 1000).toISOString(), s.model_id, s.api_base || '',
         p.dt.toFixed(2), p.requests, p.v.toFixed(3), p.failures, p.cooldowns,
+        p.lpot == null ? '' : (p.lpot * 1000).toFixed(2), p.lpotN,
+        p.ttft == null ? '' : p.ttft.toFixed(3), p.ttftN,
         p.state == null ? '' : p.state, p.brk ? 1 : 0,
       ].join(','));
     }
