@@ -140,6 +140,24 @@ def parse_prom(text):
 LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
 
+def is_placeholder(v):
+    """LiteLLM writes a placeholder rather than omitting a label it has no value
+    for: the literal string "None" (Python str(None)) on some metric families,
+    the empty string on others. Taken at face value they become a phantom
+    deployment named "None" in the routing table."""
+    return not v or v == "None"
+
+
+def is_inference(labels):
+    """Was this proxy-level request an inference call, or LiteLLM's own
+    housekeeping? requested_model is empty on /metrics/, /v1/models, /health and
+    friends. It matters: a model-list call and this collector's own scrape are
+    both recorded as *failed* proxy requests, so counting them naively makes an
+    idle proxy read as a 100% error rate."""
+    return (not is_placeholder(labels.get("requested_model"))
+            or not is_placeholder(labels.get("model_id")))
+
+
 def parse_prom_labeled(text):
     """Prometheus text -> [(name, {label: value}, float)].
 
@@ -378,10 +396,17 @@ class Collector:
                 start_time = value
                 continue
             if name == "litellm_in_flight_requests":
-                acc(proxy, "in_flight", value)
+                # This scrape is itself an open request on the proxy (verified:
+                # two concurrent scrapes read 2), so the observer subtracts
+                # itself or an idle proxy never records zero.
+                acc(proxy, "in_flight", max(0.0, value - 1.0))
                 continue
             col = PROXY_COUNTERS.get(name)
             if col:
+                # Only the two request counters carry non-inference traffic;
+                # the rest are emitted on real calls only.
+                if col in ("requests_total", "requests_failed") and not is_inference(labels):
+                    continue
                 acc(proxy, col, value)
                 continue
             for base, col in PROXY_HISTOGRAMS.items():
@@ -391,12 +416,14 @@ class Collector:
                     acc(proxy, col + "_count", value)
 
             mid = labels.get("model_id")
-            if not mid:
+            # A routing attempt that never reached a box names no deployment;
+            # the proxy-level failure counter already carries it.
+            if mid is None or is_placeholder(mid):
                 continue
             d = deps.setdefault(mid, {"api_base": None, "model_name": None})
-            if labels.get("api_base"):
+            if not is_placeholder(labels.get("api_base")):
                 d["api_base"] = labels["api_base"]
-            if labels.get("litellm_model_name"):
+            if not is_placeholder(labels.get("litellm_model_name")):
                 d["model_name"] = labels["litellm_model_name"]
             dcol = DEP_COUNTERS.get(name)
             if dcol:

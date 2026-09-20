@@ -989,16 +989,45 @@ const LITELLM_DEP_COUNTERS = {
 }
 
 /**
+ * LiteLLM writes a *placeholder* rather than omitting a label it has no value
+ * for: the literal string "None" (Python's `str(None)`) on some metric
+ * families, the empty string on others. Taken at face value these become a
+ * phantom deployment called "None" sitting in the routing table with zero
+ * requests, and an exception status reading "None×1".
+ */
+const isPlaceholder = (v) => !v || v === 'None'
+
+/**
+ * Was this proxy-level request an inference call, or LiteLLM's own
+ * housekeeping? `requested_model` carries the model group a caller asked for
+ * and is empty on `/metrics/`, `/v1/models`, `/health` and friends — a
+ * semantic test, rather than a hardcoded route list that would need a new
+ * entry every time LiteLLM adds an endpoint.
+ *
+ * This matters more than it looks: hermes listing models, and this app's own
+ * metrics scrape, are both recorded as *failed* proxy requests. Counted
+ * naively they make an idle proxy read as a 100% error rate.
+ */
+const isInferenceRequest = (labels) =>
+  !isPlaceholder(labels.requested_model) || !isPlaceholder(labels.model_id)
+
+/**
  * Fold the label explosion down to what the tab asks. LiteLLM emits each
  * counter once per (api key × team × user agent × client IP × …) combination;
  * summing over everything but `model_id` is the whole reduction. Failures keep
  * their `exception_status` because "which box is failing" is only half the
  * answer — "with what" is the other half.
+ *
+ * Three populations come out, never merged: real deployments, requests that
+ * failed before any deployment was chosen, and non-inference calls on the
+ * proxy's HTTP surface.
  */
 function reduceLitellmMetrics(rows) {
   const proxy = {}
   const deployments = new Map()
   const statuses = new Map()
+  const unrouted = { requests: 0, failure: 0 }
+  const nonInference = { requests: 0, failed: 0 }
   let processStart = null
   const add = (o, k, v) => { o[k] = (o[k] || 0) + v }
 
@@ -1006,8 +1035,16 @@ function reduceLitellmMetrics(rows) {
     if (name === 'process_start_time_seconds') { processStart = value; continue }
     if (name === 'litellm_in_flight_requests') { add(proxy, 'in_flight', value); continue }
     const pc = LITELLM_PROXY_COUNTERS[name]
-    if (pc) add(proxy, pc, value)
-    else {
+    if (pc) {
+      // The two request counters carry a `route`; the rest are emitted only on
+      // real calls, so only these two need the inference test.
+      if (pc === 'requests_total' || pc === 'requests_failed') {
+        if (isInferenceRequest(labels)) add(proxy, pc, value)
+        else add(nonInference, pc === 'requests_total' ? 'requests' : 'failed', value)
+      } else {
+        add(proxy, pc, value)
+      }
+    } else {
       for (const [base, col] of Object.entries(LITELLM_PROXY_HISTOGRAMS)) {
         if (name === `${base}_sum`) add(proxy, `${col}_sum`, value)
         else if (name === `${base}_count`) add(proxy, `${col}_count`, value)
@@ -1015,19 +1052,27 @@ function reduceLitellmMetrics(rows) {
     }
 
     const id = labels.model_id
-    if (!id) continue
+    if (id === undefined) continue
+    if (isPlaceholder(id)) {
+      // A routing attempt that never reached a box — it names no deployment,
+      // so it belongs in neither the table nor the share, but dropping it
+      // would lose a real failure.
+      if (name === 'litellm_deployment_total_requests_total') unrouted.requests += value
+      else if (name === 'litellm_deployment_failure_responses_total') unrouted.failure += value
+      continue
+    }
     let d = deployments.get(id)
     if (!d) {
       d = { model_id: id, api_base: null, model_name: null, requests: 0, success: 0,
             failure: 0, cooled_down: 0, state: null, lpot_sum: 0, lpot_count: 0 }
       deployments.set(id, d)
     }
-    if (labels.api_base) d.api_base = labels.api_base
-    if (labels.litellm_model_name) d.model_name = labels.litellm_model_name
+    if (!isPlaceholder(labels.api_base)) d.api_base = labels.api_base
+    if (!isPlaceholder(labels.litellm_model_name)) d.model_name = labels.litellm_model_name
     const dc = LITELLM_DEP_COUNTERS[name]
     if (dc) {
       d[dc] += value
-      if (dc === 'failure' && value > 0 && labels.exception_status) {
+      if (dc === 'failure' && value > 0 && !isPlaceholder(labels.exception_status)) {
         const k = `${id} ${labels.exception_status}`
         statuses.set(k, (statuses.get(k) || 0) + value)
       }
@@ -1050,7 +1095,17 @@ function reduceLitellmMetrics(rows) {
   for (const d of deployments.values()) {
     d.exception_statuses?.sort((a, b) => b.count - a.count)
   }
-  return { proxy, deployments: [...deployments.values()], process_start: processStart }
+  // The scrape that produced this reading is itself an open request on the
+  // proxy (verified: two concurrent scrapes read 2), so the observer has to
+  // subtract itself or an idle proxy never reads zero.
+  if (proxy.in_flight != null) proxy.in_flight = Math.max(0, proxy.in_flight - 1)
+  return {
+    proxy,
+    deployments: [...deployments.values()],
+    unrouted,
+    non_inference: nonInference,
+    process_start: processStart,
+  }
 }
 
 const DEPLOYMENT_STATES = { 0: 'healthy', 1: 'partial_outage', 2: 'outage' }
@@ -1070,7 +1125,8 @@ async function buildLitellmLive(ll) {
   }
   if (error) return { ...base, metrics: null, metrics_error: error, deployments: [] }
 
-  const { proxy, deployments, process_start } = reduceLitellmMetrics(rows)
+  const { proxy, deployments, unrouted, non_inference, process_start } =
+    reduceLitellmMetrics(rows)
   const engineById_ = new Map(engines().map((e) => [e.id, e]))
   const total = deployments.reduce((a, d) => a + d.requests, 0)
   const enriched = deployments
@@ -1092,8 +1148,14 @@ async function buildLitellmLive(ll) {
     ...base,
     metrics_error: null,
     process_start,
+    unrouted,
+    non_inference,
     metrics: {
       ...proxy,
+      // The load-balancing number: what actually reached a deployment. The
+      // proxy-level counter below is a different denominator — it also holds
+      // requests that failed before routing.
+      routed_total: total,
       requests_total: proxy.requests_total || 0,
       requests_failed: proxy.requests_failed || 0,
       in_flight: proxy.in_flight || 0,

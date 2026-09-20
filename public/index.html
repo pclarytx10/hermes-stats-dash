@@ -2055,7 +2055,9 @@ function lbSnapshot(payload) {
   for (const d of payload.deployments || []) m.set(d.model_id, d.requests || 0);
   return {
     t: Date.now() / 1000,
-    requests: payload.metrics?.requests_total || 0,
+    // Routed, not accepted: the live rate should describe work that reached a
+    // box, not every call on the proxy's HTTP surface.
+    requests: payload.metrics?.routed_total || 0,
     failed: payload.metrics?.requests_failed || 0,
     perDeployment: m,
   };
@@ -2101,18 +2103,27 @@ function lbRenderTiles(payload) {
   }
   const failRate = m.requests_total > 0 ? m.requests_failed / m.requests_total : null;
   const secs = (v, dp) => (v == null ? '—' : fmtNum(v, dp === undefined ? 2 : dp));
+  const unrouted = payload.unrouted || {};
+  const nonInf = payload.non_inference || {};
 
   $('lb-tiles').replaceChildren(
-    tileEl('Requests routed', valueWithUnit(fmtCompact(m.requests_total), ''),
+    tileEl('Requests routed', valueWithUnit(fmtCompact(m.routed_total), ''),
       liveRate == null
-        ? 'since the proxy started — a second reading gives a rate'
-        : `${fmtNum(liveRate, 1)}/min over the last interval · since the proxy started`),
+        ? 'reached a deployment, since the proxy started — a second reading gives a rate'
+        : `${fmtNum(liveRate, 1)}/min over the last interval · reached a deployment, since the proxy started`),
     tileEl('Failed at the proxy',
       valueWithUnit(fmtCompact(m.requests_failed), failRate == null ? '' : ` · ${fmtNum(failRate * 100, 1)}%`),
-      'client did not get a success response — routing failures and upstream errors both land here',
+      [
+        `of ${fmtCompact(m.requests_total)} inference calls accepted`,
+        unrouted.requests ? `${fmtCompact(unrouted.requests)} never reached a deployment` : null,
+        // Model-list calls and this dashboard's own metrics scrape are recorded
+        // as failed proxy requests. Excluded from the rate, named here so the
+        // exclusion is visible rather than silent.
+        nonInf.requests ? `${fmtCompact(nonInf.requests)} non-inference calls excluded` : null,
+      ].filter(Boolean).join(' · '),
       m.requests_failed > 0 ? 'state-queued' : ''),
     tileEl('In flight', valueWithUnit(fmtNum(m.in_flight, 0), ''),
-      'requests open on the proxy right now, across every deployment'),
+      'requests open on the proxy right now, across every deployment — this page’s own poll subtracted'),
     tileEl('End-to-end latency', valueWithUnit(secs(m.mean_total_latency_s), 's'),
       m.mean_api_latency_s == null
         ? 'mean over every request since the proxy started'

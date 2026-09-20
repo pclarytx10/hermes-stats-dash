@@ -101,10 +101,12 @@ Usage tab's reconciliation** — folding it in would double-count every
 request. What it adds is the one thing neither other tab can see: the
 routing decision.
 
-- **Live panel** — requests routed and the live rate, failures at the proxy
+- **Live panel** — requests *routed* and the live rate, failures at the proxy
   with an error rate, in-flight requests, mean end-to-end latency split into
   the LLM call and LiteLLM's own overhead, time to first token, and tokens
-  through the proxy
+  through the proxy. "Routed" and "accepted" are separate numbers on purpose:
+  the first is what reached a deployment, the second also holds requests that
+  failed before routing
 - **Routing share** — a bar per deployment: its share of everything routed
   since the proxy started, *and* its share of what has been routed since the
   page was opened. The cumulative split is dominated by whatever happened
@@ -220,6 +222,31 @@ reduction both here and in the collector: the load-balancing question is only
 ever "which box". Failures are the exception — they keep their
 `exception_status`, because "which box is failing" is half the answer and
 "with what" is the other half.
+
+Three things about that label set are load-bearing, and all three were found
+by reading a real scrape rather than the docs:
+
+- **Absent labels are written, not omitted.** LiteLLM emits the literal
+  string `"None"` (Python's `str(None)`) on some metric families and `""` on
+  others. Taken at face value they produce a deployment called *None* sitting
+  in the routing table with zero requests, and an exception status reading
+  *None×1*. Both spellings are treated as absent.
+- **The proxy's own housekeeping is recorded as failed requests.** A
+  `/v1/models` call from hermes, and this dashboard's own `/metrics/` scrape,
+  each land in `litellm_proxy_failed_requests_metric_total`. Counted naively
+  an idle proxy reads as a 100% error rate. A request counts as inference
+  when `requested_model` or `model_id` is populated — a semantic test rather
+  than a route denylist that would need an entry every time LiteLLM adds an
+  endpoint. The excluded count is shown on the tile, so the exclusion is
+  visible rather than silent.
+- **The scrape counts itself in `litellm_in_flight_requests`.** Two
+  concurrent scrapes read `2`, so the observer subtracts itself — otherwise
+  an idle proxy never reads zero.
+
+A routing attempt that failed *before* a deployment was chosen names no box.
+It is kept out of the deployment table and the routing share, where it would
+be meaningless, and reported separately as "never reached a deployment"
+rather than dropped.
 
 Every upstream call uses a short timeout (`UPSTREAM_TIMEOUT_MS`, 10s for
 most routes; 3s for the health badge) so a stalled upstream degrades a
