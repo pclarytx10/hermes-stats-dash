@@ -2505,6 +2505,10 @@ function renderLbHistSummary() {
  * Every figure is differenced out of the histogram across the window, so it
  * describes the selected range rather than all time.
  */
+// Below this many observations a mean is a hint, not a measurement, and every
+// figure built from fewer says so where it is shown.
+const LB_THIN_SAMPLE = 20;
+
 function renderLbLatency(series) {
   const holder = $('lb-latency');
   const timed = series.filter((s) => s.mean_lpot_s != null && s.measured > 0);
@@ -2532,7 +2536,13 @@ function renderLbLatency(series) {
     ? Math.min(...ttftTimed.map((s) => s.mean_ttft_s)) : null;
 
   // A metric's cell: the number, with its ratio against the fastest underneath.
-  const metricCell = (value, best, unitScale, digits) => {
+  //
+  // Each metric carries its *own* sample count, because they diverge: TTFT is
+  // recorded only for streaming requests and only since the collector started
+  // capturing it, so a deployment can have 27 timed completions and one timed
+  // first token. Reporting the shared count beside both would present a
+  // single-sample mean as if it rested on twenty-seven.
+  const metricCell = (value, best, count, unitScale, digits) => {
     if (value == null) {
       return el('td', { class: 'num' },
         el('span', { class: 'cell-sub', text: '—' }),
@@ -2540,10 +2550,12 @@ function renderLbLatency(series) {
     }
     const ratio = best > 0 ? value / best : null;
     const isBest = ratio != null && ratio <= 1.0001;
+    const thin = count > 0 && count < LB_THIN_SAMPLE;
+    const ratioText = isBest ? 'baseline' : (ratio == null ? '' : `${fmtNum(ratio, 1)}×`);
     return el('td', { class: 'num' },
-      el('span', { class: 'cell-main', text: fmtNum(value * unitScale, digits) }),
-      el('div', { class: isBest ? 'cell-sub' : (ratio >= 2 ? 'lb-lat-slow' : 'cell-sub'),
-                  text: isBest ? 'baseline' : (ratio == null ? '' : `${fmtNum(ratio, 1)}×`) }));
+      el('span', { class: thin ? 'cell-sub' : 'cell-main', text: fmtNum(value * unitScale, digits) }),
+      el('div', { class: !isBest && ratio >= 2 && !thin ? 'lb-lat-slow' : 'cell-sub',
+                  text: thin ? `${ratioText} · n=${fmtFull(count)}` : ratioText }));
   };
 
   const head = el('tr', {},
@@ -2557,13 +2569,13 @@ function renderLbLatency(series) {
     // A mean over a handful of completions is a hint, not a measurement, and
     // the row should say which one it is rather than letting the number stand
     // unqualified next to one built from thousands.
-    const thin = s.measured < 20;
+    const thin = s.measured < LB_THIN_SAMPLE;
     return el('tr', {},
       el('td', {},
         el('span', { class: 'lb-lat-swatch', style: `background:${s.color}` }),
         el('span', { class: 'cell-main', text: labelFor(s.model_id) })),
-      metricCell(s.mean_lpot_s, fastest, 1000, 1),
-      metricCell(s.mean_ttft_s, fastestTtft, 1, 2),
+      metricCell(s.mean_lpot_s, fastest, s.measured, 1000, 1),
+      metricCell(s.mean_ttft_s, fastestTtft, s.ttft_measured, 1, 2),
       el('td', { class: 'num' },
         el('span', { class: thin ? 'cell-sub' : '', text: fmtFull(s.measured) }),
         thin ? el('div', { class: 'cell-sub', text: 'thin sample' }) : null),
@@ -2604,8 +2616,10 @@ function renderLbLatency(series) {
   } else if (timed.length > 1) {
     bits.push('The deployments are within ~20% of each other per output token over this window.');
   }
-  if (timed.some((s) => s.measured < 20)) {
-    bits.push('Rows marked thin rest on fewer than 20 timed completions — treat them as a hint, not a measurement.');
+  if (timed.some((s) => s.measured < LB_THIN_SAMPLE || (s.ttft_measured > 0 && s.ttft_measured < LB_THIN_SAMPLE))) {
+    bits.push(`A figure marked n= rests on fewer than ${LB_THIN_SAMPLE} observations — ` +
+              'treat it as a hint, not a measurement. The two columns are counted ' +
+              'separately, since TTFT is recorded only for streaming requests.');
   }
   if (timed.some((s) => s.mean_ttft_s == null)) {
     bits.push('TTFT reads "not recorded" for any window predating the collector that captures it per deployment.');
