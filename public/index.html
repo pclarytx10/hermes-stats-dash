@@ -358,7 +358,7 @@
     margin: 20px 0 8px; padding-top: 14px; border-top: 1px solid var(--gridline);
   }
   #lb-latency { overflow-x: auto; }
-  #lb-latency table { min-width: 460px; }
+  #lb-latency table { min-width: 540px; }
   .lb-lat-swatch {
     display: inline-block; width: 8px; height: 8px; border-radius: 2px;
     margin-right: 7px; vertical-align: middle; flex: none;
@@ -2285,6 +2285,33 @@ let lbHasCollector = null;
  * proxy restart (epoch change) is dropped rather than differenced into a false
  * spike, and a bucket the collector missed is a gap rather than a zero.
  */
+/**
+ * Window mean of a cumulative Prometheus histogram, from the collector's rows.
+ * Three things make this more than a subtraction:
+ *
+ *  - counters reset on a proxy restart, so only the final epoch inside the
+ *    window is differenced — a pair spanning a restart is not a mean;
+ *  - a column added by a later collector version is NULL on every row written
+ *    before that upgrade, so the baseline is the first row actually carrying a
+ *    value rather than the first row in the window. Differencing against a
+ *    NULL-as-zero would report the all-time mean as if it were this window's;
+ *  - one usable row cannot be differenced against itself, so it reports
+ *    nothing rather than a number.
+ */
+function histWindowMean(rows, C, sumCol, countCol) {
+  const epoch = rows[rows.length - 1][C.epoch];
+  let first = null, last = null;
+  for (const r of rows) {
+    if (r[C.epoch] !== epoch || r[C[countCol]] == null) continue;
+    if (!first) first = r;
+    last = r;
+  }
+  if (!first || last === first) return { mean: null, count: 0 };
+  const dSum = Math.max(0, (last[C[sumCol]] || 0) - (first[C[sumCol]] || 0));
+  const dCount = Math.max(0, (last[C[countCol]] || 0) - (first[C[countCol]] || 0));
+  return { mean: dCount > 0 ? dSum / dCount : null, count: dCount };
+}
+
 function lbHistSeries() {
   if (!lbHist || !Array.isArray(lbHist.dep_rows) || lbHist.dep_rows.length < 2) return [];
   const C = {};
@@ -2314,24 +2341,21 @@ function lbHistSeries() {
                     cooldowns: dCool, brk, state: b[C.state] });
     }
     const last = rows[rows.length - 1];
-    lpotSum = last[C.lpot_sum] || 0;
-    lpotCount = last[C.lpot_count] || 0;
-    const first = rows[0];
-    // The histogram is cumulative too, so the window's mean is the difference
-    // of both its sum and its count — not the last value.
-    const dSum = Math.max(0, lpotSum - (first[C.lpot_sum] || 0));
-    const dCount = Math.max(0, lpotCount - (first[C.lpot_count] || 0));
+    const lpot = histWindowMean(rows, C, 'lpot_sum', 'lpot_count');
+    const ttft = histWindowMean(rows, C, 'ttft_sum', 'ttft_count');
     out.push({
       model_id: id,
       api_base: last[C.api_base] || null,
       color: lbColorFor(id),
       points, requests, failures, cooldowns, breaks,
-      mean_lpot_s: dCount > 0 ? dSum / dCount : null,
+      mean_lpot_s: lpot.mean,
       // How many completions that mean rests on. Not the same as `requests`:
       // a request that failed, or was still streaming when the window closed,
       // never reaches the histogram. Shown, because a 10× gap over nine
       // samples and over nine thousand are different claims.
-      measured: dCount,
+      measured: lpot.count,
+      mean_ttft_s: ttft.mean,
+      ttft_measured: ttft.count,
       state: last[C.state],
     });
   }
@@ -2500,15 +2524,36 @@ function renderLbLatency(series) {
   const labelFor = (id) =>
     (lbLive?.deployments || []).find((d) => d.model_id === id)?.engine?.label || id;
 
+  // TTFT ranks on its own: the box that streams fastest is not necessarily the
+  // one that starts fastest, and collapsing them onto one baseline would hide
+  // exactly the case worth seeing.
+  const ttftTimed = timed.filter((s) => s.mean_ttft_s != null);
+  const fastestTtft = ttftTimed.length
+    ? Math.min(...ttftTimed.map((s) => s.mean_ttft_s)) : null;
+
+  // A metric's cell: the number, with its ratio against the fastest underneath.
+  const metricCell = (value, best, unitScale, digits) => {
+    if (value == null) {
+      return el('td', { class: 'num' },
+        el('span', { class: 'cell-sub', text: '—' }),
+        el('div', { class: 'cell-sub', text: 'not recorded' }));
+    }
+    const ratio = best > 0 ? value / best : null;
+    const isBest = ratio != null && ratio <= 1.0001;
+    return el('td', { class: 'num' },
+      el('span', { class: 'cell-main', text: fmtNum(value * unitScale, digits) }),
+      el('div', { class: isBest ? 'cell-sub' : (ratio >= 2 ? 'lb-lat-slow' : 'cell-sub'),
+                  text: isBest ? 'baseline' : (ratio == null ? '' : `${fmtNum(ratio, 1)}×`) }));
+  };
+
   const head = el('tr', {},
     el('th', { text: 'Deployment' }),
     el('th', { class: 'num', text: 'ms/token' }),
-    el('th', { class: 'num', text: 'vs fastest' }),
+    el('th', { class: 'num', text: 'TTFT · s' }),
     el('th', { class: 'num', text: 'Completions timed' }),
     el('th', { class: 'num', text: 'Routed' }));
 
-  const rows = timed.map((s, i) => {
-    const ratio = fastest > 0 ? s.mean_lpot_s / fastest : null;
+  const rows = timed.map((s) => {
     // A mean over a handful of completions is a hint, not a measurement, and
     // the row should say which one it is rather than letting the number stand
     // unqualified next to one built from thousands.
@@ -2517,11 +2562,8 @@ function renderLbLatency(series) {
       el('td', {},
         el('span', { class: 'lb-lat-swatch', style: `background:${s.color}` }),
         el('span', { class: 'cell-main', text: labelFor(s.model_id) })),
-      el('td', { class: 'num cell-main', text: fmtNum(s.mean_lpot_s * 1000, 1) }),
-      el('td', { class: 'num' }, ratio == null || i === 0
-        ? el('span', { class: 'cell-sub', text: i === 0 ? 'baseline' : '—' })
-        : el('span', { class: ratio >= 2 ? 'lb-lat-slow' : 'cell-sub',
-                       text: `${fmtNum(ratio, 1)}×` })),
+      metricCell(s.mean_lpot_s, fastest, 1000, 1),
+      metricCell(s.mean_ttft_s, fastestTtft, 1, 2),
       el('td', { class: 'num' },
         el('span', { class: thin ? 'cell-sub' : '', text: fmtFull(s.measured) }),
         thin ? el('div', { class: 'cell-sub', text: 'thin sample' }) : null),
@@ -2537,14 +2579,39 @@ function renderLbLatency(series) {
       `${labelFor(slowest.model_id)} is ${fmtNum(spread, 1)}× slower per output token than ` +
       `${labelFor(timed[0].model_id)} over this window. Routing is by in-flight count, not speed, ` +
       'so a slower box keeps its share of the pool.');
+    // The two columns disagreeing is the useful signal: ms/token amortises
+    // prefill over the whole response, so a box that is slow only to *start*
+    // shows a much larger TTFT ratio than token ratio. Saying which it is
+    // saves the reader the arithmetic, and points at a different fix.
+    const ttftRatio = fastestTtft > 0 && slowest.mean_ttft_s != null
+      ? slowest.mean_ttft_s / fastestTtft : null;
+    if (ttftRatio != null && ttftRatio >= 1.2) {
+      if (ttftRatio >= spread * 1.5) {
+        bits.push(
+          `Its time to first token is ${fmtNum(ttftRatio, 1)}× — a wider gap than the per-token one, ` +
+          'so most of the difference is in getting started (queueing, prefill, or the hop to it) ' +
+          'rather than in how fast it generates once running.');
+      } else if (spread >= ttftRatio * 1.5) {
+        bits.push(
+          `Its time to first token is only ${fmtNum(ttftRatio, 1)}×, so it starts comparably and ` +
+          'the difference is in generation speed itself.');
+      } else {
+        bits.push(
+          `Its time to first token is ${fmtNum(ttftRatio, 1)}× — a similar gap, so it is slower ` +
+          'both to start and to generate.');
+      }
+    }
   } else if (timed.length > 1) {
     bits.push('The deployments are within ~20% of each other per output token over this window.');
   }
   if (timed.some((s) => s.measured < 20)) {
     bits.push('Rows marked thin rest on fewer than 20 timed completions — treat them as a hint, not a measurement.');
   }
-  bits.push('Mean over completions that finished inside the selected range, prefill included — ' +
-            'a cold prefill on a distant box inflates this as much as slow decode does.');
+  if (timed.some((s) => s.mean_ttft_s == null)) {
+    bits.push('TTFT reads "not recorded" for any window predating the collector that captures it per deployment.');
+  }
+  bits.push('Both figures are means over completions that finished inside the selected range. ' +
+            'ms/token is prefill-inclusive; TTFT is the prefill on its own.');
   $('lb-latency-note').textContent = bits.join(' ');
 }
 

@@ -94,6 +94,8 @@ CREATE TABLE IF NOT EXISTS litellm_deployments (
   state       REAL,
   lpot_sum    REAL,
   lpot_count  REAL,
+  ttft_sum    REAL,
+  ttft_count  REAL,
   PRIMARY KEY (ts, model_id)
 );
 CREATE INDEX IF NOT EXISTS litellm_deployments_ts ON litellm_deployments(ts);
@@ -112,7 +114,7 @@ LL_COLS = ["ts", "epoch", "requests_total", "requests_failed", "in_flight",
 
 LL_DEP_COLS = ["ts", "model_id", "epoch", "api_base", "model_name", "requests",
                "success", "failure", "cooled_down", "state", "lpot_sum",
-               "lpot_count", "n"]
+               "lpot_count", "ttft_sum", "ttft_count", "n"]
 
 
 def parse_prom(text):
@@ -212,6 +214,8 @@ class Collector:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        self._add_missing_columns("litellm_deployments",
+                                  (("ttft_sum", "REAL"), ("ttft_count", "REAL")))
         self.db.commit()
         self.slot_prev = {}
         self.metrics_ok = True
@@ -228,6 +232,17 @@ class Collector:
         ).fetchone()
         self.epoch = int(row[0]) if row else 0
         self.last_decode = row[1] if row else None
+
+    def _add_missing_columns(self, table, columns):
+        """CREATE TABLE IF NOT EXISTS silently does nothing to a table that already
+        exists, so columns added in a later version never appear on a database
+        carried across an upgrade. Rows written before the upgrade keep NULL in
+        the new columns, which readers must treat as "not recorded" rather than
+        zero."""
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
+        for name, decl in columns:
+            if name not in have:
+                self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, decl))
 
     def get(self, path, timeout=None):
         # /metrics and /slots are answered off llama-server's task queue, so under heavy
@@ -436,6 +451,14 @@ class Collector:
                 acc(d, "lpot_sum", value)
             elif name == "litellm_deployment_latency_per_output_token_count":
                 acc(d, "lpot_count", value)
+            # TTFT is one of the few proxy-level histograms carrying model_id,
+            # which makes it per-deployment for free. It separates "slow to
+            # start" from "slow to stream" — latency per output token alone
+            # cannot, because it amortises prefill over the whole response.
+            elif name == "litellm_llm_api_time_to_first_token_metric_sum":
+                acc(d, "ttft_sum", value)
+            elif name == "litellm_llm_api_time_to_first_token_metric_count":
+                acc(d, "ttft_count", value)
 
         # A restarted proxy zeroes every counter. Detect it from the process
         # start time rather than from counters going backwards: the deployment
@@ -465,11 +488,12 @@ class Collector:
             self.db.execute(
                 "INSERT OR REPLACE INTO litellm_deployments(ts,model_id,epoch,"
                 "api_base,model_name,requests,success,failure,cooled_down,state,"
-                "lpot_sum,lpot_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "lpot_sum,lpot_count,ttft_sum,ttft_count)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, mid, self.litellm_epoch, d.get("api_base"), d.get("model_name"),
                  d.get("requests"), d.get("success"), d.get("failure"),
                  d.get("cooled_down"), d.get("state"), d.get("lpot_sum"),
-                 d.get("lpot_count")))
+                 d.get("lpot_count"), d.get("ttft_sum"), d.get("ttft_count")))
         self.db.commit()
         return None
 
@@ -608,7 +632,8 @@ def make_handler(db_path):
                         "SELECT MAX(ts), model_id, MAX(epoch), MAX(api_base),"
                         " MAX(model_name), MAX(requests), MAX(success),"
                         " MAX(failure), MAX(cooled_down), MAX(state),"
-                        " MAX(lpot_sum), MAX(lpot_count), COUNT(*)"
+                        " MAX(lpot_sum), MAX(lpot_count), MAX(ttft_sum),"
+                        " MAX(ttft_count), COUNT(*)"
                         " FROM litellm_deployments WHERE ts>=? AND ts<=?"
                         " GROUP BY CAST((ts-?)/? AS INTEGER), model_id ORDER BY 1",
                         (t0, t1, t0, width)).fetchall()
