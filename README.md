@@ -47,6 +47,8 @@ Zero runtime dependencies. Node ≥ 18.
 
 ### Usage tab (reconciled)
 
+![Usage tab: reconciled token totals, hermes share of engine, and reconciled tokens over time](docs/screenshots/usage.png)
+
 - **Reconciled totals** — one total for the window, split into hermes'
   own tokens and the residual from other clients on the endpoint, with a
   `Total / Split` hero toggle
@@ -78,6 +80,8 @@ Zero runtime dependencies. Node ≥ 18.
 
 ### Hermes tab
 
+![Hermes tab: totals, gateway activity, token counts over time, usage by model, and recent sessions](docs/screenshots/hermes.png)
+
 - **Token counts over time** — stacked daily token columns, switchable
   between **By type** (input / output / reasoning, cache reads in the tooltip)
   and **By profile** (one segment per profile, tail folded into "Other").
@@ -93,6 +97,8 @@ Zero runtime dependencies. Node ≥ 18.
 - **Recent sessions** — latest activity with model and token counts
 
 ### Load balancing tab (LiteLLM)
+
+![Load balancing tab: requests routed, latency, routing share and per-deployment health](docs/screenshots/load-balancing.png)
 
 Hidden unless a LiteLLM proxy is enabled under Setup → Load balancing. A
 proxy is a *router*, not a worker: the tokens it counts are the same tokens
@@ -139,6 +145,8 @@ when they're missing:
   credential this app holds besides the hermes one
 
 ### Engine tab
+
+![Engine tab: live throughput, prompt cache reuse, slots, and recorded throughput](docs/screenshots/engine.png)
 
 - **Live panel** — prefill and generation throughput (both a short live
   reading off `/slots` progress and a settled on-completion figure from
