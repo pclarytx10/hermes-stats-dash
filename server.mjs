@@ -2196,7 +2196,11 @@ function applySettings(body) {
     delete config.comparator
   } else if (body.comparator && typeof body.comparator === 'object') {
     const c = body.comparator
-    const rate = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null)
+    // Blank is "not given", not zero — Number('') would otherwise price it at $0.
+    const rate = (v) =>
+      v != null && String(v).trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0
+        ? Number(v)
+        : null
     const model = String(c.model || '').trim()
     const input = rate(c.input_per_m)
     const output = rate(c.output_per_m)

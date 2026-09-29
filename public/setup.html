@@ -156,6 +156,20 @@
 
   .ll-row2 { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; margin-bottom: 14px; }
   @media (max-width: 520px) { .ll-row2 { grid-template-columns: 1fr; } }
+
+  .cmp-rates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+  @media (max-width: 520px) { .cmp-rates { grid-template-columns: 1fr; } }
+  .cmp-rates .field { margin: 0; }
+  .price-in { position: relative; }
+  .price-in::before {
+    content: '$'; position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+    color: var(--text-muted); pointer-events: none;
+  }
+  .field .price-in input[type="number"] {
+    width: 100%; padding: 8px 10px 8px 22px; border-radius: 8px;
+    border: 1px solid var(--baseline); background: var(--page);
+    color: var(--text-primary); font: inherit; font-variant-numeric: tabular-nums;
+  }
 </style>
 </head>
 <body>
@@ -292,6 +306,43 @@
   </div>
 
   <div class="card">
+    <h2>Cost-avoidance comparator</h2>
+    <div class="hint" style="margin-bottom:12px">
+      The hosted model the Usage tab's <strong>Cost avoided</strong> tile prices
+      hermes' engine-hosted tokens against. It's a list-price comparison only.
+      It leaves out power, hardware and operator time, and it doesn't mean the
+      two models give the same quality.
+    </div>
+
+    <div class="field">
+      <label for="cmp-model">Model name</label>
+      <input type="text" id="cmp-model" placeholder="Gemini 3.5 Flash" spellcheck="false" />
+    </div>
+
+    <div class="cmp-rates">
+      <div class="field">
+        <label for="cmp-input">Input / 1M</label>
+        <div class="price-in"><input type="number" id="cmp-input" min="0" step="0.01" inputmode="decimal" /></div>
+      </div>
+      <div class="field">
+        <label for="cmp-output">Output / 1M</label>
+        <div class="price-in"><input type="number" id="cmp-output" min="0" step="0.01" inputmode="decimal" /></div>
+      </div>
+      <div class="field">
+        <label for="cmp-cached">Cached input / 1M <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+        <div class="price-in"><input type="number" id="cmp-cached" min="0" step="0.01" inputmode="decimal" /></div>
+      </div>
+    </div>
+    <div class="hint" id="cmp-state" style="margin:-4px 0 14px"></div>
+
+    <div class="actions">
+      <button id="cmp-save-btn" class="primary">Save</button>
+      <button id="cmp-reset-btn" hidden>Reset to default</button>
+      <span class="save-note" id="cmp-save-note"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Current state</h2>
     <div class="state-line" id="state-line">Loading…</div>
     <div style="margin-top:8px">
@@ -351,7 +402,67 @@ async function loadSettings() {
     loadEngines(settings.engines);
   }
   loadLitellm(settings.litellm);
+  if (!comparatorLoaded) {
+    comparatorLoaded = true;
+    loadComparator(settings.comparator);
+  }
 }
+
+// ── Cost-avoidance comparator ────────────────────────────────────────
+let comparatorLoaded = false;
+
+function loadComparator(c) {
+  if (!c) return;
+  $('cmp-model').value = c.model;
+  $('cmp-input').value = c.input_per_m;
+  $('cmp-output').value = c.output_per_m;
+  $('cmp-cached').value = c.cached_input_per_m;
+  $('cmp-state').textContent = c.is_default
+    ? `Default: published list price, checked ${c.verified} (${c.source}).`
+    : 'Custom rates from your config file. Reset to go back to the published default.';
+  $('cmp-reset-btn').hidden = !!c.is_default;
+}
+
+async function postComparator(body, note) {
+  const res = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const r = await res.json();
+  if (r.error) { note.className = 'save-note fail'; note.textContent = r.error; return; }
+  note.className = 'save-note ok'; note.textContent = 'Saved';
+  loadComparator(r.settings.comparator);
+}
+
+$('cmp-save-btn').addEventListener('click', async () => {
+  const btn = $('cmp-save-btn');
+  btn.disabled = true;
+  const note = $('cmp-save-note');
+  note.textContent = '';
+  try {
+    await postComparator({ comparator: {
+      model: $('cmp-model').value.trim(),
+      input_per_m: $('cmp-input').value,
+      output_per_m: $('cmp-output').value,
+      cached_input_per_m: $('cmp-cached').value,
+    } }, note);
+  } catch (err) {
+    note.className = 'save-note fail'; note.textContent = String(err?.message || err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('cmp-reset-btn').addEventListener('click', async () => {
+  const note = $('cmp-save-note');
+  note.textContent = '';
+  try {
+    await postComparator({ resetComparator: true }, note);
+  } catch (err) {
+    note.className = 'save-note fail'; note.textContent = String(err?.message || err);
+  }
+});
 
 // ── LiteLLM ──────────────────────────────────────────────────────────
 function loadLitellm(ll) {
