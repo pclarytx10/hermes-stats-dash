@@ -410,7 +410,7 @@ forget cached tokens. Saved settings take precedence over the environment:
 
 ### Engines (Engine and Usage tabs)
 
-A **list** — the real deployment this was built for has two llama.cpp
+A **list** — the real deployment this was built for has three llama.cpp
 servers with different models, builds, and context sizes. Each entry:
 
 ```json
@@ -424,6 +424,10 @@ servers with different models, builds, and context sizes. Each entry:
     { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B Q6",
       "llamaUrl": "http://10.0.0.66:8081",
       "collectorUrl": "http://10.0.0.66:8082",
+      "models": ["Qwen3.8_27B_Q6"] },
+    { "id": "ds5975wx",  "label": "ds5975wx · Qwen3.8-27B Q6",
+      "llamaUrl": "http://10.0.0.212:8081",
+      "collectorUrl": "http://10.0.0.212:8082",
       "models": ["Qwen3.8_27B_Q6"] }
   ]
 }
@@ -545,10 +549,13 @@ python3 ~/llamacpp-telemetry/collect.py \
 ```
 
 `--server` and `--port` assume llama-server on `:8080` and the collector on
-`:8081`, which are only defaults — **both hosts in the example config above
-have moved off them**: mini795s7 runs open-webui on `:8080`, so llama-server
+`:8081`, which are only defaults — **every host in the example config above
+has moved off them**: mini795s7 runs open-webui on `:8080`, so llama-server
 took `:8081` and the collector `:8082`, and nfcmini was later shifted the same
-way. Read a host's actual ports out of its unit
+way. ds5975wx follows the same layout — llama-server on `:8081` (a system
+unit, `llamacpp.service`), the collector on `:8082` — but its llama-server
+first came up on `:8082`, so the collector briefly ran on `:8083` until the
+move. Read a host's actual ports out of its unit
 (`systemctl --user cat llamacpp-telemetry.service`, `ss -ltnp`) rather than
 assuming. When llama-server moves, `--server` has to follow: a collector left
 pointing at the old port records failed samples (`down:` in its journal) and
