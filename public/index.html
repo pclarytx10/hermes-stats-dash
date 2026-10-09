@@ -2277,6 +2277,8 @@ function lbRenderDeployments(payload) {
 let lbHist = null;             // {cols, dep_cols, bucket, from, to, rows, dep_rows}
 let lbHistSpan = 900;
 let lbHistLoaded = false;
+let lbHistTimer = null;
+const LB_HIST_POLL_MS = 15000;
 let lbHasCollector = null;
 
 /**
@@ -2649,10 +2651,12 @@ function setLbSpanButtons(span) {
     b.setAttribute('aria-pressed', String(b.dataset.span === String(span))));
 }
 
-async function loadLbHistory(span) {
+// `silent` is the background refresh: no "loading…" flash, and a failed fetch
+// keeps what is already drawn instead of blanking the card.
+async function loadLbHistory(span, silent = false) {
   lbHistSpan = span;
   setLbSpanButtons(span);
-  $('lb-hist-note').textContent = 'loading…';
+  if (!silent) $('lb-hist-note').textContent = 'loading…';
   try {
     let from, to;
     if (span === 'all') {
@@ -2668,9 +2672,11 @@ async function loadLbHistory(span) {
     const res = await fetch(`/api/litellm/history?from=${from}&to=${to}&points=400`);
     const j = await res.json();
     if (j.error) throw new Error(j.error);
+    if (span !== lbHistSpan) return;   // range changed while this was in flight
     lbHist = j;
     renderLbHistSummary();
   } catch (err) {
+    if (silent || span !== lbHistSpan) return;
     lbHist = null;
     renderLbHistSummary();
     $('lb-hist-note').textContent = String(err?.message || err);
@@ -2778,11 +2784,16 @@ function startLbPoll() {
       'to get recorded history.';
   } else {
     renderLbHistSummary();
+    if (lbHasCollector !== false) loadLbHistory(lbHistSpan, true);
   }
   lbPollTimer = setInterval(pollLbLive, LB_POLL_MS);
+  lbHistTimer = setInterval(() => {
+    if (lbHasCollector !== false) loadLbHistory(lbHistSpan, true);
+  }, LB_HIST_POLL_MS);
 }
 function stopLbPoll() {
   if (lbPollTimer) { clearInterval(lbPollTimer); lbPollTimer = null; }
+  if (lbHistTimer) { clearInterval(lbHistTimer); lbHistTimer = null; }
 }
 
 // ── Engine tab ──────────────────────────────────────────────────────
