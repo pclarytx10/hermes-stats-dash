@@ -498,16 +498,19 @@ class Collector:
         return None
 
     def run(self):
-        self.read_props()
+        if self.base:
+            self.read_props()
         last_err = None
         was_metrics = self.metrics_ok
         next_props = time.time() + 600
         while True:
             start = time.time()
-            try:
-                err = self.poll()
-            except Exception as e:                      # never let the loop die
-                err = "collector error: %s" % e
+            err = None
+            if self.base:
+                try:
+                    err = self.poll()
+                except Exception as e:                  # never let the loop die
+                    err = "collector error: %s" % e
             if self.litellm:
                 # Same cadence, same loop, separate tables: a LiteLLM outage
                 # must not stop llama-server sampling, and the llama-server
@@ -521,7 +524,7 @@ class Collector:
             # Capability and model identity are not fixed for the life of the
             # process: the server can be restarted with different flags or a
             # different model under us. Re-read on any change, and periodically.
-            if self.metrics_ok != was_metrics or start >= next_props:
+            if self.base and (self.metrics_ok != was_metrics or start >= next_props):
                 was_metrics = self.metrics_ok
                 next_props = start + 600
                 self.read_props()
@@ -655,7 +658,10 @@ def make_handler(db_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=os.path.expanduser("~/llamacpp-telemetry/telemetry.db"))
-    ap.add_argument("--server", default="http://127.0.0.1:8080")
+    ap.add_argument("--server", default="http://127.0.0.1:8080",
+                    help="llama-server base URL. Pass an empty string, with "
+                         "--litellm, for a LiteLLM-only collector on a host "
+                         "that runs no engine.")
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--port", type=int, default=8081)
@@ -676,6 +682,9 @@ def main():
     litellm_key = (a.litellm_key or os.environ.get("LITELLM_API_KEY")
                    or os.environ.get("LITELLM_MASTER_KEY", ""))
 
+    if not a.server and not a.litellm:
+        ap.error("--server '' needs --litellm: nothing left to collect")
+
     os.makedirs(os.path.dirname(a.db), exist_ok=True)
     c = Collector(a.db, a.server, a.interval, a.timeout,
                   litellm=a.litellm or None, litellm_key=litellm_key)
@@ -684,7 +693,7 @@ def main():
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print("polling %s every %.1fs -> %s ; api on %s:%d"
-          % (a.server, a.interval, a.db, a.bind, a.port), flush=True)
+          % (a.server or "no engine", a.interval, a.db, a.bind, a.port), flush=True)
     if a.litellm:
         print("also polling litellm %s%s"
               % (a.litellm, "" if litellm_key else " (no key — /metrics is "

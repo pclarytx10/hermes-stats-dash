@@ -596,6 +596,13 @@ proxy's `/metrics/` on the same interval, into its own tables
 (`/litellm/range`, `/litellm/history`). Only the host that runs the proxy
 needs the flag; other hosts run the identical file without it.
 
+**LiteLLM-only host.** When the proxy runs somewhere with no engine on it (a
+container, say), pass `--server ""` together with `--litellm`. The collector
+then skips the llama-server poll entirely instead of logging an engine failure
+every interval, and `/range` stays empty while `/litellm/range` fills. The
+engines keep their own collectors. `--server ""` without `--litellm` is
+refused, since there would be nothing to collect.
+
 The key comes from the environment in preference to `--litellm-key`, because
 an argument is visible in `ps(1)` to every user on the box. Both
 `LITELLM_API_KEY` and `LITELLM_MASTER_KEY` are read — the latter is the name
