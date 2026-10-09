@@ -2801,6 +2801,8 @@ let engineList = [];
 let currentEngineId = null;
 let enginePollTimer = null;
 const ENGINE_POLL_MS = 4000;
+const ENGINE_HIST_POLL_MS = 15000;
+let engineHistTimer = null;
 const ENGINE_MAXCOLS = 160;
 
 // Per-engine running series, rebuilt from scratch on engine switch or a
@@ -3273,11 +3275,15 @@ function setHistSpanButtons(span) {
     b.setAttribute('aria-pressed', String(b.dataset.span === String(span))));
 }
 
-async function loadEngineHistory(span) {
+// `silent` is the background refresh: no "loading…" flash, and a failed fetch
+// keeps what is already drawn instead of blanking the card.
+async function loadEngineHistory(span, silent = false) {
   engineHistSpan = span;
   setHistSpanButtons(span);
   if (!currentEngineId) return;
-  $('engine-hist-note').textContent = 'loading…';
+  const id = currentEngineId;
+  const stale = () => id !== currentEngineId || span !== engineHistSpan;
+  if (!silent) $('engine-hist-note').textContent = 'loading…';
   try {
     let from, to;
     if (span === 'all') {
@@ -3293,11 +3299,13 @@ async function loadEngineHistory(span) {
     const res = await fetch(`/api/engine/history?engine=${encodeURIComponent(currentEngineId)}&from=${from}&to=${to}&points=400`);
     const j = await res.json();
     if (j.error) throw new Error(j.error);
+    if (stale()) return;   // engine or range changed while this was in flight
     engineHist = j;
     engineHistCols = {};
     (j.cols || []).forEach((name, i) => { engineHistCols[name] = i; });
     renderEngineHistSummary();
   } catch (err) {
+    if (silent || stale()) return;
     engineHist = null;
     $('engine-hist-note').textContent = String(err?.message || err);
     renderEngineHistSummary();
@@ -3420,12 +3428,16 @@ function startEnginePoll() {
   if (engineHistLoadedFor !== currentEngineId) {
     engineHistLoadedFor = currentEngineId;
     loadEngineHistory(engineHistSpan);
+  } else {
+    loadEngineHistory(engineHistSpan, true);   // stale after time on another tab
   }
   pollEngineLive();
   enginePollTimer = setInterval(pollEngineLive, ENGINE_POLL_MS);
+  engineHistTimer = setInterval(() => loadEngineHistory(engineHistSpan, true), ENGINE_HIST_POLL_MS);
 }
 function stopEnginePoll() {
   if (enginePollTimer) { clearInterval(enginePollTimer); enginePollTimer = null; }
+  if (engineHistTimer) { clearInterval(engineHistTimer); engineHistTimer = null; }
 }
 
 // ── Engine health badge ──────────────────────────────────────────────
