@@ -155,20 +155,25 @@ when they're missing:
 
 ### Engine tab
 
-![Engine tab: live throughput, prompt cache reuse, slots, and recorded throughput](docs/screenshots/engine.png)
+![Engine tab: live throughput, prompt cache reuse, slots, recorded throughput, and context in use](docs/screenshots/engine.png)
 
 - **Live panel** — prefill and generation throughput (both a short live
   reading off `/slots` progress and a settled on-completion figure from
   `/metrics` counters), prompt-cache reuse, server state (idle / prefilling
   / generating / queued), a per-slot table, and an endpoint + model identity
-  line (URL, model file, build, `n_ctx`)
+  line (URL, model file, build, `n_ctx`). A busy slot shows prompt progress
+  and cache reuse; an idle one shows the tokens it still holds from its last
+  request ("74.6K in cache"), kept for prefix reuse
 - **History panel** — a range picker (15m/1h/6h/24h/7d/all) over data the
   collector has recorded, a canvas strip chart, a window summary (average
-  throughput, token volumes, mean busy slots, sample coverage), a recorded
-  context-in-use chart on the same range (KV-cache tokens summed across
-  slots, in-flight vs. idle-cached), and a CSV export. Context history
-  starts when the collector is upgraded; earlier buckets show as a gap. A server restart mid-window renders as a break, not a false spike;
+  throughput, token volumes, mean busy slots, sample coverage), and a CSV
+  export. A server restart mid-window renders as a break, not a false spike;
   a collector outage renders as a visible gap, not a silent zero
+- **Context in use** — inside the History panel, on the same range: KV-cache
+  tokens summed across slots per bucket, stacked in-flight vs. idle-cached,
+  with the window average, busiest poll and share of total `n_ctx`. Context
+  history starts when the collector is upgraded to record it; earlier
+  buckets show as a gap
 - **Multi-engine** — an engine picker when more than one is configured;
   switching discards in-memory state, since neither counters nor epochs are
   comparable across endpoints
@@ -176,7 +181,11 @@ when they're missing:
   omit prompt-token fields entirely, some report `next_token` as a
   one-element array instead of an object. The server feature-detects both
   per poll and the UI says so (e.g. "Unavailable: this build's `/slots` does
-  not report `n_prompt_tokens_cache`") rather than silently showing a zero
+  not report `n_prompt_tokens_cache`") rather than silently showing a zero.
+  Builds also disagree on `n_prompt_tokens`: older ones report the prompt
+  size, newer ones (seen on b10711) grow it with every generated
+  token. The page and collector tell the two apart by whether it equals
+  cached + processed + decoded, so generated tokens aren't counted twice
 
 ### Engine health badge
 
