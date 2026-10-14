@@ -632,15 +632,6 @@
 
       <div class="card chart-card">
         <div class="card-head">
-          <h2>Context in use</h2>
-          <div class="legend" id="engine-ctx-legend"></div>
-        </div>
-        <canvas id="engine-ctx" class="engine-strip-canvas"></canvas>
-        <div class="engine-sub" id="engine-ctx-note"></div>
-      </div>
-
-      <div class="card chart-card">
-        <div class="card-head">
           <h2>Recorded throughput</h2>
           <div class="legend" id="engine-hist-legend"></div>
         </div>
@@ -2949,10 +2940,9 @@ let engineTaskPrompt = {};   // task id -> {cache, total}
 let engineTaskOrder = [];
 let engineReqCount = 0;
 let engineHasPromptFields = false;
-let engineCtx = [];          // [{t, active, idle, cap}] summed slot context per poll
 
 function resetEngineSeries() {
-  engineSamples = []; engineDeltas = []; engineSlotPrev = {}; engineCtx = [];
+  engineSamples = []; engineDeltas = []; engineSlotPrev = {};
   engineTaskPrompt = {}; engineTaskOrder = []; engineReqCount = 0;
 }
 
@@ -2975,6 +2965,25 @@ function tileEl(label, valueNode, sub, extraClass) {
     sub ? el('div', { class: 'sub', text: sub }) : null);
 }
 
+// Prompt / generated / context for one slot. Builds disagree on what
+// n_prompt_tokens means: older ones report the request's prompt size, newer
+// ones (seen on b10711) grow it with every generated token, so it already
+// includes n_decoded and adding the two double-counts the generation. Tell
+// them apart by whether it equals cache + processed + decoded, allowing a few
+// tokens of skew since the fields aren't read atomically. Mirrored by
+// collect.py's slot_tokens(); keep the two in step.
+const SLOT_TOKEN_SKEW = 64;
+function slotTokens(s) {
+  const nt = s.next_token || {};
+  const dec = firstNum([nt.n_decoded, s.n_decoded]);
+  const proc = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
+  const cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
+  const reported = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
+  const withDecoded = dec > 0 && Math.abs(reported - (cache + proc + dec)) <= SLOT_TOKEN_SKEW;
+  const prompt = withDecoded ? Math.max(0, reported - dec) : reported;
+  return { dec, proc, cache, prompt, context: typeof s.n_past === 'number' ? s.n_past : prompt + dec };
+}
+
 // Mirrors the standalone telemetry page's slot-progress reader: first
 // sighting of a slot only baselines it (a request already mid-flight would
 // otherwise dump its whole history into one interval); after that, a
@@ -2987,11 +2996,7 @@ function readSlots(slots, dt) {
   for (const s of slots) {
     const id = String(s.id);
     const task = s.id_task === undefined ? -1 : s.id_task;
-    const nt = s.next_token || {};
-    const dec = firstNum([nt.n_decoded, s.n_decoded]);
-    const proc = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
-    const cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
-    const total = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
+    const { dec, proc, cache, prompt: total } = slotTokens(s);
     const p = engineSlotPrev[id];
     const sameTask = p && p.task === task;
     const dDec = !p ? 0 : (sameTask ? Math.max(0, dec - p.decoded) : dec);
@@ -3049,11 +3054,6 @@ function ingestEngineLive(payload) {
   const dtPrev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
   const dt = dtPrev ? (now - dtPrev.t) / 1000 : 0;
   const live = readSlots(payload.slots, dt);
-  const ctxRow = readSlotContext(payload.slots);
-  if (ctxRow) {
-    engineCtx.push({ t: now, ...ctxRow });
-    if (engineCtx.length > ENGINE_MAXCOLS) engineCtx.shift();
-  }
   engineSamples.push({ t: now, m });
   if (engineSamples.length > ENGINE_MAXCOLS + 1) engineSamples.shift();
   if (dtPrev && dt > 0 && dtPrev.m && m) {
@@ -3157,7 +3157,6 @@ function renderEngineLive(payload, live) {
   $('engine-tiles').replaceChildren(...tiles);
   renderEngineSlots(payload.slots, payload.slots_error);
   drawEngineStrip();
-  renderEngineContext();
 
   $('engine-strip-legend').replaceChildren(
     el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
@@ -3181,11 +3180,7 @@ function renderEngineSlots(slots, slotsError) {
     el('th', { class: 'num', text: 'Decoded' }), el('th', { class: 'num', text: 'Context' }));
   const rows = slots.map((s) => {
     const busy = !!s.is_processing;
-    const nt = s.next_token || {};
-    const dec = nt.n_decoded || 0;
-    const total = s.n_prompt_tokens || 0;
-    const cache = s.n_prompt_tokens_cache || 0;
-    const proc = s.n_prompt_tokens_processed || 0;
+    const { dec, cache, proc, prompt: total } = slotTokens(s);
     const done = Math.min(total, cache + proc);
     const pct = total > 0 ? 100 * done / total : 0;
     const state = !busy ? 'idle' : (dec > 0 ? 'generating' : 'prefilling');
@@ -3210,53 +3205,11 @@ function renderEngineSlots(slots, slotsError) {
   holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
 }
 
-// Context a slot holds = tokens in its KV cache. n_past is exact where the
-// build reports it; otherwise prompt + decoded is the same figure. Idle slots
-// keep their last request's cache (reused for prefix matching), so they're
-// summed separately rather than dropped. null when the build exposes neither.
-function readSlotContext(slots) {
-  if (!Array.isArray(slots) || !slots.length) return null;
-  let active = 0, idle = 0, cap = 0, known = false;
-  for (const s of slots) {
-    cap += Number(s.n_ctx) || 0;
-    let used = null;
-    if (typeof s.n_past === 'number') used = s.n_past;
-    else if (engineHasPromptFields) {
-      const nt = s.next_token || {};
-      used = firstNum([s.n_prompt_tokens, s.prompt_tokens]) + firstNum([nt.n_decoded, s.n_decoded]);
-    }
-    if (used === null) continue;
-    known = true;
-    if (s.is_processing) active += used; else idle += used;
-  }
-  return known ? { active, idle, cap } : null;
-}
-
-function renderEngineContext() {
-  const c = $('engine-ctx');
-  drawContextCanvas(c, engineCtx, { cols: ENGINE_MAXCOLS });
-  $('engine-ctx-legend').replaceChildren(
-    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'In-flight' })),
-    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1);opacity:.35' }), el('span', { text: 'Idle (cached)' })));
-  const last = engineCtx[engineCtx.length - 1];
-  if (!last) {
-    $('engine-ctx-note').textContent = "this build's /slots reports neither n_past nor prompt token counts — context can't be summed";
-    return;
-  }
-  const total = last.active + last.idle;
-  const peak = Math.max(...engineCtx.map((r) => r.active + r.idle));
-  const pct = (v) => last.cap > 0 ? ` (${fmtNum(100 * v / last.cap, 0)}%)` : '';
-  $('engine-ctx-note').textContent =
-    `now ${fmtFull(total)} tokens${pct(total)} · ${fmtFull(last.active)} in-flight · peak ${fmtFull(peak)}${pct(peak)}` +
-    (last.cap > 0 ? ` · capacity ${fmtFull(last.cap)}` : '') +
-    ` · ${engineCtx.length} reading${engineCtx.length === 1 ? '' : 's'}, ${ENGINE_POLL_MS / 1000}s apart`;
-}
-
 // Stacked area: in-flight context solid, idle-cached context faded above it.
 // Y scales to the window's peak, not capacity, so small loads stay visible.
 // A null row is a gap (nothing recorded) and breaks the area there.
-// opt.cols sets the column spacing (the live chart fills right-to-left toward
-// ENGINE_MAXCOLS); opt.labels are time ticks, as on the throughput strips.
+// opt.cols sets the column spacing (a short series fills right-to-left);
+// opt.labels are time ticks, as on the throughput strips.
 function drawContextCanvas(c, rows, opt) {
   opt = opt || {};
   if (!c.isConnected || c.clientWidth === 0) return;
@@ -3408,7 +3361,6 @@ window.addEventListener('resize', () => {
   if (activeTab === 'lb' && !$('lb-content').hidden) { drawLbHistStrip(); return; }
   if (activeTab !== 'engine' || $('engine-content').hidden) return;
   drawEngineStrip();
-  drawContextCanvas($('engine-ctx'), engineCtx, { cols: ENGINE_MAXCOLS });
   drawEngineHistStrip();
 });
 

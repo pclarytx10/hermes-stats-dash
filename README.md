@@ -160,13 +160,13 @@ when they're missing:
 - **Live panel** — prefill and generation throughput (both a short live
   reading off `/slots` progress and a settled on-completion figure from
   `/metrics` counters), prompt-cache reuse, server state (idle / prefilling
-  / generating / queued), a per-slot table, a context-in-use chart (KV-cache
-  tokens summed across slots, in-flight vs. idle-cached), and an endpoint +
-  model identity line (URL, model file, build, `n_ctx`)
+  / generating / queued), a per-slot table, and an endpoint + model identity
+  line (URL, model file, build, `n_ctx`)
 - **History panel** — a range picker (15m/1h/6h/24h/7d/all) over data the
   collector has recorded, a canvas strip chart, a window summary (average
   throughput, token volumes, mean busy slots, sample coverage), a recorded
-  context-in-use chart on the same range, and a CSV export. Context history
+  context-in-use chart on the same range (KV-cache tokens summed across
+  slots, in-flight vs. idle-cached), and a CSV export. Context history
   starts when the collector is upgraded; earlier buckets show as a gap. A server restart mid-window renders as a break, not a false spike;
   a collector outage renders as a visible gap, not a silent zero
 - **Multi-engine** — an engine picker when more than one is configured;
