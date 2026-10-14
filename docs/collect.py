@@ -234,6 +234,30 @@ def next_tok(slot):
     return nt if isinstance(nt, dict) else {}
 
 
+# Fields aren't read atomically, so a total that should equal a sum can be off
+# by a few tokens.
+SLOT_TOKEN_SKEW = 64
+
+
+def slot_tokens(slot):
+    """Context one slot holds, or None when the build doesn't say. Mirror of the
+    page's slotTokens(); keep the two in step. Builds disagree on n_prompt_tokens:
+    older ones report the prompt size, newer ones (seen on b10711) grow it with
+    every generated token, so it already includes n_decoded. Tell them apart by
+    whether it equals cache + processed + decoded."""
+    if isinstance(slot.get("n_past"), (int, float)):
+        return slot["n_past"]
+    reported = slot.get("n_prompt_tokens", slot.get("prompt_tokens"))
+    if not isinstance(reported, (int, float)):
+        return None
+    dec = next_tok(slot).get("n_decoded") or 0
+    proc = slot.get("n_prompt_tokens_processed") or 0
+    cache = slot.get("n_prompt_tokens_cache") or 0
+    if dec > 0 and abs(reported - (cache + proc + dec)) <= SLOT_TOKEN_SKEW:
+        return reported
+    return reported + dec
+
+
 class Collector:
     def __init__(self, db_path, base, interval, timeout, litellm=None, litellm_key=None):
         self.base = base.rstrip("/")
@@ -347,20 +371,17 @@ class Collector:
 
     @staticmethod
     def slot_context(slots):
-        """Mirror of the page's readSlotContext: tokens held in each slot's KV
-        cache, summed separately for slots mid-request and idle ones (which keep
-        their last prompt for prefix reuse). n_past where the build reports it,
-        else prompt + decoded. (None, None, cap) when neither is exposed."""
+        """Mirror of the page's history context: tokens held in each slot's KV
+        cache (slot_tokens), summed separately for slots mid-request and idle
+        ones (which keep their last prompt for prefix reuse). (None, None, cap)
+        when the build reports neither n_past nor prompt token counts."""
         active = idle = cap = 0.0
         known = False
         for s in slots:
             cap += s.get("n_ctx") or 0
-            used = s.get("n_past")
-            if not isinstance(used, (int, float)):
-                total = s.get("n_prompt_tokens", s.get("prompt_tokens"))
-                if not isinstance(total, (int, float)):
-                    continue
-                used = total + (next_tok(s).get("n_decoded") or 0)
+            used = slot_tokens(s)
+            if used is None:
+                continue
             known = True
             if s.get("is_processing"):
                 active += used
