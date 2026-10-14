@@ -1144,7 +1144,7 @@ const DEPLOYMENT_STATES = { 0: 'healthy', 1: 'partial_outage', 2: 'outage' }
  * The Load balancing tab's live source. One deployment's `model_id` is the
  * `model_info.id` an operator wrote in LiteLLM's config; when that happens to
  * match a configured engine id — which is the sane way to name them — the
- * engine's label and llama_url are joined on so the tab can say "nfcmini"
+ * engine's label and llama_url are joined on so the tab can say "my-engine"
  * rather than "the thing at 127.0.0.1:8081".
  */
 async function buildLitellmLive(ll) {
