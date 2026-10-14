@@ -366,6 +366,9 @@
   /* Only past 2x, where the gap stops being noise and starts being a reason
      to look at the box. */
   .lb-lat-slow { color: var(--critical); font-weight: 600; }
+  #lb-clients { overflow-x: auto; }
+  #lb-clients table { min-width: 620px; }
+  #lb-clients .cell-sub { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -585,6 +588,12 @@
         <div style="margin-top:10px">
           <button class="toggle-btn" id="lb-hist-csv" type="button">Export CSV</button>
         </div>
+      </div>
+
+      <div class="card chart-card">
+        <h2>Top clients</h2>
+        <div id="lb-clients"></div>
+        <div class="engine-sub" id="lb-clients-note"></div>
       </div>
     </div>
   </div>
@@ -2072,7 +2081,10 @@ function lbResetSeries() {
 function lbSnapshot(payload) {
   const m = new Map();
   for (const d of payload.deployments || []) m.set(d.model_id, d.requests || 0);
+  const pc = new Map();
+  for (const c of payload.clients || []) pc.set(c.client, c.requests || 0);
   return {
+    perClient: pc,
     t: Date.now() / 1000,
     // Routed, not accepted: the live rate should describe work that reached a
     // box, not every call on the proxy's HTTP surface.
@@ -2669,6 +2681,7 @@ async function loadLbHistory(span, silent = false) {
       to = Date.now() / 1000;
       from = to - span;
     }
+    loadLbClients(span, from, to, silent);
     const res = await fetch(`/api/litellm/history?from=${from}&to=${to}&points=400`);
     const j = await res.json();
     if (j.error) throw new Error(j.error);
@@ -2681,6 +2694,111 @@ async function loadLbHistory(span, silent = false) {
     renderLbHistSummary();
     $('lb-hist-note').textContent = String(err?.message || err);
   }
+}
+
+// ── Load balancing: top clients ──────────────────────────────────────
+//
+// Who sent the traffic. LiteLLM labels its proxy request counters with
+// client_ip, user_agent and the API key (its token counters carry none of
+// them), so this is a request count per client. The recorded figures follow the
+// Recorded routing range; "peak" is the client's busiest bucket in it, which is
+// what ties a burst on the chart above to a sender. Live columns come from the
+// proxy's own counters and need no collector.
+let lbClients = null;          // collector answer for the current range
+let lbClientsError = null;
+
+// A minute is the useful resolution for a 15m/1h window; past that, 5 minutes
+// keeps a short burst visible without splitting it across buckets.
+const lbClientBucket = (span) => (span !== 'all' && span <= 3600 ? 60 : 300);
+
+async function loadLbClients(span, from, to, silent) {
+  try {
+    const res = await fetch(`/api/litellm/clients?from=${from}&to=${to}&bucket=${lbClientBucket(span)}`);
+    const j = await res.json();
+    if (span !== lbHistSpan) return;
+    if (j.error) throw new Error(j.error);
+    lbClients = j; lbClientsError = null;
+  } catch (err) {
+    if (silent && lbClients) return;
+    lbClients = null; lbClientsError = String(err?.message || err);
+  }
+  lbRenderClients();
+}
+
+function lbClientName(c) { return c.ip || 'unknown address'; }
+
+function lbRenderClients() {
+  const holder = $('lb-clients');
+  const live = lbLive?.clients || [];
+  const byKey = new Map();
+  const row = (c) => {
+    let r = byKey.get(c.client);
+    if (!r) {
+      r = { client: c.client, ip: c.ip, user_agent: c.user_agent, api_key: c.api_key,
+            range: null, failed: null, peak: null, peak_ts: null, live: null, since: null };
+      byKey.set(c.client, r);
+    }
+    return r;
+  };
+  for (const c of lbClients?.clients || []) {
+    Object.assign(row(c), { range: c.requests, failed: c.failed, peak: c.peak, peak_ts: c.peak_ts });
+  }
+  for (const c of live) {
+    const r = row(c);
+    r.live = c.requests;
+    if (lbFirst) r.since = Math.max(0, c.requests - (lbFirst.perClient.get(c.client) || 0));
+  }
+  const rows = [...byKey.values()].sort((a, b) =>
+    (b.range ?? -1) - (a.range ?? -1) || (b.since ?? -1) - (a.since ?? -1) || (b.live ?? 0) - (a.live ?? 0));
+
+  if (!rows.length) {
+    holder.replaceChildren(el('div', { class: 'empty', text: lbLive
+      ? 'No inference request has reached the proxy since it started.'
+      : 'Waiting for the proxy.' }));
+  } else {
+    const bucket = lbClients?.bucket || lbClientBucket(lbHistSpan);
+    const bucketText = bucket >= 300 ? `${Math.round(bucket / 60)} min` : `${Math.round(bucket)}s`;
+    const dash = '—';
+    const head = el('tr', {},
+      el('th', { text: 'Client' }), el('th', { text: 'API key' }),
+      el('th', { class: 'num', text: 'In range' }), el('th', { class: 'num', text: 'Failed' }),
+      el('th', { class: 'num', text: bucket === 60 ? 'Peak / min' : `Peak / ${bucketText}` }),
+      el('th', { class: 'num', text: 'Since opened' }),
+      el('th', { class: 'num', text: 'Since proxy start' }));
+    const key = (k) => (!k ? dash : k.length > 20 && /^[0-9a-f]+$/i.test(k) ? `${k.slice(0, 10)}…` : k);
+    const trs = rows.slice(0, 25).map((r) => el('tr', {},
+      el('td', {},
+        el('div', { class: 'cell-main', text: lbClientName(r) }),
+        el('div', { class: 'cell-sub', text: r.user_agent || 'no user agent', title: r.user_agent || '' })),
+      el('td', { class: 'cell-sub', text: key(r.api_key), title: r.api_key || '' }),
+      el('td', { class: 'num', text: r.range == null ? dash : fmtFull(r.range) }),
+      el('td', { class: 'num', text: r.failed ? fmtFull(r.failed) : dash }),
+      el('td', { class: 'num' },
+        el('span', { text: r.peak ? fmtFull(r.peak) : dash }),
+        r.peak && r.peak_ts ? el('div', { class: 'cell-sub', text: fmtWhen(r.peak_ts) }) : null),
+      el('td', { class: 'num', text: r.since == null ? dash : fmtFull(r.since) }),
+      el('td', { class: 'num', text: r.live == null ? dash : fmtFull(r.live) })));
+    holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...trs)));
+  }
+
+  const bits = [];
+  if (lbLive && lbLive.client_labels === false && live.length) {
+    bits.push('This proxy reports no client_ip or user_agent on its request counters — it predates those ' +
+              'labels, or prometheus_metrics_config drops them. Rows are split by API key only.');
+  }
+  if (lbHasCollector === false) {
+    bits.push('No collector is configured, so only the live columns are filled — "In range" and "Peak" need ' +
+              'docs/collect.py --litellm.');
+  } else if (lbClientsError) {
+    bits.push(`Recorded columns unavailable: ${lbClientsError}.`);
+  } else if (lbClients?.since && lbClients.since > lbClients.from) {
+    bits.push(`The collector started recording clients ${fmtWhen(lbClients.since)}; nothing before that is in "In range".`);
+  }
+  bits.push('Requests, not tokens: LiteLLM labels only its request counters by client. "Peak" is the client\'s ' +
+            'busiest bucket in the selected range — line it up with a burst on the chart above. The address is the ' +
+            'connection\'s peer: behind a reverse proxy every client reads as that proxy unless LiteLLM is set to ' +
+            'trust X-Forwarded-For. Traffic sent straight to a llama-server never passes the proxy and is not here.');
+  $('lb-clients-note').textContent = bits.join(' ');
 }
 
 document.querySelectorAll('.lb-range-btn').forEach((btn) => {
@@ -2763,6 +2881,7 @@ async function pollLbLive() {
   if (!lbFirst) lbFirst = snap;
   lbPrev = snap;
   lbHasCollector = !!payload.litellm?.has_collector;
+  lbRenderClients();
 }
 
 function applyLbVisibility() {

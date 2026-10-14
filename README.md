@@ -127,6 +127,15 @@ routing decision.
   Engine tab, over a per-deployment request-rate chart with a window summary
   and CSV export. A proxy restart breaks the line rather than spiking it, and
   a collector outage is shaded rather than drawn as zero
+- **Top clients** — who sent the traffic: requests per client (address,
+  user agent and API key, from LiteLLM's `client_ip` / `user_agent` /
+  `api_key_alias` labels) over the Recorded routing range, each client's
+  busiest minute (5 minutes past 1h) with its time — the number that ties a
+  burst on the chart to a sender — plus live since-opened and
+  since-proxy-start counts. Requests, not tokens: LiteLLM puts client labels
+  on its request counters only. The address is the connection's peer, so
+  behind a reverse proxy it is that proxy unless LiteLLM trusts
+  `X-Forwarded-For`; traffic sent straight to a llama-server never appears
 - **Named to match** — LiteLLM identifies a deployment by the `model_info.id`
   in its config. Where that id equals a configured engine's id, the rows are
   labelled with the engine's label, so the tab names the same hosts the
@@ -222,12 +231,16 @@ section on failure rather than failing the whole request.
 | `GET /api/litellm/live` | The Load balancing tab's live source. Fetches the proxy's `/metrics/` with the configured key, parses the Prometheus text **with labels** (unlike the engine routes — for LiteLLM the label set *is* the data), folds the label explosion down to one row per `model_id`, and joins each to a configured engine where the ids match. `{enabled: false}` when no proxy is configured, which is what hides the tab |
 | `GET /api/litellm/history?from=&to=&points=` | Validated, clamped proxy to the collector's `/litellm/history` |
 | `GET /api/litellm/range` | Proxy to the collector's `/litellm/range`, for the "all" range button |
+| `GET /api/litellm/clients?from=&to=&bucket=` | Proxy to the collector's `/litellm/clients`: requests and failures per client over the window, and each client's busiest bucket |
 | `POST /api/litellm/test` | Ad-hoc probe for the Setup page — metrics endpoint and collector reported separately, since either can be the broken one |
 
 LiteLLM emits every counter once per *(api key × team × user agent × client
 IP × …)* combination. Summing over everything but `model_id` is the whole
 reduction both here and in the collector: the load-balancing question is only
-ever "which box". Failures are the exception — they keep their
+ever "which box". The one exception is Top clients, which folds the proxy
+request counters the other way — over `model_id`, keeping client IP, user
+agent and key — into its own collector table, written only when a client's
+counters change. Failures are the exception — they keep their
 `exception_status`, because "which box is failing" is half the answer and
 "with what" is the other half.
 
