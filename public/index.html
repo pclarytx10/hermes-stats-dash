@@ -632,6 +632,15 @@
 
       <div class="card chart-card">
         <div class="card-head">
+          <h2>Context in use</h2>
+          <div class="legend" id="engine-ctx-legend"></div>
+        </div>
+        <canvas id="engine-ctx" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-ctx-note"></div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
           <h2>Recorded throughput</h2>
           <div class="legend" id="engine-hist-legend"></div>
         </div>
@@ -647,6 +656,12 @@
         <canvas id="engine-hist-strip" class="engine-strip-canvas"></canvas>
         <div class="engine-sub" id="engine-hist-note"></div>
         <div class="grid tiles" id="engine-hist-tiles" style="margin-top:14px"></div>
+        <div class="card-head" style="margin-top:18px">
+          <h2>Context in use</h2>
+          <div class="legend" id="engine-hist-ctx-legend"></div>
+        </div>
+        <canvas id="engine-hist-ctx" class="engine-strip-canvas"></canvas>
+        <div class="engine-sub" id="engine-hist-ctx-note"></div>
         <div style="margin-top:10px">
           <button class="toggle-btn" id="engine-hist-csv" type="button">Export CSV</button>
         </div>
@@ -2934,9 +2949,10 @@ let engineTaskPrompt = {};   // task id -> {cache, total}
 let engineTaskOrder = [];
 let engineReqCount = 0;
 let engineHasPromptFields = false;
+let engineCtx = [];          // [{t, active, idle, cap}] summed slot context per poll
 
 function resetEngineSeries() {
-  engineSamples = []; engineDeltas = []; engineSlotPrev = {};
+  engineSamples = []; engineDeltas = []; engineSlotPrev = {}; engineCtx = [];
   engineTaskPrompt = {}; engineTaskOrder = []; engineReqCount = 0;
 }
 
@@ -3033,6 +3049,11 @@ function ingestEngineLive(payload) {
   const dtPrev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
   const dt = dtPrev ? (now - dtPrev.t) / 1000 : 0;
   const live = readSlots(payload.slots, dt);
+  const ctxRow = readSlotContext(payload.slots);
+  if (ctxRow) {
+    engineCtx.push({ t: now, ...ctxRow });
+    if (engineCtx.length > ENGINE_MAXCOLS) engineCtx.shift();
+  }
   engineSamples.push({ t: now, m });
   if (engineSamples.length > ENGINE_MAXCOLS + 1) engineSamples.shift();
   if (dtPrev && dt > 0 && dtPrev.m && m) {
@@ -3136,6 +3157,7 @@ function renderEngineLive(payload, live) {
   $('engine-tiles').replaceChildren(...tiles);
   renderEngineSlots(payload.slots, payload.slots_error);
   drawEngineStrip();
+  renderEngineContext();
 
   $('engine-strip-legend').replaceChildren(
     el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
@@ -3186,6 +3208,116 @@ function renderEngineSlots(slots, slotsError) {
       el('td', { class: 'num cell-sub', text: fmtCompact(s.n_ctx) }));
   });
   holder.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows)));
+}
+
+// Context a slot holds = tokens in its KV cache. n_past is exact where the
+// build reports it; otherwise prompt + decoded is the same figure. Idle slots
+// keep their last request's cache (reused for prefix matching), so they're
+// summed separately rather than dropped. null when the build exposes neither.
+function readSlotContext(slots) {
+  if (!Array.isArray(slots) || !slots.length) return null;
+  let active = 0, idle = 0, cap = 0, known = false;
+  for (const s of slots) {
+    cap += Number(s.n_ctx) || 0;
+    let used = null;
+    if (typeof s.n_past === 'number') used = s.n_past;
+    else if (engineHasPromptFields) {
+      const nt = s.next_token || {};
+      used = firstNum([s.n_prompt_tokens, s.prompt_tokens]) + firstNum([nt.n_decoded, s.n_decoded]);
+    }
+    if (used === null) continue;
+    known = true;
+    if (s.is_processing) active += used; else idle += used;
+  }
+  return known ? { active, idle, cap } : null;
+}
+
+function renderEngineContext() {
+  const c = $('engine-ctx');
+  drawContextCanvas(c, engineCtx, { cols: ENGINE_MAXCOLS });
+  $('engine-ctx-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'In-flight' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1);opacity:.35' }), el('span', { text: 'Idle (cached)' })));
+  const last = engineCtx[engineCtx.length - 1];
+  if (!last) {
+    $('engine-ctx-note').textContent = "this build's /slots reports neither n_past nor prompt token counts — context can't be summed";
+    return;
+  }
+  const total = last.active + last.idle;
+  const peak = Math.max(...engineCtx.map((r) => r.active + r.idle));
+  const pct = (v) => last.cap > 0 ? ` (${fmtNum(100 * v / last.cap, 0)}%)` : '';
+  $('engine-ctx-note').textContent =
+    `now ${fmtFull(total)} tokens${pct(total)} · ${fmtFull(last.active)} in-flight · peak ${fmtFull(peak)}${pct(peak)}` +
+    (last.cap > 0 ? ` · capacity ${fmtFull(last.cap)}` : '') +
+    ` · ${engineCtx.length} reading${engineCtx.length === 1 ? '' : 's'}, ${ENGINE_POLL_MS / 1000}s apart`;
+}
+
+// Stacked area: in-flight context solid, idle-cached context faded above it.
+// Y scales to the window's peak, not capacity, so small loads stay visible.
+// A null row is a gap (nothing recorded) and breaks the area there.
+// opt.cols sets the column spacing (the live chart fills right-to-left toward
+// ENGINE_MAXCOLS); opt.labels are time ticks, as on the throughput strips.
+function drawContextCanvas(c, rows, opt) {
+  opt = opt || {};
+  if (!c.isConnected || c.clientWidth === 0) return;
+  const ctx = c.getContext('2d');
+  const { w: W, h: H } = sizeEngineCanvas(c, ctx);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 46, padR = 12, padT = 14, padB = opt.labels ? 24 : 14;
+  const plotW = W - padL - padR, plotH = H - padT - padB, base = padT + plotH;
+  const rule = cssVar('--gridline'), faint = cssVar('--text-muted'), col = cssVar('--series-1');
+  ctx.strokeStyle = rule; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, Math.round(base) + 0.5); ctx.lineTo(W - padR, Math.round(base) + 0.5); ctx.stroke();
+  ctx.font = '10px system-ui, -apple-system, "Segoe UI", sans-serif';
+  if (!rows.some(Boolean)) {
+    ctx.fillStyle = faint; ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(opt.emptyMsg || 'no slot context data', W / 2, padT + plotH / 2);
+    return;
+  }
+  const max = Math.max(1, ...rows.filter(Boolean).map((r) => r.active + r.idle));
+  ctx.setLineDash([2, 4]); ctx.beginPath();
+  ctx.moveTo(padL, Math.round(padT) + 0.5); ctx.lineTo(W - padR, Math.round(padT) + 0.5); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = faint; ctx.textAlign = 'right';
+  ctx.fillText(fmtCompact(max), padL - 8, padT + 4);
+  ctx.fillText('0', padL - 8, base + 3.5);
+
+  const n = rows.length, step = plotW / Math.max(n - 1, (opt.cols || n) - 1, 1);
+  const x = (j) => padL + plotW - (n - 1 - j) * step;
+  const y = (v) => base - (v / max) * plotH;
+  const runs = [];
+  let cur = null;
+  rows.forEach((r, j) => {
+    if (!r) { cur = null; return; }
+    if (!cur) runs.push(cur = []);
+    cur.push(j);
+  });
+  const area = (run, top, bottom, alpha) => {
+    ctx.beginPath();
+    run.forEach((j, k) => (k ? ctx.lineTo : ctx.moveTo).call(ctx, x(j), y(top(rows[j]))));
+    for (let k = run.length - 1; k >= 0; k--) ctx.lineTo(x(run[k]), y(bottom(rows[run[k]])));
+    ctx.closePath(); ctx.globalAlpha = alpha; ctx.fillStyle = col; ctx.fill(); ctx.globalAlpha = 1;
+  };
+  for (const run of runs) {
+    if (run.length === 1) {
+      const r = rows[run[0]], x0 = x(run[0]) - 2;
+      ctx.fillStyle = col; ctx.globalAlpha = 0.35; ctx.fillRect(x0, y(r.active + r.idle), 4, (r.idle / max) * plotH);
+      ctx.globalAlpha = 1; ctx.fillRect(x0, y(r.active), 4, (r.active / max) * plotH);
+      continue;
+    }
+    area(run, (r) => r.active + r.idle, (r) => r.active, 0.25);
+    area(run, (r) => r.active, () => 0, 0.85);
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
+    run.forEach((j, k) => (k ? ctx.lineTo : ctx.moveTo).call(ctx, x(j), y(rows[j].active + rows[j].idle)));
+    ctx.stroke();
+  }
+
+  if (opt.labels) {
+    ctx.fillStyle = faint;
+    for (const lb of opt.labels) {
+      ctx.textAlign = lb.frac <= 0 ? 'left' : (lb.frac >= 1 ? 'right' : 'center');
+      ctx.fillText(lb.text, padL + plotW * lb.frac, H - 6);
+    }
+  }
 }
 
 // ── Engine live strip (canvas — 400+ columns, SVG would be too heavy) ──
@@ -3276,6 +3408,7 @@ window.addEventListener('resize', () => {
   if (activeTab === 'lb' && !$('lb-content').hidden) { drawLbHistStrip(); return; }
   if (activeTab !== 'engine' || $('engine-content').hidden) return;
   drawEngineStrip();
+  drawContextCanvas($('engine-ctx'), engineCtx, { cols: ENGINE_MAXCOLS });
   drawEngineHistStrip();
 });
 
@@ -3296,6 +3429,15 @@ function histTimeLabel(t, spanSec) {
 // bucket recorded no counters (collector was down) becomes a gap marker
 // instead of a zero; a pair whose epoch changed (server restart) becomes a
 // break instead of being differenced into a false spike.
+// Bucket context is an average over the bucket's polls, unlike the counters
+// it isn't differenced. null for buckets the collector recorded none in —
+// down, or rows written before it began recording context.
+function histCtx(b) {
+  const HC = engineHistCols;
+  if (HC.ctx_active === undefined || b[HC.ctx_active] == null || b[HC.ctx_idle] == null) return null;
+  return { active: b[HC.ctx_active], idle: b[HC.ctx_idle], peak: b[HC.ctx_peak], cap: b[HC.ctx_cap] };
+}
+
 function engineHistSeries() {
   if (!engineHist || !Array.isArray(engineHist.rows) || engineHist.rows.length < 2) return [];
   const R = engineHist.rows, HC = engineHistCols, out = [];
@@ -3305,7 +3447,7 @@ function engineHistSeries() {
     const gap = b[HC.n] > b[HC.n_ok];
     const pair = a[HC.prompt_tokens] !== null && b[HC.prompt_tokens] !== null;
     if (haveM && !pair) {
-      out.push({ t: b[HC.ts], dt: 0, pre: 0, gen: 0, preTok: 0, preSec: 0, genTok: 0, genSec: 0, busy: 0, gap: true, brk: false });
+      out.push({ t: b[HC.ts], dt: 0, pre: 0, gen: 0, preTok: 0, preSec: 0, genTok: 0, genSec: 0, busy: 0, gap: true, brk: false, ctx: histCtx(b) });
       continue;
     }
     const dt = b[HC.ts] - a[HC.ts];
@@ -3322,7 +3464,7 @@ function engineHistSeries() {
       gen: (b[HC.gen_delta] > 0) ? b[HC.gen_delta] / dt : 0,
       preTok: dpT, preSec: dpS, genTok: dgT, genSec: dgS,
       busy: (b[HC.slots_generating] || 0) + (b[HC.slots_prefilling] || 0),
-      gap, brk,
+      gap, brk, ctx: histCtx(b),
     });
   }
   return out;
@@ -3332,19 +3474,20 @@ function drawEngineHistStrip() {
   const s = engineHistSeries();
   if (!s.length) {
     drawStripCanvas($('engine-hist-strip'), [], [], engineHist ? 'window contains no usable pairs' : 'no window loaded');
+    drawContextCanvas($('engine-hist-ctx'), [], { emptyMsg: engineHist ? 'window contains no usable pairs' : 'no window loaded' });
     return;
   }
   const pre = [], gen = [], marks = [], breaks = [];
   for (const row of s) { pre.push(row.pre); gen.push(row.gen); marks.push(row.gap); breaks.push(row.brk); }
   const t0 = s[0].t, t1 = s[s.length - 1].t, sp = t1 - t0;
-  drawStripCanvas($('engine-hist-strip'), pre, gen, '', {
-    marks, breaks, dimOlder: false,
-    labels: [
-      { frac: 0, text: histTimeLabel(t0, sp) },
-      { frac: 0.5, text: histTimeLabel((t0 + t1) / 2, sp) },
-      { frac: 1, text: histTimeLabel(t1, sp) },
-    ],
-  });
+  const labels = [
+    { frac: 0, text: histTimeLabel(t0, sp) },
+    { frac: 0.5, text: histTimeLabel((t0 + t1) / 2, sp) },
+    { frac: 1, text: histTimeLabel(t1, sp) },
+  ];
+  drawStripCanvas($('engine-hist-strip'), pre, gen, '', { marks, breaks, dimOlder: false, labels });
+  drawContextCanvas($('engine-hist-ctx'), s.map((row) => row.ctx), {
+    labels, emptyMsg: 'no context recorded in this window — the collector predates it, or /slots lacks token counts' });
 }
 
 function renderEngineHistSummary() {
@@ -3353,8 +3496,12 @@ function renderEngineHistSummary() {
   $('engine-hist-legend').replaceChildren(
     el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'Prefill' })),
     el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-2)' }), el('span', { text: 'Generation' })));
+  $('engine-hist-ctx-legend').replaceChildren(
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1)' }), el('span', { text: 'In-flight' })),
+    el('span', { class: 'key' }, el('span', { class: 'swatch', style: 'background:var(--series-1);opacity:.35' }), el('span', { text: 'Idle (cached)' })));
   if (!s.length) {
     tilesHolder.replaceChildren();
+    $('engine-hist-ctx-note').textContent = '';
     drawEngineHistStrip();
     return;
   }
@@ -3386,7 +3533,24 @@ function renderEngineHistSummary() {
   $('engine-hist-note').textContent = `${s.length} bucket${s.length === 1 ? '' : 's'} · ` +
     `${engineHist.bucket >= 60 ? fmtNum(engineHist.bucket / 60, 1) + 'min' : fmtNum(engineHist.bucket, 0) + 's'} per column · ` +
     `${mins >= 90 ? fmtNum(mins / 60, 1) + 'h' : fmtNum(mins, 0) + 'min'} spanned`;
+  $('engine-hist-ctx-note').textContent = engineHistCtxNote(s);
   drawEngineHistStrip();
+}
+
+function engineHistCtxNote(s) {
+  const c = s.map((row) => row.ctx).filter(Boolean);
+  if (!c.length) return '';
+  let sum = 0, peak = 0, cap = 0;
+  for (const r of c) {
+    sum += r.active + r.idle;
+    peak = Math.max(peak, r.peak != null ? r.peak : r.active + r.idle);
+    if (r.cap) cap = r.cap;
+  }
+  const pct = (v) => cap > 0 ? ` (${fmtNum(100 * v / cap, 0)}%)` : '';
+  const avg = sum / c.length;
+  return `bucket averages · window avg ${fmtFull(Math.round(avg))} tokens${pct(avg)} · peak poll ${fmtFull(peak)}${pct(peak)}` +
+    (cap > 0 ? ` · capacity ${fmtFull(cap)}` : '') +
+    (c.length < s.length ? ` · ${s.length - c.length} of ${s.length} buckets without context` : '');
 }
 
 function setHistSpanButtons(span) {
@@ -3440,10 +3604,11 @@ document.querySelectorAll('.hist-range-btn').forEach((btn) => {
 $('engine-hist-csv').addEventListener('click', () => {
   const s = engineHistSeries();
   if (!s.length) return;
-  const header = 'timestamp_iso,dt_seconds,prefill_tok_s,generation_tok_s,prompt_tokens,prompt_seconds,generated_tokens,generation_seconds,busy_slots,gap,restart\n';
+  const header = 'timestamp_iso,dt_seconds,prefill_tok_s,generation_tok_s,prompt_tokens,prompt_seconds,generated_tokens,generation_seconds,busy_slots,gap,restart,ctx_in_flight,ctx_idle,ctx_peak,ctx_capacity\n';
   const lines = s.map((row) => [
     new Date(row.t * 1000).toISOString(), row.dt.toFixed(2), row.pre.toFixed(3), row.gen.toFixed(3),
     row.preTok, row.preSec.toFixed(2), row.genTok, row.genSec.toFixed(2), row.busy, row.gap ? 1 : 0, row.brk ? 1 : 0,
+    ...(row.ctx ? [Math.round(row.ctx.active), Math.round(row.ctx.idle), row.ctx.peak ?? '', row.ctx.cap ?? ''] : ['', '', '', '']),
   ].join(','));
   const blob = new Blob([header + lines.join('\n') + '\n'], { type: 'text/csv' });
   const url = URL.createObjectURL(blob);
