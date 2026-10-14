@@ -167,8 +167,11 @@ when they're missing:
 - **History panel** — a range picker (15m/1h/6h/24h/7d/all) over data the
   collector has recorded, a canvas strip chart, a window summary (average
   throughput, token volumes, mean busy slots, sample coverage), and a CSV
-  export. A server restart mid-window renders as a break, not a false spike;
-  a collector outage renders as a visible gap, not a silent zero
+  export of the window (per-bucket rates and token counts, busy slots,
+  gap/restart flags, and the context columns `ctx_in_flight`, `ctx_idle`,
+  `ctx_peak`, `ctx_capacity`, blank where none was recorded). A server
+  restart mid-window renders as a break, not a false spike; a collector
+  outage renders as a visible gap, not a silent zero
 - **Context in use** — inside the History panel, on the same range: KV-cache
   tokens summed across slots per bucket, stacked in-flight vs. idle-cached,
   with the window average, busiest poll and share of total `n_ctx`. Context
@@ -586,6 +589,24 @@ pointing at the old port records failed samples (`down:` in its journal) and
 its `/range` keeps serving stale metadata, which looks like an idle engine
 rather than a broken collector.
 
+**Context in use.** Each poll also records how many tokens the slots hold
+in their KV cache, for the Engine tab's Context in use chart. A slot's
+figure is `n_past` where the build reports it; otherwise it is the prompt
+plus the tokens generated so far. Builds disagree on whether
+`n_prompt_tokens` already includes the generated tokens, so the collector
+treats it as inclusive when it equals cached + processed + decoded (within
+64 tokens, since the fields aren't read atomically) and adds `n_decoded`
+only when it doesn't. The page's Slots table uses the same rule
+(`slot_tokens()` in `collect.py`, `slotTokens()` in `public/index.html`;
+keep the two in step). Three columns go on each `samples` row:
+`ctx_active` (slots mid-request), `ctx_idle` (idle slots, which keep their
+last request for prefix reuse) and `ctx_cap` (summed `n_ctx`). `/history`
+returns each bucket's average of the first two, the capacity, and
+`ctx_peak`, the busiest single poll in the bucket, after the existing
+columns. `ctx_active` and `ctx_idle` are NULL when `/slots` reports no
+token counts (capacity is still recorded), and all three are NULL when
+`/slots` doesn't answer.
+
 Stdlib only, no dependencies, works on any Python 3. In production, run it
 as a **systemd user unit** so it survives logout and restarts on crash:
 
@@ -755,7 +776,11 @@ curl http://<engine-host>:<collector-port>/range
 
 The database (`telemetry.db`) sits beside the script and is kept across a
 restart, so history continues — the LiteLLM tables are created on first
-start, so an existing database picks them up without migration. The
+start, so an existing database picks them up without migration, and the
+context columns (`ctx_active`, `ctx_idle`, `ctx_cap`) are added to
+`samples` the same way. Adding a column only changes table metadata, so
+this is instant even on a large database. Rows written before the upgrade
+keep NULL there, which the Context in use chart shows as a gap. The
 collector's arguments are per-host (see above); check them with
 `systemctl --user cat llamacpp-telemetry.service` rather than assuming the
 defaults. If the host was rebuilt and the unit is gone, it's a fresh install:
@@ -764,6 +789,9 @@ follow the collector steps above, including `loginctl enable-linger`.
 A collector still running an older copy of `collect.py` answers 404 on the
 `/litellm/*` routes; the Load balancing tab and the Setup page's test both
 say so by name rather than showing it as "no data recorded yet".
+One that predates context recording leaves the Engine tab's Context in use
+chart empty ("no context recorded in this window"); the rest of the
+History panel works as before.
 
 **After an engine host changes** — a new model, port, or LAN address — update
 its entry under Setup → Engines (or `POST /api/settings`), run **Test
