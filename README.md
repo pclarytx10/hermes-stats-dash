@@ -443,16 +443,16 @@ servers with different models, builds, and context sizes. Each entry:
 ```json
 {
   "engines": [
-    { "id": "nfcmini",   "label": "nfcmini · Qwen3.8-27B Q6",
+    { "id": "<engine-host-1>", "label": "<engine-host-1> · Qwen3.8-27B Q6",
       "llamaUrl": "http://127.0.0.1:8081",
       "collectorUrl": "http://127.0.0.1:8082",
-      "models": ["/home/patrickm/models/Qwen3.8-27B-UD-Q6_K.gguf",
+      "models": ["/path/to/models/Qwen3.8-27B-UD-Q6_K.gguf",
                  "Qwen3.8_27B_Q6"] },
-    { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B Q6",
+    { "id": "<engine-host-2>", "label": "<engine-host-2> · Qwen3.8-27B Q6",
       "llamaUrl": "http://<ip_address>:8081",
       "collectorUrl": "http://<ip_address>:8082",
       "models": ["Qwen3.8_27B_Q6"] },
-    { "id": "ds5975wx",  "label": "ds5975wx · Qwen3.8-27B Q6",
+    { "id": "<engine-host-3>", "label": "<engine-host-3> · Qwen3.8-27B Q6",
       "llamaUrl": "http://<ip_address>:8081",
       "collectorUrl": "http://<ip_address>:8082",
       "models": ["Qwen3.8_27B_Q6"] }
@@ -495,7 +495,7 @@ this one *does* hold a credential:
 {
   "litellm": {
     "enabled": true,
-    "label": "nfcmini · LiteLLM",
+    "label": "<engine-host-1> · LiteLLM",
     "url": "http://127.0.0.1:8080",
     "apiKey": "sk-…",
     "collectorUrl": "http://127.0.0.1:8082"
@@ -577,12 +577,13 @@ python3 ~/llamacpp-telemetry/collect.py \
 
 `--server` and `--port` assume llama-server on `:8080` and the collector on
 `:8081`, which are only defaults — **every host in the example config above
-has moved off them**: mini795s7 runs open-webui on `:8080`, so llama-server
-took `:8081` and the collector `:8082`, and nfcmini was later shifted the same
-way. ds5975wx follows the same layout — llama-server on `:8081` (a system
-unit, `llamacpp.service`), the collector on `:8082` — but its llama-server
-first came up on `:8082`, so the collector briefly ran on `:8083` until the
-move. Read a host's actual ports out of its unit
+has moved off them**: `<engine-host-2>` runs open-webui on `:8080`, so
+llama-server took `:8081` and the collector `:8082`, and `<engine-host-1>`
+was later shifted the same way. `<engine-host-3>` follows the same layout —
+llama-server on `:8081` (a system unit, `llamacpp.service`), the collector
+on `:8082` — but its llama-server first came up on `:8082`, so the
+collector briefly ran on `:8083` until the move. Read a host's actual ports
+out of its unit
 (`systemctl --user cat llamacpp-telemetry.service`, `ss -ltnp`) rather than
 assuming. When llama-server moves, `--server` has to follow: a collector left
 pointing at the old port records failed samples (`down:` in its journal) and
