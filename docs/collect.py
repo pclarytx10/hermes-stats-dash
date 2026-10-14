@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS litellm_deployments (
   PRIMARY KEY (ts, model_id)
 );
 CREATE INDEX IF NOT EXISTS litellm_deployments_ts ON litellm_deployments(ts);
+
+-- Per-client request counters — who sent the traffic. The one exception to
+-- folding every label but model_id away: here the fold goes the other way,
+-- over model_id, keeping client_ip / user_agent / API key. Only the proxy
+-- request counters carry those labels, so this is requests, not tokens.
+-- Written only when a client's counters change: a quiet client costs nothing,
+-- and history is still a step function readers can difference.
+CREATE TABLE IF NOT EXISTS litellm_clients (
+  ts          REAL NOT NULL,
+  client      TEXT NOT NULL,
+  epoch       INTEGER NOT NULL DEFAULT 0,
+  client_ip   TEXT,
+  user_agent  TEXT,
+  api_key     TEXT,
+  requests    REAL,
+  failed      REAL,
+  PRIMARY KEY (ts, client)
+);
+CREATE INDEX IF NOT EXISTS litellm_clients_client ON litellm_clients(client, epoch, ts);
 """
 
 COLS = ["ts", "epoch", "prompt_tokens", "prompt_seconds", "predicted_tokens",
@@ -158,6 +177,18 @@ def is_inference(labels):
     idle proxy read as a 100% error rate."""
     return (not is_placeholder(labels.get("requested_model"))
             or not is_placeholder(labels.get("model_id")))
+
+
+def litellm_client_of(labels):
+    """(key, ip, user_agent, api_key) for a proxy request series. The key string
+    must match server.mjs's litellmClientOf() exactly: the dashboard joins live
+    counters to recorded ones on it. client_ip is the socket peer unless LiteLLM
+    trusts X-Forwarded-For, so behind a reverse proxy every row is that proxy."""
+    clean = lambda v: "" if is_placeholder(v) else v
+    ip = clean(labels.get("client_ip"))
+    ua = clean(labels.get("user_agent"))
+    key = clean(labels.get("api_key_alias")) or clean(labels.get("hashed_api_key"))
+    return "%s|%s|%s" % (ip, ua, key), ip, ua, key
 
 
 def parse_prom_labeled(text):
@@ -221,6 +252,14 @@ class Collector:
         self.metrics_ok = True
         self.litellm_ok = True
         self.litellm_start = None        # process_start_time_seconds, for restarts
+        self.client_last = {}            # client -> (epoch, requests, failed) last written
+        # The first moment this database recorded clients at all. A client's
+        # first row only counts from zero if the proxy was seen without it
+        # *after* this point — otherwise upgrading the collector on a proxy
+        # that has run for a week books the whole week as one burst.
+        self.db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('clients_since',?)",
+                        (str(time.time()),))
+        self.db.commit()
         row = self.db.execute(
             "SELECT epoch FROM litellm_samples WHERE ok=1 ORDER BY ts DESC LIMIT 1"
         ).fetchone()
@@ -377,6 +416,7 @@ class Collector:
 
         proxy = {}
         deps = {}
+        clients = {}
 
         def acc(bucket, key, value):
             bucket[key] = bucket.get(key, 0.0) + value
@@ -420,8 +460,13 @@ class Collector:
             if col:
                 # Only the two request counters carry non-inference traffic;
                 # the rest are emitted on real calls only.
-                if col in ("requests_total", "requests_failed") and not is_inference(labels):
-                    continue
+                if col in ("requests_total", "requests_failed"):
+                    if not is_inference(labels):
+                        continue
+                    key, ip, ua, ak = litellm_client_of(labels)
+                    c = clients.setdefault(key, {"ip": ip, "ua": ua, "key": ak,
+                                                 "requests": 0.0, "failed": 0.0})
+                    c["requests" if col == "requests_total" else "failed"] += value
                 acc(proxy, col, value)
                 continue
             for base, col in PROXY_HISTOGRAMS.items():
@@ -494,6 +539,16 @@ class Collector:
                  d.get("requests"), d.get("success"), d.get("failure"),
                  d.get("cooled_down"), d.get("state"), d.get("lpot_sum"),
                  d.get("lpot_count"), d.get("ttft_sum"), d.get("ttft_count")))
+        for key, c in clients.items():
+            cur = (self.litellm_epoch, c["requests"], c["failed"])
+            if self.client_last.get(key) == cur:
+                continue
+            self.client_last[key] = cur
+            self.db.execute(
+                "INSERT OR REPLACE INTO litellm_clients(ts,client,epoch,client_ip,"
+                "user_agent,api_key,requests,failed) VALUES(?,?,?,?,?,?,?,?)",
+                (ts, key, self.litellm_epoch, c["ip"], c["ua"], c["key"],
+                 c["requests"], c["failed"]))
         self.db.commit()
         return None
 
@@ -532,6 +587,76 @@ class Collector:
                 print(err or "collecting", flush=True)
                 last_err = err
             time.sleep(max(0.5, self.interval - (time.time() - start)))
+
+
+def litellm_clients(db, t0, t1, bucket):
+    """Requests per client over [t0, t1], plus each client's busiest bucket —
+    the number that matches a burst on the routing chart to whoever sent it.
+
+    Rows are written only on change, so each client's history is a step
+    function. Volume is the sum of increases between consecutive rows, starting
+    from the client's last row before the window. A drop, or an epoch change,
+    is a proxy restart: the new value is counted from zero rather than
+    differenced into a negative.
+    """
+    meta = dict(db.execute("SELECT k,v FROM meta").fetchall())
+    since = float(meta.get("clients_since", 0) or 0)
+    prior = {r[0]: r[1:] for r in db.execute(
+        "SELECT c.client, c.ts, c.epoch, c.requests, c.failed FROM litellm_clients c"
+        " JOIN (SELECT client, MAX(ts) mt FROM litellm_clients WHERE ts<?"
+        " GROUP BY client) p ON c.client=p.client AND c.ts=p.mt", (t0,)).fetchall()}
+    rows = db.execute(
+        "SELECT ts, client, epoch, client_ip, user_agent, api_key, requests, failed"
+        " FROM litellm_clients WHERE ts>=? AND ts<=? ORDER BY client, ts",
+        (t0, t1)).fetchall()
+
+    def seen_without(epoch, ts):
+        # Did the collector see this proxy epoch running before the client's
+        # first row? Then the client really was absent and its first value is
+        # new traffic. If not, the first value is history we never watched.
+        return db.execute(
+            "SELECT 1 FROM litellm_samples WHERE ok=1 AND epoch=? AND ts<? AND ts>=?"
+            " LIMIT 1", (epoch, ts, since)).fetchone() is not None
+
+    out = {}
+    prev = None
+    for ts, client, epoch, ip, ua, key, req, fail in rows:
+        c = out.get(client)
+        if c is None:
+            c = out[client] = {"client": client, "ip": ip, "user_agent": ua,
+                               "api_key": key, "requests": 0.0, "failed": 0.0,
+                               "buckets": {}, "last_ts": None}
+            p = prior.get(client)
+            prev = (p[1], p[2] or 0.0, p[3] or 0.0) if p else None
+            if prev is None and seen_without(epoch, ts):
+                prev = (epoch, 0.0, 0.0)
+        req, fail = req or 0.0, fail or 0.0
+        if prev is not None:
+            restart = epoch != prev[0] or req < prev[1]
+            dr = req if restart else req - prev[1]
+            df = fail if restart or fail < prev[2] else fail - prev[2]
+            if dr > 0 or df > 0:
+                c["requests"] += dr
+                c["failed"] += df
+                b = int((ts - t0) // bucket)
+                c["buckets"][b] = c["buckets"].get(b, 0.0) + dr
+                c["last_ts"] = ts
+        prev = (epoch, req, fail)
+
+    clients = []
+    for c in out.values():
+        if c["requests"] <= 0 and c["failed"] <= 0:
+            continue
+        bk = c.pop("buckets")
+        if bk:
+            b, v = max(bk.items(), key=lambda kv: kv[1])
+            c["peak"], c["peak_ts"] = v, t0 + b * bucket
+        else:
+            c["peak"], c["peak_ts"] = 0.0, None
+        clients.append(c)
+    clients.sort(key=lambda c: -c["requests"])
+    return {"from": t0, "to": t1, "bucket": bucket, "since": since or None,
+            "clients": clients[:50], "total_clients": len(clients)}
 
 
 def make_handler(db_path):
@@ -647,6 +772,12 @@ def make_handler(db_path):
                                             "bucket": width, "from": t0, "to": t1,
                                             "rows": rnd(rows),
                                             "dep_rows": rnd(deps)})
+                if u.path == "/litellm/clients":
+                    now = time.time()
+                    t1 = float(q.get("to", [now])[0])
+                    t0 = float(q.get("from", [t1 - 3600])[0])
+                    bucket = max(10.0, float(q.get("bucket", [300])[0]))
+                    return self._send(200, litellm_clients(db, t0, t1, bucket))
                 return self._send(404, {"error": "not found"})
             except Exception as e:
                 return self._send(500, {"error": str(e)})

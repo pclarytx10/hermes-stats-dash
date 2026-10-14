@@ -1012,6 +1012,24 @@ const isInferenceRequest = (labels) =>
   !isPlaceholder(labels.requested_model) || !isPlaceholder(labels.model_id)
 
 /**
+ * Who sent a request, as far as the proxy can tell. Only the two proxy request
+ * counters carry `client_ip` / `user_agent` (the token counters do not), so
+ * per-client figures are request counts. The key string must match
+ * docs/collect.py's litellm_client_of() exactly — the frontend joins the live
+ * counters to the collector's recorded ones on it.
+ *
+ * `client_ip` is the socket peer unless LiteLLM is told to trust
+ * X-Forwarded-For; behind a reverse proxy every row reads as that proxy.
+ */
+function litellmClientOf(labels) {
+  const clean = (v) => (isPlaceholder(v) ? '' : v)
+  const ip = clean(labels.client_ip)
+  const ua = clean(labels.user_agent)
+  const key = clean(labels.api_key_alias) || clean(labels.hashed_api_key)
+  return { client: `${ip}|${ua}|${key}`, ip, user_agent: ua, api_key: key }
+}
+
+/**
  * Fold the label explosion down to what the tab asks. LiteLLM emits each
  * counter once per (api key × team × user agent × client IP × …) combination;
  * summing over everything but `model_id` is the whole reduction. Failures keep
@@ -1028,6 +1046,8 @@ function reduceLitellmMetrics(rows) {
   const statuses = new Map()
   const unrouted = { requests: 0, failure: 0 }
   const nonInference = { requests: 0, failed: 0 }
+  const clients = new Map()
+  let clientLabels = false
   let processStart = null
   const add = (o, k, v) => { o[k] = (o[k] || 0) + v }
 
@@ -1039,8 +1059,16 @@ function reduceLitellmMetrics(rows) {
       // The two request counters carry a `route`; the rest are emitted only on
       // real calls, so only these two need the inference test.
       if (pc === 'requests_total' || pc === 'requests_failed') {
-        if (isInferenceRequest(labels)) add(proxy, pc, value)
-        else add(nonInference, pc === 'requests_total' ? 'requests' : 'failed', value)
+        if (isInferenceRequest(labels)) {
+          add(proxy, pc, value)
+          const c = litellmClientOf(labels)
+          if (c.ip || c.user_agent) clientLabels = true
+          let row = clients.get(c.client)
+          if (!row) { row = { ...c, requests: 0, failed: 0 }; clients.set(c.client, row) }
+          row[pc === 'requests_total' ? 'requests' : 'failed'] += value
+        } else {
+          add(nonInference, pc === 'requests_total' ? 'requests' : 'failed', value)
+        }
       } else {
         add(proxy, pc, value)
       }
@@ -1104,6 +1132,8 @@ function reduceLitellmMetrics(rows) {
     deployments: [...deployments.values()],
     unrouted,
     non_inference: nonInference,
+    clients: [...clients.values()].sort((a, b) => b.requests - a.requests),
+    client_labels: clientLabels,
     process_start: processStart,
   }
 }
@@ -1125,7 +1155,7 @@ async function buildLitellmLive(ll) {
   }
   if (error) return { ...base, metrics: null, metrics_error: error, deployments: [] }
 
-  const { proxy, deployments, unrouted, non_inference, process_start } =
+  const { proxy, deployments, unrouted, non_inference, clients, client_labels, process_start } =
     reduceLitellmMetrics(rows)
   const engineById_ = new Map(engines().map((e) => [e.id, e]))
   const total = deployments.reduce((a, d) => a + d.requests, 0)
@@ -1150,6 +1180,8 @@ async function buildLitellmLive(ll) {
     process_start,
     unrouted,
     non_inference,
+    clients,
+    client_labels,
     metrics: {
       ...proxy,
       // The load-balancing number: what actually reached a deployment. The
@@ -2494,6 +2526,18 @@ const server = http.createServer(async (req, res) => {
       const points = clampInt(url.searchParams.get('points'), { def: 600, min: 10, max: 4000 })
       const { status, body } = await proxyLitellmCollector(
         ll, '/litellm/history', `from=${from}&to=${to}&points=${points}`)
+      sendJson(res, status, body)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/litellm/clients') {
+      const ll = litellm()
+      if (!ll) { sendJson(res, 404, { error: 'LiteLLM is not enabled' }); return }
+      const now = Date.now() / 1000
+      const to = clampFloat(url.searchParams.get('to'), { def: now, min: 0, max: now + 86400 })
+      const from = clampFloat(url.searchParams.get('from'), { def: to - 3600, min: 0, max: to })
+      const bucket = clampInt(url.searchParams.get('bucket'), { def: 300, min: 10, max: 86400 })
+      const { status, body } = await proxyLitellmCollector(
+        ll, '/litellm/clients', `from=${from}&to=${to}&bucket=${bucket}`)
       sendJson(res, status, body)
       return
     }
