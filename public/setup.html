@@ -564,9 +564,9 @@ function newEngineRow(e) {
   e = e || { id: '', label: '', llamaUrl: '', collectorUrl: '' };
   const rid = 'er' + (engineRowSeq++);
   const idIn = el('input', { type: 'text', id: `${rid}-id`, value: e.id || '',
-    placeholder: 'nfcmini', spellcheck: 'false' });
+    placeholder: 'my-engine', spellcheck: 'false' });
   const labelIn = el('input', { type: 'text', id: `${rid}-label`, value: e.label || '',
-    placeholder: 'nfcmini · Qwen3.6-35B', spellcheck: 'false' });
+    placeholder: 'my-engine · Qwen3.6-35B', spellcheck: 'false' });
   const llamaIn = el('input', { type: 'url', id: `${rid}-llama`, value: e.llamaUrl || '',
     placeholder: 'http://127.0.0.1:8080', spellcheck: 'false' });
   const collectorIn = el('input', { type: 'url', id: `${rid}-collector`, value: e.collectorUrl || '',

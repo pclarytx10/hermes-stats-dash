@@ -25,7 +25,7 @@ they require a separate ad-hoc page pointed straight at `llama-server`.
 
 The two are the same pipeline measured at opposite ends. On this deployment
 hermes' active model is `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` via provider
-`custom:nfcmini`, which is the same model file `llama-server` reports at
+`custom:<engine-host-1>`, which is the same model file `llama-server` reports at
 `/props` — 22,250 API calls and ~80.7M input tokens attributed to it. Demand and
 supply, one machine, two dashboards.
 
@@ -59,7 +59,7 @@ is currently summarising.
    generation throughput, slot state, prompt cache reuse) plus recorded history
    over minutes to days, **switchable across multiple collectors** — local or
    remote — the same way the standalone page already switches between
-   `nfcmini` and `mini795s7`.
+   `<engine-host-1>` and `<engine-host-2>`.
 2. Fed through `server.mjs`, so the dashboard's own traffic to each engine goes
    through one origin. This does **not** require narrowing what a collector
    accepts — see the deployment topology note below — bind mode (loopback vs.
@@ -99,7 +99,7 @@ is currently summarising.
 
 ## 2. Current state
 
-### Already built and running (on `nfcmini.local`, Ubuntu 25.10)
+### Already built and running (on `<engine-host-1>.local`, Ubuntu 25.10)
 
 | Component | Detail |
 |---|---|
@@ -150,7 +150,7 @@ honestly on builds that differ.
 
 ```mermaid
 flowchart LR
-  subgraph nfcmini
+  subgraph engine_host_1["engine-host-1"]
     LS["llama-server :8080<br/>/metrics /slots /props"]
     COL["collect.py<br/>systemd user unit<br/>SQLite, 5s"]
     HA["hermes dashboard :9119"]
@@ -185,50 +185,50 @@ llama.cpp version.
 
 ### Deployment topology — the hop is asymmetric
 
-The dashboard runs **on nfcmini**, so the two engines are not reached the same
+The dashboard runs **on `<engine-host-1>`**, so the two engines are not reached the same
 way. This is about what address the *dashboard* dials for each — it says
 nothing about how either collector is bound (that's the separate, per-collector
 choice covered below):
 
 | Engine | llama-server | Collector | Dashboard dials |
 |---|---|---|---|
-| nfcmini · Qwen3.6-35B | same host | same host | **loopback** (`127.0.0.1`) |
-| mini795s7 · Qwen3.8-27B (Gemma-4-E4B until 2026-09) | over the LAN | over the LAN | **LAN IP** |
+| `<engine-host-1>` · Qwen3.6-35B | same host | same host | **loopback** (`127.0.0.1`) |
+| `<engine-host-2>` · Qwen3.8-27B (Gemma-4-E4B until 2026-09) | over the LAN | over the LAN | **LAN IP** |
 
-For the *dashboard's own traffic*, only nfcmini ever needs to reach mini795s7 —
+For the *dashboard's own traffic*, only `<engine-host-1>` ever needs to reach `<engine-host-2>` —
 the browser talks to `:8788` and nothing else, because the dashboard proxies
 both engines. That would be a narrow enough requirement to lock the collector
 down to a single caller.
 
 **But it is not the only caller.** The standalone `llamacpp-telemetry.html` is
 staying in service (see §1) and is opened from whatever machine currently has a
-browser pointed at it — not from nfcmini, and not from a fixed address. Locking
-`:8081` to nfcmini's IP specifically would work for the dashboard and silently
+browser pointed at it — not from `<engine-host-1>`, and not from a fixed address. Locking
+`:8081` to `<engine-host-1>`'s IP specifically would work for the dashboard and silently
 break the standalone page for everyone else. So the collector's exposure is a
 **per-collector deployment choice** (§1), not something this project narrows:
 `--bind 0.0.0.0` keeps it open to any LAN client, the mode both collectors run
 in today; `--bind 127.0.0.1` is available for a collector meant only for a
 co-located dashboard. Nothing here forces either choice.
 
-**Address selection — use the LAN IP.** Measured from nfcmini on 2026-07-31:
+**Address selection — use the LAN IP.** Measured from `<engine-host-1>` on 2026-07-31:
 
 | Path | Result |
 |---|---|
-| `10.0.0.65:8081` (LAN IP) | **HTTP 200 in 1.3 ms** |
-| `mini795s7.local:8081` (mDNS) | HTTP 200 in 104 ms |
-| `100.118.134.124:8081` (Tailscale) | **timeout** |
+| `<ip_address>:8081` (LAN IP) | **HTTP 200 in 1.3 ms** |
+| `<engine-host-2>.local:8081` (mDNS) | HTTP 200 in 104 ms |
+| `<ip_address>:8081` (Tailscale) | **timeout** |
 
 mDNS costs ~100 ms per resolution and can fail transiently — acceptable for a
 human clicking a page, wasteful for a service polling on a timer. Tailscale
 would be the preferred transport (authenticated and encrypted, which matters for
 a collector with no auth of its own), but it does **not currently work between
 these two hosts**: ICMP, port 22 and port 8081 all fail over the tailnet while
-the LAN path succeeds, even though both nodes are on the `theclarys.org` tailnet
+the LAN path succeeds, even though both nodes are on the `<tailnet>` tailnet
 and each lists the other. Both hosts run `ufw`. Until that is diagnosed, the
 cross-host hop is **plaintext over the LAN**, and the plan assumes so.
 
-> **Update 2026-09-18:** mini795s7 was rebuilt and DHCP moved it to
-> `10.0.0.66` (Tailscale `100.98.104.78`) — the "hard-coded LAN IP" risk below
+> **Update 2026-09-18:** `<engine-host-2>` was rebuilt and DHCP moved it to
+> `<ip_address>` (Tailscale `<ip_address>`) — the "hard-coded LAN IP" risk below
 > materialized. Its llama-server is now on `:8081` and its collector on
 > `:8082`; the figures above are the 2026-07-31 measurements against the old
 > address and ports. See the addendum at the end of this document.
@@ -242,12 +242,12 @@ topology. Config becomes a **list**, in `~/.hermes-stats-dash/config.json`
 ```json
 {
   "engines": [
-    { "id": "nfcmini",   "label": "nfcmini · Qwen3.6-35B",
+    { "id": "<engine-host-1>", "label": "<engine-host-1> · Qwen3.6-35B",
       "llamaUrl": "http://127.0.0.1:8080",
       "collectorUrl": "http://127.0.0.1:8081" },
-    { "id": "mini795s7", "label": "mini795s7 · Gemma-4-E4B",
-      "llamaUrl": "http://10.0.0.65:8080",
-      "collectorUrl": "http://10.0.0.65:8081" }
+    { "id": "<engine-host-2>", "label": "<engine-host-2> · Gemma-4-E4B",
+      "llamaUrl": "http://<ip_address>:8080",
+      "collectorUrl": "http://<ip_address>:8081" }
   ]
 }
 ```
@@ -259,7 +259,7 @@ whether a collector answers. No entry holds credentials, so none needs
 redaction. `LLAMA_SERVER_URL` / `LLAMA_COLLECTOR_URL` remain as a single-engine
 env fallback for a bare deployment.
 
-(The example above is the 2026-07-31 config; the current mini795s7 entry is in
+(The example above is the 2026-07-31 config; the current `<engine-host-2>` entry is in
 the README and the addendum below.)
 
 ### Frontend model
@@ -319,7 +319,7 @@ in the system, and it fails independently and silently.
 
 **Wording rules.** The badge must never imply hermes caused the state. It names
 the endpoint, and where the state is load-related it says the load may include
-other clients: *"llama.cpp @ nfcmini.local:8080 — 2 requests queued. Load may
+other clients: *"llama.cpp @ `<engine-host-1>.local:8080` — 2 requests queued. Load may
 include clients other than hermes."* Never "your requests are queued." This is
 the specific failure mode the attribution boundary in §1 exists to prevent, and
 the badge is the place most likely to trip it.
@@ -396,7 +396,7 @@ it.
 Independent of the UI work; worth doing first because the current setup is
 fragile.
 
-- [ ] Convert hermes-stats-dash on nfcmini to a systemd **user** unit, matching
+- [ ] Convert hermes-stats-dash on `<engine-host-1>` to a systemd **user** unit, matching
       `llamacpp-telemetry.service`. It currently runs from a `sh -c` in a
       terminal session and dies with it.
 - [ ] Leave both collectors' bind addresses untouched. Neither this phase nor
@@ -531,9 +531,9 @@ frontend and ~30 of server on top of routes that already exist.
 | Scoping `days` breaks existing cards | Moderate | Phase 2 lands and is verified before any engine UI is written |
 | Repo scope dilution on a public project | Certain, by design | Deliberate README rewrite in Phase 5, not an added bullet |
 | Engine tab useless without the collector | Certain | History panel degrades to an install prompt; live panel works without it |
-| **Remote engine unreachable while the local one is fine** — a partial view that could read as "no traffic" | Moderate; a LAN hiccup or a mini795s7 reboot does it | Per-engine reachability state in the picker; never render a remote engine's absence as zero |
+| **Remote engine unreachable while the local one is fine** — a partial view that could read as "no traffic" | Moderate; a LAN hiccup or a `<engine-host-2>` reboot does it | Per-engine reachability state in the picker; never render a remote engine's absence as zero |
 | Cross-host telemetry travels unauthenticated over the LAN | Certain, until Tailscale works between the hosts | No mitigation applied by this project — narrowing `ufw` to a single caller would break the standalone page for anyone not on that host. Revisit once the tailnet path works, or once the standalone page is retired and a narrower rule stops costing anything |
-| Hard-coded LAN IP breaks if DHCP moves mini795s7 | Moderate | Reserve the address, or fall back to mDNS on connection failure and log that it did |
+| Hard-coded LAN IP breaks if DHCP moves `<engine-host-2>` | Moderate | Reserve the address, or fall back to mDNS on connection failure and log that it did |
 
 ---
 
@@ -543,7 +543,7 @@ frontend and ~30 of server on top of routes that already exist.
    that is fine for years, but a roll-up path may be wanted eventually.
 2. **Should the tailnet path be fixed first?** Tailscale would give the
    cross-host hop authentication and encryption for free, and both nodes are
-   already on `theclarys.org` — but ICMP, `:22` and `:8081` all fail between them
+   already on `<tailnet>` — but ICMP, `:22` and `:8081` all fail between them
    today. Diagnosing it needs sudo and tailnet admin access. Fixing it wouldn't
    change anything about the collector's bind mode (still a per-collector
    choice, per the decision above), but it would give whoever later chooses to
@@ -553,7 +553,7 @@ frontend and ~30 of server on top of routes that already exist.
    unmodified.** The Engine tab is being built to reach parity with it (same
    multi-collector switching), so retiring the standalone page is a later,
    separate decision once that parity exists — not part of this project.
-4. **Per-engine retention.** mini795s7 spent its first hour in slots-only mode
+4. **Per-engine retention.** `<engine-host-2>` spent its first hour in slots-only mode
    (no `--metrics`), so its history has a permanent capability seam. Worth
    surfacing in the UI, or leave it to the gap markers?
 
@@ -564,7 +564,7 @@ frontend and ~30 of server on top of routes that already exist.
 Gathered 2026-07-31 against the live deployment.
 
 - llama-server: build `b9079-69d8e4be4`, 4 slots, `n_ctx` 262144,
-  `/home/patrickm/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
+  `/path/to/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
 - `/slots` keys on this build: `id`, `id_task`, `is_processing`, `n_ctx`,
   `next_token` (array), `params`, `speculative` — no prompt-token fields
 - CORS: llama-server echoes the request origin (`Access-Control-Allow-Origin: null`
@@ -575,29 +575,29 @@ Gathered 2026-07-31 against the live deployment.
 - Theme tokens available: `--good` (`#0ca30c`), `--critical` (`#d03b3b`), and
   `--series-1..5`. **There is no warning colour** — the badge needs one added
 - hermes: v0.19.0, active model `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, provider
-  `custom:nfcmini`; `by_model` also lists `google/gemini-3-flash-preview` and
+  `custom:<engine-host-1>`; `by_model` also lists `google/gemini-3-flash-preview` and
   `gemma-4-E4B-it-Q4_K_M.gguf`
 - Collector storage: 390 B/row measured on a near-empty file (page overhead
   dominates; steady state lower) → ≤6.7 MB/day at 5s
-- Node on nfcmini: v22.22.2; `package.json` `engines: >=18.0.0`
+- Node on `<engine-host-1>`: v22.22.2; `package.json` `engines: >=18.0.0`
 - hermes-stats-dash refresh cadence today: `setInterval(refresh, 30_000)`,
   ranges 7 / 30 / 90 days
 
-**Second engine — mini795s7** (added 2026-07-31):
+**Second engine — `<engine-host-2>`** (added 2026-07-31):
 
 - llama-server build `b8995-2e81dc5f6`, 4 slots, `n_ctx` 131072,
-  `/home/patrickm/models/gemma-4-E4B-it-Q4_K_M.gguf`, `0.0.0.0:8080`
+  `/path/to/models/gemma-4-E4B-it-Q4_K_M.gguf`, `0.0.0.0:8080`
 - Ubuntu 26.04, Python 3.14.4, `Linger=yes`, collector installed and enabled
 - Started **without `--metrics`** (501) until 06:29 on 2026-07-31; its `/slots`
   omits `id_task` and `next_token` **while idle**, exposing them only under load.
   The collector gained a slots-only mode for this and kept recording across the
   change unattended
-- Addresses: LAN `10.0.0.65`, Tailscale `100.118.134.124` (tailnet path
-  non-functional to nfcmini)
-- nfcmini addresses: LAN `10.0.0.151` / `10.0.0.216`, Tailscale `100.81.234.124`
+- Addresses: LAN `<ip_address>`, Tailscale `<ip_address>` (tailnet path
+  non-functional to `<engine-host-1>`)
+- `<engine-host-1>` addresses: LAN `<ip_address>` / `<ip_address>`, Tailscale `<ip_address>`
 - Both hosts run `ufw` (rules not readable without sudo)
 
-**mini795s7 rebuilt** (found 2026-09-18, collector redeployed the same day):
+**`<engine-host-2>` rebuilt** (found 2026-09-18, collector redeployed the same day):
 
 - The host was rebuilt or repurposed. The collector directory, its systemd user
   unit and all recorded history were gone; `Linger` was back to `no`
@@ -609,11 +609,11 @@ Gathered 2026-07-31 against the live deployment.
 - `:8080` is now open-webui, so the collector runs with
   `--server http://127.0.0.1:8081 --port 8082`
 - Python 3.12.3 (`/usr/bin/python3`); `Linger=yes` re-enabled
-- Addresses: LAN `10.0.0.66`, Tailscale `100.98.104.78`
-- Dashboard config updated to `llamaUrl` `http://10.0.0.66:8081`,
-  `collectorUrl` `http://10.0.0.66:8082`
+- Addresses: LAN `<ip_address>`, Tailscale `<ip_address>`
+- Dashboard config updated to `llamaUrl` `http://<ip_address>:8081`,
+  `collectorUrl` `http://<ip_address>:8082`
 
-**nfcmini ports shifted** (2026-09-19):
+**`<engine-host-1>` ports shifted** (2026-09-19):
 
 - llama-server moved `:8080` → **`:8081`** and the collector `:8081` →
   **`:8082`**, so neither host now uses the ports the install docs default to
@@ -631,15 +631,15 @@ Later the same day:
 - The unit's `--metrics` line was missing its trailing `\`, so systemd had
   been silently dropping `--alias`; fixed
 - Switched to **`Qwen3.8-27B-UD-Q6_K.gguf`** (`unsloth/Qwen3.8-27B-GGUF`, SHA-256
-  `c9c20681…63cd436`), byte-identical to nfcmini's copy, at
+  `c9c20681…63cd436`), byte-identical to `<engine-host-1>`'s copy, at
   `/opt/models/gguf/qwen3.8-27b/`, `--parallel 2` (131072 ctx per slot), MTP
   drafting kept. The Q4_K_M file is still on disk as a fallback
-- nfcmini itself had moved to the same model (`Qwen3.8-27B-UD-Q6_K.gguf`,
+- `<engine-host-1>` itself had moved to the same model (`Qwen3.8-27B-UD-Q6_K.gguf`,
   `--alias Qwen3.8_27B_Q6`); its dashboard entry was relabelled and remapped
 - **Both engines serve under the same alias, `Qwen3.8_27B_Q6`, by choice.**
   `engineModelIndex()` gives a model mapped to two engines to the first one in
-  config order (nfcmini), so the Usage tab never double-subtracts. The cost is
+  config order (`<engine-host-1>`), so the Usage tab never double-subtracts. The cost is
   that the per-engine split on the Usage tab is rolled up: hermes traffic
-  served by mini795s7 is subtracted from nfcmini, and appears on mini795s7 as
+  served by `<engine-host-2>` is subtracted from `<engine-host-1>`, and appears on `<engine-host-2>` as
   other clients. The Engine tab is unaffected, because each engine reads its
   own collector. A distinct alias on one host would restore the split

@@ -137,7 +137,7 @@
     </div>
     <div class="field">
       <label for="url">server</label>
-      <input type="text" id="url" value="http://nfcmini.local:8080" spellcheck="false">
+      <input type="text" id="url" value="http://localhost:8080" spellcheck="false">
     </div>
     <div class="field">
       <label for="iv">poll (s)</label>
@@ -224,7 +224,7 @@
     <div class="ranges">
       <div class="field">
         <label for="hurl">collector</label>
-        <input type="text" id="hurl" value="http://nfcmini.local:8081" spellcheck="false">
+        <input type="text" id="hurl" value="http://localhost:8081" spellcheck="false">
       </div>
       <div class="rangebtns">
         <button data-span="900">15m</button>
@@ -909,8 +909,7 @@
   // Each entry pairs a llama-server with the collector recording it. Switching
   // discards all in-memory history: the two endpoints share no counter space.
   var SERVERS = [
-    {name:"nfcmini · Qwen3.6-35B",  llama:"http://nfcmini.local:8080",  collector:"http://nfcmini.local:8081"},
-    {name:"mini795s7 · Gemma-4-E4B", llama:"http://mini795s7.local:8080", collector:"http://mini795s7.local:8081"},
+    {name:"local · llama-server", llama:"http://localhost:8080", collector:"http://localhost:8081"},
     {name:"custom…", llama:"", collector:""}
   ];
   var CUSTOM = SERVERS.length - 1;
