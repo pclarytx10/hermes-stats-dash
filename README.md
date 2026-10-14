@@ -449,12 +449,12 @@ servers with different models, builds, and context sizes. Each entry:
       "models": ["/home/patrickm/models/Qwen3.8-27B-UD-Q6_K.gguf",
                  "Qwen3.8_27B_Q6"] },
     { "id": "mini795s7", "label": "mini795s7 · Qwen3.8-27B Q6",
-      "llamaUrl": "http://10.0.0.66:8081",
-      "collectorUrl": "http://10.0.0.66:8082",
+      "llamaUrl": "http://<ip_address>:8081",
+      "collectorUrl": "http://<ip_address>:8082",
       "models": ["Qwen3.8_27B_Q6"] },
     { "id": "ds5975wx",  "label": "ds5975wx · Qwen3.8-27B Q6",
-      "llamaUrl": "http://10.0.0.212:8081",
-      "collectorUrl": "http://10.0.0.212:8082",
+      "llamaUrl": "http://<ip_address>:8081",
+      "collectorUrl": "http://<ip_address>:8082",
       "models": ["Qwen3.8_27B_Q6"] }
   ]
 }
