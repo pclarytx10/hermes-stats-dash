@@ -3183,7 +3183,7 @@ function renderEngineSlots(slots, slotsError) {
     el('th', { class: 'num', text: 'Decoded' }), el('th', { class: 'num', text: 'Context' }));
   const rows = slots.map((s) => {
     const busy = !!s.is_processing;
-    const { dec, cache, proc, prompt: total } = slotTokens(s);
+    const { dec, cache, proc, prompt: total, context } = slotTokens(s);
     const done = Math.min(total, cache + proc);
     const pct = total > 0 ? 100 * done / total : 0;
     const state = !busy ? 'idle' : (dec > 0 ? 'generating' : 'prefilling');
@@ -3193,7 +3193,14 @@ function renderEngineSlots(slots, slotsError) {
       el('td', { text: String(s.id) }),
       el('td', {}, el('span', { class: 'slot-tag' + (tagClass ? ' ' + tagClass : ''), text: state })),
       el('td', { class: 'num', text: (s.id_task == null || s.id_task === -1) ? '—' : String(s.id_task) }),
-      ...(showPrompt ? [
+      // An idle slot's counters describe the request it last finished, whose
+      // tokens it still holds for prefix reuse: show that, not a progress bar
+      // stuck at 0 that reads as pending work.
+      ...(showPrompt && !busy ? [
+        el('td', {}, el('span', { class: 'cell-sub', text: context > 0 ? `${fmtCompact(context)} in cache` : '—' })),
+        el('td', { class: 'num', text: '—' }),
+      ] : []),
+      ...(showPrompt && busy ? [
         el('td', {}, total > 0
           ? el('div', { class: 'slot-bar-track' },
               el('div', { class: 'slot-bar-rail' },
