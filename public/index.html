@@ -678,7 +678,10 @@ function fmtCompact(n) {
   if (Math.abs(n) >= 1e9) return one(n / 1e9) + 'B';
   if (Math.abs(n) >= 1e6) return one(n / 1e6) + 'M';
   if (Math.abs(n) >= 1e4) return one(n / 1e3) + 'K';
-  return fmtFull(n);
+  // Rates reach here as raw floats (a strip's 105.053 tok/s peak); toLocaleString
+  // would keep three decimals. Counts are integers and pass through unchanged.
+  if (Number.isInteger(n)) return fmtFull(n);
+  return Math.abs(n) >= 100 ? fmtFull(Math.round(n)) : one(n);
 }
 const fmtUsd = (n) => '$' + Number(n || 0).toFixed(2);
 function fmtDay(iso) {
