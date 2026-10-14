@@ -47,7 +47,10 @@ CREATE TABLE IF NOT EXISTS samples (
   gen_delta           REAL,
   slots_generating    INTEGER,
   slots_prefilling    INTEGER,
-  slots_idle          INTEGER
+  slots_idle          INTEGER,
+  ctx_active          REAL,
+  ctx_idle            REAL,
+  ctx_cap             REAL
 );
 CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -123,7 +126,8 @@ CREATE INDEX IF NOT EXISTS litellm_clients_client ON litellm_clients(client, epo
 COLS = ["ts", "epoch", "prompt_tokens", "prompt_seconds", "predicted_tokens",
         "predicted_seconds", "n_decode", "n_tokens_max", "busy_per_decode",
         "requests_processing", "gen_delta", "slots_generating",
-        "slots_prefilling", "slots_idle", "n", "n_ok"]
+        "slots_prefilling", "slots_idle", "n", "n_ok",
+        "ctx_active", "ctx_idle", "ctx_cap", "ctx_peak"]
 
 LL_COLS = ["ts", "epoch", "requests_total", "requests_failed", "in_flight",
            "input_tokens", "output_tokens", "total_tokens",
@@ -245,6 +249,8 @@ class Collector:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        self._add_missing_columns("samples", (("ctx_active", "REAL"), ("ctx_idle", "REAL"),
+                                              ("ctx_cap", "REAL")))
         self._add_missing_columns("litellm_deployments",
                                   (("ttft_sum", "REAL"), ("ttft_count", "REAL")))
         self.db.commit()
@@ -339,6 +345,31 @@ class Collector:
         self.slot_prev = nxt
         return gen, generating, prefilling, idle
 
+    @staticmethod
+    def slot_context(slots):
+        """Mirror of the page's readSlotContext: tokens held in each slot's KV
+        cache, summed separately for slots mid-request and idle ones (which keep
+        their last prompt for prefix reuse). n_past where the build reports it,
+        else prompt + decoded. (None, None, cap) when neither is exposed."""
+        active = idle = cap = 0.0
+        known = False
+        for s in slots:
+            cap += s.get("n_ctx") or 0
+            used = s.get("n_past")
+            if not isinstance(used, (int, float)):
+                total = s.get("n_prompt_tokens", s.get("prompt_tokens"))
+                if not isinstance(total, (int, float)):
+                    continue
+                used = total + (next_tok(s).get("n_decoded") or 0)
+            known = True
+            if s.get("is_processing"):
+                active += used
+            else:
+                idle += used
+        if not known:
+            return None, None, (cap or None)
+        return active, idle, (cap or None)
+
     def poll(self):
         ts = time.time()
         note = None
@@ -365,6 +396,7 @@ class Collector:
         except Exception:
             slots = []
         gen, generating, prefilling, idle = self.slot_deltas(slots)
+        ctx_active, ctx_idle, ctx_cap = self.slot_context(slots)
 
         n_decode = m.get("n_decode_total")
         if self.last_decode is not None and n_decode is not None and n_decode < self.last_decode:
@@ -377,12 +409,13 @@ class Collector:
             "INSERT OR REPLACE INTO samples(ts,epoch,ok,prompt_tokens,prompt_seconds,"
             "predicted_tokens,predicted_seconds,n_decode,n_tokens_max,busy_per_decode,"
             "requests_processing,requests_deferred,gen_delta,slots_generating,"
-            "slots_prefilling,slots_idle) VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "slots_prefilling,slots_idle,ctx_active,ctx_idle,ctx_cap)"
+            " VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, self.epoch, m.get("prompt_tokens_total"), m.get("prompt_seconds_total"),
              m.get("tokens_predicted_total"), m.get("tokens_predicted_seconds_total"),
              n_decode, m.get("n_tokens_max"), m.get("n_busy_slots_per_decode"),
              m.get("requests_processing"), m.get("requests_deferred"),
-             gen, generating, prefilling, idle))
+             gen, generating, prefilling, idle, ctx_active, ctx_idle, ctx_cap))
         self.db.commit()
         return note
 
@@ -707,7 +740,9 @@ def make_handler(db_path):
                         " MAX(predicted_tokens), MAX(predicted_seconds), MAX(n_decode),"
                         " MAX(n_tokens_max), AVG(busy_per_decode), AVG(requests_processing),"
                         " SUM(gen_delta), AVG(slots_generating), AVG(slots_prefilling),"
-                        " AVG(slots_idle), COUNT(*), SUM(ok)"
+                        " AVG(slots_idle), COUNT(*), SUM(ok),"
+                        " AVG(ctx_active), AVG(ctx_idle), MAX(ctx_cap),"
+                        " MAX(ctx_active + ctx_idle)"
                         " FROM samples WHERE ts>=? AND ts<=?"
                         " GROUP BY CAST((ts-?)/? AS INTEGER) ORDER BY 1",
                         (t0, t1, t0, width)).fetchall()
