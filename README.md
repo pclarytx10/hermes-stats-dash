@@ -98,7 +98,7 @@ Zero runtime dependencies. Node ≥ 18.
 
 ### Load balancing tab (LiteLLM)
 
-![Load balancing tab: requests routed, latency, routing share and per-deployment health](docs/screenshots/load-balancing.png)
+![Load balancing tab: requests routed, latency, routing share, per-deployment health, recorded routing, latency per deployment and top clients](docs/screenshots/load-balancing.png)
 
 Hidden unless a LiteLLM proxy is enabled under Setup → Load balancing. A
 proxy is a *router*, not a worker: the tokens it counts are the same tokens
@@ -127,6 +127,18 @@ routing decision.
   Engine tab, over a per-deployment request-rate chart with a window summary
   and CSV export. A proxy restart breaks the line rather than spiking it, and
   a collector outage is shaded rather than drawn as zero
+- **Latency per deployment** — inside Recorded routing, on the same range:
+  mean latency per output token and mean time to first token for each
+  deployment, ranked fastest first, each with its ratio to the fastest
+  ("baseline", "3.2×"), plus completions timed and requests routed.
+  With LiteLLM's `least-busy` strategy, routing balances on in-flight count,
+  not speed, so an evenly split pool can still hide a box that is several
+  times slower; this table is where that shows. A note under it names the
+  slowest deployment and says whether its gap is in starting (TTFT) or
+  generating (ms/token). Each column carries its own sample count, since TTFT is only
+  recorded for streaming requests; a mean built from fewer than 20 is marked
+  `n=` and "thin sample" rather than shown as a measurement. ms/token is
+  prefill-inclusive; TTFT is the prefill on its own
 - **Top clients** — who sent the traffic: requests per client (address,
   user agent and API key, from LiteLLM's `client_ip` / `user_agent` /
   `api_key_alias` labels) over the Recorded routing range, each client's
