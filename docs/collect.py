@@ -15,6 +15,12 @@ independent population: LiteLLM counts requests it *routed*, llama-server counts
 work it *did*, and one proxy fans out across several llama-servers. The two are
 kept apart here for the same reason the dashboard keeps them on separate tabs.
 
+It also reads Strata, a llama-server stand-in that keeps llama.cpp's port and
+endpoint names but answers /metrics with a JSON monitor document. That is
+detected from the reply: metrics then come from its llama.cpp-compatible
+/metrics/prometheus and slots from its /v1/telemetry, reshaped into
+llama.cpp's slot fields. Mirrors server.mjs's handling.
+
 stdlib only, no dependencies.
 """
 
@@ -234,6 +240,16 @@ def next_tok(slot):
     return nt if isinstance(nt, dict) else {}
 
 
+def slot_decoded(slot):
+    """Tokens this slot's request has generated: next_token.n_decoded, else a
+    top-level n_decoded (older builds, and the Strata adapter). Mirror of the
+    page's firstNum([nt.n_decoded, s.n_decoded])."""
+    dec = next_tok(slot).get("n_decoded")
+    if dec is None:
+        dec = slot.get("n_decoded")
+    return dec or 0
+
+
 # Fields aren't read atomically, so a total that should equal a sum can be off
 # by a few tokens.
 SLOT_TOKEN_SKEW = 64
@@ -250,12 +266,91 @@ def slot_tokens(slot):
     reported = slot.get("n_prompt_tokens", slot.get("prompt_tokens"))
     if not isinstance(reported, (int, float)):
         return None
-    dec = next_tok(slot).get("n_decoded") or 0
+    dec = slot_decoded(slot)
     proc = slot.get("n_prompt_tokens_processed") or 0
     cache = slot.get("n_prompt_tokens_cache") or 0
+    said = slot.get("prompt_includes_decoded")
+    if isinstance(said, bool):          # the server says which layout; no guessing
+        return reported if said else reported + dec
     if dec > 0 and abs(reported - (cache + proc + dec)) <= SLOT_TOKEN_SKEW:
         return reported
     return reported + dec
+
+
+def num_or(v, default=0):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
+def is_strata_monitor(doc):
+    return isinstance(doc, dict) and bool(doc.get("engine")) and bool(doc.get("live"))
+
+
+def strata_slot(s, n_ctx):
+    """One Strata /v1/telemetry (schema 1) slot as a llama.cpp /slots entry.
+    Mirror of server.mjs's strataSlot(); keep the two in step. prompt_read
+    counts from the start of the prompt, reused prefix included, so it stands
+    in for cache + processed; there is no per-slot cache split."""
+    state = s.get("state")
+    busy = bool(state) and state != "idle"
+    prompt = num_or(s.get("prompt_tokens"))
+    gen = num_or(s.get("generated")) if busy else 0
+    read = (num_or(s.get("prompt_read")) if state == "reading" else prompt) if busy else 0
+    held = num_or(s.get("held_tokens"))
+    return {
+        "id": s.get("slot"),
+        "id_task": str(s["request_id"]) if busy and s.get("request_id") else -1,
+        "is_processing": busy,
+        "n_ctx": n_ctx,
+        "n_prompt_tokens": prompt if busy else held,
+        "n_prompt_tokens_processed": read,
+        "n_decoded": gen,
+        "n_past": read + gen if busy else held,
+        "prompt_includes_decoded": False,
+    }
+
+
+def strata_solo(live, requests):
+    """A request Strata runs alone takes its solo path, outside the batch
+    slots: telemetry shows every slot idle and never updates its row, while
+    the JSON /metrics' live block tracks it. Mirror of server.mjs's
+    strataSoloSlot(). Only when no slot is busy: otherwise live describes one
+    of them and anything outside them is waiting, not running."""
+    if not isinstance(live, dict) or live.get("state") not in ("reading", "generating"):
+        return None
+    if any(isinstance(x, dict) and x.get("state") not in (None, "idle") for x in live.get("slots") or []):
+        return None
+    rows = [r for r in (requests or []) if isinstance(r, dict) and r.get("slot") is None
+            and r.get("state") not in ("queued", "waiting", "admitted")]
+    rows.sort(key=lambda r: num_or(r.get("admitted_at")), reverse=True)
+    prompt = live.get("prompt_total")
+    return {
+        "state": "reading" if live["state"] == "reading" else "decoding",
+        "request_id": rows[0].get("id") if rows else "solo",
+        "prompt_tokens": prompt if prompt is not None else live.get("prompt_tokens"),
+        "prompt_read": live.get("prompt_read"),
+        "generated": live.get("generated"),
+    }
+
+
+def strata_slots(doc, live=None):
+    """Strata's slots as llama.cpp /slots entries, a solo-path request shown
+    in the first idle slot."""
+    work = doc.get("work") if isinstance(doc, dict) else None
+    if not isinstance(work, dict) or not isinstance(work.get("slots"), list):
+        return []
+    n_ctx = num_or((doc.get("model") or {}).get("context"), None)
+    out = [strata_slot(s, n_ctx) for s in work["slots"]]
+    solo = strata_solo(live, work.get("requests"))
+    if solo:
+        idle = [i for i, s in enumerate(out) if not s["is_processing"]]
+        entry = strata_slot(solo, n_ctx)
+        if idle:
+            entry["id"] = out[idle[0]]["id"]
+            out[idle[0]] = entry
+        elif not out:
+            entry["id"] = 0
+            out.append(entry)
+    return out
 
 
 class Collector:
@@ -297,10 +392,14 @@ class Collector:
         # Resume from the newest row, not MAX(n_decode) — a prior restart means the
         # all-time maximum belongs to an older epoch and would fake another restart.
         row = self.db.execute(
-            "SELECT epoch, n_decode FROM samples WHERE ok=1 ORDER BY ts DESC LIMIT 1"
+            "SELECT epoch, n_decode, predicted_tokens, prompt_tokens FROM samples"
+            " WHERE ok=1 ORDER BY ts DESC LIMIT 1"
         ).fetchone()
         self.epoch = int(row[0]) if row else 0
-        self.last_decode = row[1] if row else None
+        # Any of these going backwards means the server restarted. n_decode
+        # alone is not enough: Strata does not report it.
+        self.last_counters = dict(zip(("n_decode", "predicted", "prompt"), row[1:])) if row else {}
+        self.flavor = None               # "llama.cpp" | "strata", from the /metrics reply
 
     def _add_missing_columns(self, table, columns):
         """CREATE TABLE IF NOT EXISTS silently does nothing to a table that already
@@ -314,12 +413,54 @@ class Collector:
                 self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, decl))
 
     def get(self, path, timeout=None):
+        return self.get_typed(path, timeout)[0]
+
+    def get_typed(self, path, timeout=None):
         # /metrics and /slots are answered off llama-server's task queue, so under heavy
         # decode they block well past the poll interval. Time out generously rather than
         # recording a false outage; a slow poll just delays the next one.
         req = urllib.request.Request(self.base + path, headers={"Accept": "*/*"})
         with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
-            return r.read().decode("utf-8", "replace")
+            return r.read().decode("utf-8", "replace"), r.headers.get("Content-Type", "")
+
+    def read_prom(self, path):
+        m = parse_prom(self.get(path))
+        if "prompt_tokens_total" not in m:
+            raise ValueError("response did not look like llama.cpp metrics")
+        return m
+
+    def read_metrics(self):
+        """llama.cpp-shaped counters from whichever server answers, setting
+        self.flavor on the way. HTTPError propagates for the caller to classify."""
+        if self.flavor == "strata":
+            try:
+                return self.read_prom("/metrics/prometheus")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                self.flavor = None       # something else answers here now: detect again
+        body, ctype = self.get_typed("/metrics")
+        if "json" in ctype.lower():
+            if not is_strata_monitor(json.loads(body)):
+                raise ValueError("/metrics answered JSON that is not Strata's monitor document")
+            self.flavor = "strata"
+            return self.read_prom("/metrics/prometheus")
+        m = parse_prom(body)
+        if "prompt_tokens_total" not in m:
+            raise ValueError("response did not look like llama.cpp metrics")
+        self.flavor = "llama.cpp"
+        return m
+
+    def read_slots(self):
+        if self.flavor == "strata":
+            doc = json.loads(self.get("/v1/telemetry"))
+            try:
+                live = json.loads(self.get("/metrics")).get("live")
+            except Exception:
+                live = None
+            return strata_slots(doc, live)
+        slots = json.loads(self.get("/slots"))
+        return slots if isinstance(slots, list) else []
 
     def get_litellm(self, path, timeout=None):
         headers = {"Accept": "*/*"}
@@ -340,10 +481,19 @@ class Collector:
         dgs = p.get("default_generation_settings") or {}
         if dgs.get("n_ctx"):
             self.set_meta("n_ctx", dgs["n_ctx"])
+        # Strata reports no model file or build, only the alias it serves under.
+        if p.get("model_path") is None and p.get("model_alias") is not None:
+            p["model_path"] = p["model_alias"]
+        if p.get("build_info") is None and self.flavor == "strata":
+            p["build_info"] = "Strata"
         for k in ("model_path", "build_info", "total_slots"):
             if p.get(k) is not None:
                 self.set_meta(k, p[k])
-        self.set_meta("endpoint_metrics", bool(p.get("endpoint_metrics")))
+        # Absent is not "disabled": Strata omits it and always serves metrics.
+        if isinstance(p.get("endpoint_metrics"), bool):
+            self.set_meta("endpoint_metrics", p["endpoint_metrics"])
+        if self.flavor:
+            self.set_meta("flavor", self.flavor)
         self.db.commit()
 
     def slot_deltas(self, slots):
@@ -354,7 +504,7 @@ class Collector:
         for s in slots:
             sid = str(s.get("id"))
             task = s.get("id_task", -1)
-            dec = next_tok(s).get("n_decoded") or 0
+            dec = slot_decoded(s)
             prev = self.slot_prev.get(sid)
             if prev is not None:
                 gen += max(0.0, dec - prev[1]) if prev[0] == task else dec
@@ -395,9 +545,7 @@ class Collector:
         ts = time.time()
         note = None
         try:
-            m = parse_prom(self.get("/metrics"))
-            if "prompt_tokens_total" not in m:
-                raise ValueError("response did not look like llama.cpp metrics")
+            m = self.read_metrics()
             self.metrics_ok = True
         except urllib.error.HTTPError as e:
             # 501 means the server was started without --metrics. That is a
@@ -411,20 +559,20 @@ class Collector:
             return self.record_down(ts, e)
 
         try:
-            slots = json.loads(self.get("/slots"))
-            if not isinstance(slots, list):
-                slots = []
+            slots = self.read_slots()
         except Exception:
             slots = []
         gen, generating, prefilling, idle = self.slot_deltas(slots)
         ctx_active, ctx_idle, ctx_cap = self.slot_context(slots)
 
         n_decode = m.get("n_decode_total")
-        if self.last_decode is not None and n_decode is not None and n_decode < self.last_decode:
+        cur = {"n_decode": n_decode, "predicted": m.get("tokens_predicted_total"),
+               "prompt": m.get("prompt_tokens_total")}
+        if any(v is not None and self.last_counters.get(k) is not None and v < self.last_counters[k]
+               for k, v in cur.items()):
             self.epoch += 1              # counters went backwards: server restarted
             self.slot_prev = {}
-        if n_decode is not None:
-            self.last_decode = n_decode
+        self.last_counters = cur
 
         self.db.execute(
             "INSERT OR REPLACE INTO samples(ts,epoch,ok,prompt_tokens,prompt_seconds,"
@@ -611,6 +759,7 @@ class Collector:
             self.read_props()
         last_err = None
         was_metrics = self.metrics_ok
+        was_flavor = self.flavor
         next_props = time.time() + 600
         while True:
             start = time.time()
@@ -633,8 +782,10 @@ class Collector:
             # Capability and model identity are not fixed for the life of the
             # process: the server can be restarted with different flags or a
             # different model under us. Re-read on any change, and periodically.
-            if self.base and (self.metrics_ok != was_metrics or start >= next_props):
+            if self.base and (self.metrics_ok != was_metrics or self.flavor != was_flavor
+                              or start >= next_props):
                 was_metrics = self.metrics_ok
+                was_flavor = self.flavor
                 next_props = start + 600
                 self.read_props()
             if err != last_err:

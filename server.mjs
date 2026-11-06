@@ -688,10 +688,24 @@ async function upstreamFetch(url, { timeoutMs, headers } = {}) {
   }
 }
 
-// A 501/400 from /metrics means the server was started without --metrics —
-// a capability limit, not an outage (mirrors docs/collect.py's handling).
-async function fetchMetrics(engine, timeoutMs) {
-  const { res, error } = await upstreamFetch(`${engine.llamaUrl}/metrics`, { timeoutMs })
+// ── Strata ──────────────────────────────────────────────────────────
+//
+// Strata is a llama-server stand-in, not a llama.cpp build: same port, same
+// /slots and /props names, but its /metrics is a JSON monitor document. Its
+// llama.cpp-compatible Prometheus text lives at /metrics/prometheus, and its
+// /slots is a thin shim without per-request progress, so slots are read from
+// its versioned /v1/telemetry (schema 1) instead and reshaped into llama.cpp's
+// fields here. Detected from the /metrics reply, not configured: an engine row
+// stays a URL whichever server answers it. Mirrored by docs/collect.py.
+
+const engineFlavors = new Map() // llamaUrl -> 'llama.cpp' | 'strata'
+
+function isStrataMonitor(json) {
+  return !!(json && typeof json === 'object' && json.engine && json.live)
+}
+
+async function fetchPromMetrics(url, timeoutMs) {
+  const { res, error } = await upstreamFetch(url, { timeoutMs })
   if (error) return { metrics: null, error }
   if (res.status === 501 || res.status === 400) return { metrics: null, error: 'metrics_disabled' }
   if (!res.ok) return { metrics: null, error: `http_${res.status}` }
@@ -700,7 +714,119 @@ async function fetchMetrics(engine, timeoutMs) {
   return { metrics: parsed, error: null }
 }
 
+function numOr(v, d = 0) {
+  const n = Number(v)
+  return v != null && Number.isFinite(n) ? n : d
+}
+
+// One /v1/telemetry slot → one llama.cpp /slots entry. Strata counts
+// prompt_read from the start of the prompt, reused prefix included, so it is
+// llama.cpp's cache + processed; with no per-slot split it all goes to
+// processed and the cache field is left out (features.hasCacheFields). Its
+// prompt_tokens never includes generated tokens, said explicitly so the
+// page's b10711 heuristic can't misread a short generation as that layout.
+function strataSlot(s, nCtx) {
+  const busy = !!s.state && s.state !== 'idle'
+  const prompt = numOr(s.prompt_tokens)
+  const gen = busy ? numOr(s.generated) : 0
+  const read = !busy ? 0 : s.state === 'reading' ? numOr(s.prompt_read) : prompt
+  return {
+    id: s.slot,
+    id_task: busy && s.request_id ? String(s.request_id) : -1,
+    is_processing: busy,
+    n_ctx: nCtx,
+    n_prompt_tokens: busy ? prompt : numOr(s.held_tokens),
+    n_prompt_tokens_processed: read,
+    n_decoded: gen,
+    n_past: busy ? read + gen : numOr(s.held_tokens),
+    prompt_includes_decoded: false,
+    strata_state: s.state || null,
+  }
+}
+
+// A request Strata runs alone takes its solo path, outside the batch slots:
+// /v1/telemetry then shows every slot idle and never updates the request's
+// row, while the JSON /metrics' `live` block tracks it. Returned as a
+// telemetry-shaped slot so strataSlot() reshapes both kinds the same way.
+// Only when no slot is busy: with slots in use, live describes one of them and
+// anything outside them is waiting, not running.
+function strataSoloSlot(live, requests) {
+  if (!live || (live.state !== 'reading' && live.state !== 'generating')) return null
+  if ((live.slots || []).some((s) => s && s.state && s.state !== 'idle')) return null
+  const row = (Array.isArray(requests) ? requests : [])
+    .filter((r) => r && r.slot == null && !['queued', 'waiting', 'admitted'].includes(r.state))
+    .sort((a, b) => numOr(b.admitted_at) - numOr(a.admitted_at))[0]
+  return {
+    state: live.state === 'reading' ? 'reading' : 'decoding',
+    request_id: row?.id || 'solo',
+    prompt_tokens: live.prompt_total ?? live.prompt_tokens,
+    prompt_read: live.prompt_read,
+    generated: live.generated,
+  }
+}
+
+async function fetchJson(url, timeoutMs) {
+  const { res, error } = await upstreamFetch(url, { timeoutMs })
+  if (error) return { json: null, error }
+  if (!res.ok) return { json: null, error: `http_${res.status}` }
+  const json = await res.json().catch(() => null)
+  return json ? { json, error: null } : { json: null, error: 'invalid_json' }
+}
+
+async function fetchStrataSlots(engine, timeoutMs) {
+  const [tel, mon] = await Promise.all([
+    fetchJson(`${engine.llamaUrl}/v1/telemetry`, timeoutMs),
+    fetchJson(`${engine.llamaUrl}/metrics`, timeoutMs),
+  ])
+  if (tel.error) return { slots: null, error: tel.error }
+  const t = tel.json
+  if (!Array.isArray(t.work?.slots)) return { slots: null, error: 'unexpected_response' }
+  const nCtx = numOr(t.model?.context, null)
+  const slots = t.work.slots.map((s) => strataSlot(s, nCtx))
+  const solo = strataSoloSlot(mon.json?.live, t.work.requests)
+  if (solo) {
+    // Shown in the first idle slot; that slot's held tokens are hidden meanwhile.
+    const i = slots.findIndex((s) => !s.is_processing)
+    const id = i >= 0 ? slots[i].id : 0
+    const entry = { ...strataSlot(solo, nCtx), id, strata_state: 'solo' }
+    if (i >= 0) slots[i] = entry
+    else if (!slots.length) slots.push(entry)
+  }
+  return { slots, error: null }
+}
+
+// A 501/400 from /metrics means the server was started without --metrics —
+// a capability limit, not an outage (mirrors docs/collect.py's handling).
+async function fetchMetrics(engine, timeoutMs) {
+  const base = engine.llamaUrl
+  if (engineFlavors.get(base) === 'strata') {
+    const r = await fetchPromMetrics(`${base}/metrics/prometheus`, timeoutMs)
+    // A 404 means something else now answers on this URL: detect again.
+    if (r.error !== 'http_404') return { ...r, flavor: 'strata' }
+    engineFlavors.delete(base)
+  }
+  const { res, error } = await upstreamFetch(`${base}/metrics`, { timeoutMs })
+  if (error) return { metrics: null, error, flavor: engineFlavors.get(base) || null }
+  if (res.ok && /json/i.test(res.headers.get('content-type') || '')) {
+    const json = await res.json().catch(() => null)
+    if (!isStrataMonitor(json)) return { metrics: null, error: 'unexpected_response', flavor: null }
+    engineFlavors.set(base, 'strata')
+    const r = await fetchPromMetrics(`${base}/metrics/prometheus`, timeoutMs)
+    return { ...r, flavor: 'strata' }
+  }
+  if (res.status === 501 || res.status === 400) {
+    engineFlavors.set(base, 'llama.cpp')
+    return { metrics: null, error: 'metrics_disabled', flavor: 'llama.cpp' }
+  }
+  if (!res.ok) return { metrics: null, error: `http_${res.status}`, flavor: engineFlavors.get(base) || null }
+  const parsed = parseProm(await res.text())
+  if (!('requests_processing' in parsed)) return { metrics: null, error: 'unexpected_response', flavor: null }
+  engineFlavors.set(base, 'llama.cpp')
+  return { metrics: parsed, error: null, flavor: 'llama.cpp' }
+}
+
 async function fetchSlots(engine, timeoutMs) {
+  if (engineFlavors.get(engine.llamaUrl) === 'strata') return fetchStrataSlots(engine, timeoutMs)
   const { res, error } = await upstreamFetch(`${engine.llamaUrl}/slots`, { timeoutMs })
   if (error) return { slots: null, error }
   if (!res.ok) return { slots: null, error: `http_${res.status}` }
@@ -725,13 +851,17 @@ async function fetchProps(engine, timeoutMs) {
     return { props: null, error: 'invalid_json' }
   }
   const dgs = json?.default_generation_settings || {}
+  const strata = engineFlavors.get(engine.llamaUrl) === 'strata'
   return {
     props: {
-      model_path: json?.model_path || null,
-      build_info: json?.build_info || null,
+      // Strata reports no model file, only the alias it serves under.
+      model_path: json?.model_path || json?.model_alias || null,
+      build_info: json?.build_info || (strata ? 'Strata' : null),
       total_slots: Number.isFinite(Number(json?.total_slots)) ? Number(json.total_slots) : null,
       n_ctx: Number.isFinite(Number(dgs?.n_ctx)) ? Number(dgs.n_ctx) : null,
-      endpoint_metrics: !!json?.endpoint_metrics,
+      // Absent is not "disabled": Strata omits the field and always serves
+      // metrics. Only an explicit false means started without --metrics.
+      endpoint_metrics: typeof json?.endpoint_metrics === 'boolean' ? json.endpoint_metrics : null,
     },
     error: null,
   }
@@ -742,18 +872,22 @@ async function fetchProps(engine, timeoutMs) {
 // others; some builds' /slots omits the prompt-token fields entirely. Detect
 // both from a live sample rather than assuming either shape.
 function detectSlotFeatures(slots) {
-  if (!Array.isArray(slots) || !slots.length) return { hasPromptFields: false, nextTokenShape: 'none' }
+  if (!Array.isArray(slots) || !slots.length) {
+    return { hasPromptFields: false, hasCacheFields: false, nextTokenShape: 'none' }
+  }
   let hasPromptFields = false
+  let hasCacheFields = false
   let nextTokenShape = 'none'
   for (const s of slots) {
     if (s && (s.n_prompt_tokens != null || s.n_prompt_tokens_processed != null || s.n_prompt_tokens_cache != null)) {
       hasPromptFields = true
     }
+    if (s && (s.n_prompt_tokens_cache != null || s.cache_n != null)) hasCacheFields = true
     if (nextTokenShape === 'none' && s && 'next_token' in s) {
       nextTokenShape = Array.isArray(s.next_token) ? 'array' : 'object'
     }
   }
-  return { hasPromptFields, nextTokenShape }
+  return { hasPromptFields, hasCacheFields, nextTokenShape }
 }
 
 // Normalizes next_token to a plain object regardless of build shape, so the
@@ -769,13 +903,18 @@ function normalizeSlots(slots) {
 }
 
 async function buildEngineLive(engine) {
-  const [m, s, p] = await Promise.all([
-    fetchMetrics(engine, UPSTREAM_TIMEOUT_MS),
+  // Which /slots to read depends on what /metrics says the server is, so the
+  // first poll of an engine asks /metrics before the rest; later ones fan out.
+  let m = null
+  if (!engineFlavors.has(engine.llamaUrl)) m = await fetchMetrics(engine, UPSTREAM_TIMEOUT_MS)
+  const [m2, s, p] = await Promise.all([
+    m ? m : fetchMetrics(engine, UPSTREAM_TIMEOUT_MS),
     fetchSlots(engine, UPSTREAM_TIMEOUT_MS),
     fetchProps(engine, UPSTREAM_TIMEOUT_MS),
   ])
+  m = m2
   return {
-    engine: { id: engine.id, label: engine.label, llama_url: engine.llamaUrl },
+    engine: { id: engine.id, label: engine.label, llama_url: engine.llamaUrl, flavor: m.flavor || null },
     metrics: m.metrics,
     metrics_error: m.error,
     slots: normalizeSlots(s.slots),
@@ -864,11 +1003,13 @@ async function testEngine(body) {
     return out
   }
   const t0 = Date.now()
-  const { error } = await fetchMetrics({ llamaUrl }, 5_000)
+  const { error, flavor } = await fetchMetrics({ llamaUrl }, 5_000)
   out.llama.latency_ms = Date.now() - t0
+  out.llama.flavor = flavor || null
   if (!error) {
     out.llama.ok = true
     out.llama.metrics_enabled = true
+    if (flavor === 'strata') out.llama.detail = 'Strata — read through its llama.cpp-compatible endpoints'
   } else if (error === 'metrics_disabled') {
     out.llama.ok = true
     out.llama.metrics_enabled = false

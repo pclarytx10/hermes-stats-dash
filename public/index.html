@@ -2943,6 +2943,14 @@ let engineTaskPrompt = {};   // task id -> {cache, total}
 let engineTaskOrder = [];
 let engineReqCount = 0;
 let engineHasPromptFields = false;
+let engineHasCacheFields = false;
+// Any monotonic counter going backwards means the server restarted. Strata
+// reports no n_decode_total, so the token totals are checked as well.
+const ENGINE_RESTART_COUNTERS = ['n_decode_total', 'tokens_predicted_total', 'prompt_tokens_total'];
+function engineCountersWentBack(m, prev) {
+  return ENGINE_RESTART_COUNTERS.some((k) =>
+    typeof m[k] === 'number' && typeof prev[k] === 'number' && m[k] < prev[k]);
+}
 
 function resetEngineSeries() {
   engineSamples = []; engineDeltas = []; engineSlotPrev = {};
@@ -2982,7 +2990,11 @@ function slotTokens(s) {
   const proc = firstNum([s.n_prompt_tokens_processed, s.prompt_n]);
   const cache = firstNum([s.n_prompt_tokens_cache, s.cache_n]);
   const reported = firstNum([s.n_prompt_tokens, s.prompt_tokens]);
-  const withDecoded = dec > 0 && Math.abs(reported - (cache + proc + dec)) <= SLOT_TOKEN_SKEW;
+  // A server that says which layout it uses (Strata, via the server's
+  // adapter) is taken at its word rather than guessed at.
+  const withDecoded = typeof s.prompt_includes_decoded === 'boolean'
+    ? s.prompt_includes_decoded
+    : dec > 0 && Math.abs(reported - (cache + proc + dec)) <= SLOT_TOKEN_SKEW;
   const prompt = withDecoded ? Math.max(0, reported - dec) : reported;
   return { dec, proc, cache, prompt, context: typeof s.n_past === 'number' ? s.n_past : prompt + dec };
 }
@@ -3049,8 +3061,9 @@ function computeSettledRates() {
 function ingestEngineLive(payload) {
   const m = payload.metrics;
   engineHasPromptFields = !!(payload.features && payload.features.hasPromptFields);
+  engineHasCacheFields = !!(payload.features && payload.features.hasCacheFields);
   const prev = engineSamples.length ? engineSamples[engineSamples.length - 1] : null;
-  if (prev && prev.m && m && Number(m.n_decode_total) < Number(prev.m.n_decode_total)) {
+  if (prev && prev.m && m && engineCountersWentBack(m, prev.m)) {
     resetEngineSeries();
   }
   const now = Date.now();
@@ -3131,13 +3144,26 @@ function renderEngineLive(payload, live) {
     tiles.push(tileEl('Generation · now', valueWithUnit('—', 'tok/s'), '—'));
   }
 
-  const cr = engineCacheReuse();
-  tiles.push(tileEl('Prompt cache reuse', valueWithUnit(cr ? fmtNum(cr.pct, 1) : '—', '%'),
-    cr
-      ? `${fmtCompact(cr.cached)} reused of ${fmtCompact(cr.total)} prompt tokens across ${engineTaskOrder.length} requests`
-      : (!engineHasPromptFields
-          ? "Unavailable: this build's /slots does not report n_prompt_tokens_cache."
-          : 'Share of prompt tokens served from cache instead of reprocessed.')));
+  // Per-request reuse needs a per-slot cache count. A server without one
+  // (Strata) may still count reused tokens in total, which gives the same
+  // share over everything since it started instead of the recent requests.
+  const cachedTotal = Number(m.prompt_tokens_cached_total);
+  const readTotal = Number(m.prompt_tokens_total);
+  if (!engineHasCacheFields && Number.isFinite(cachedTotal) && Number.isFinite(readTotal)) {
+    const all = cachedTotal + readTotal;
+    tiles.push(tileEl('Prompt cache reuse', valueWithUnit(all > 0 ? fmtNum(100 * cachedTotal / all, 1) : '—', '%'),
+      all > 0
+        ? `${fmtCompact(cachedTotal)} reused of ${fmtCompact(all)} prompt tokens since the server started`
+        : 'Share of prompt tokens served from cache instead of reprocessed.'));
+  } else {
+    const cr = engineHasCacheFields ? engineCacheReuse() : null;
+    tiles.push(tileEl('Prompt cache reuse', valueWithUnit(cr ? fmtNum(cr.pct, 1) : '—', '%'),
+      cr
+        ? `${fmtCompact(cr.cached)} reused of ${fmtCompact(cr.total)} prompt tokens across ${engineTaskOrder.length} requests`
+        : (!engineHasCacheFields
+            ? "Unavailable: this server's /slots does not report n_prompt_tokens_cache."
+            : 'Share of prompt tokens served from cache instead of reprocessed.')));
+  }
 
   let stateTxt = 'idle', stateSub = 'No slot is processing.', stateClass = 'state-idle';
   if (live) {
@@ -3207,7 +3233,7 @@ function renderEngineSlots(slots, slotsError) {
                 el('div', { class: 'slot-bar-fill', style: `width:${pct.toFixed(1)}%;background:${barColor}` })),
               el('span', { class: 'slot-bar-label', text: `${fmtCompact(done)} / ${fmtCompact(total)}` }))
           : el('span', { class: 'cell-sub', text: '—' })),
-        el('td', { class: 'num', text: total > 0 ? `${fmtNum(100 * cache / total, 0)}%` : '—' }),
+        el('td', { class: 'num', text: engineHasCacheFields && total > 0 ? `${fmtNum(100 * cache / total, 0)}%` : '—' }),
       ] : []),
       el('td', { class: 'num', text: (busy || dec) ? fmtFull(dec) : '—' }),
       el('td', { class: 'num cell-sub', text: fmtCompact(s.n_ctx) }));
