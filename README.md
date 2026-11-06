@@ -498,6 +498,36 @@ an equivalent fallback:
 | `LLAMA_SERVER_URL` | e.g. `http://127.0.0.1:8080` |
 | `LLAMA_COLLECTOR_URL` | e.g. `http://127.0.0.1:8081` (optional) |
 
+#### Strata engines
+
+An engine row can also point at a [Strata](https://github.com/Niko1221/Strata) server, a
+llama-server stand-in that keeps llama.cpp's port and endpoint names. Nothing
+in the config marks it: the dashboard and the collector both recognise
+Strata from its `/metrics` reply, a JSON monitor document rather than
+Prometheus text, and then read it this way:
+
+| Need | llama.cpp | Strata |
+|---|---|---|
+| Counters | `/metrics` | `/metrics/prometheus` (llama.cpp's names) |
+| Slots | `/slots` | `/v1/telemetry`, reshaped into llama.cpp's slot fields; a request on Strata's solo path (alone, outside the batch slots) comes from `/metrics`' `live` block and is shown in the first idle slot |
+| Model, slots, context | `/props` | `/props` (`model_alias` when there is no `model_path`) |
+
+What differs on the Engine tab:
+
+- **Prompt cache reuse** comes from `prompt_tokens_cached_total` over
+  everything since the server started, not from the recent requests: Strata
+  has no per-slot cache count, so the slot table's **Cached** column is `—`.
+- **Restarts** are detected from the token counters going backwards. Strata
+  reports no `n_decode_total`, which is what llama.cpp's restart check reads.
+- The live slot rate misses the last few tokens of each request (Strata
+  forgets a request's progress when its slot goes idle). Recorded history
+  uses the counters and is unaffected.
+
+The engine must answer without a key: engine rows hold no credentials. If
+the Strata server was started with an API key, Strata's separate telemetry
+key does not cover `/metrics/prometheus` or `/props`, so run it without one
+or put it behind a proxy that adds the header.
+
 ### LiteLLM (Load balancing tab)
 
 One optional entry, off unless enabled on the Setup page. Unlike an engine,
@@ -568,7 +598,7 @@ the two hosts; if not, a plaintext LAN hop is what this dashboard assumes.
 The Engine tab's **live** panel and the **health badge** need only
 `llamaUrl` — a llama.cpp server started with `--metrics` is enough. The
 **History** panel additionally needs a collector: a small, dependency-free
-Python process that polls `/metrics` and `/slots` on an interval, writes one
+Python process that polls `/metrics` and `/slots` (or Strata's equivalents) on an interval, writes one
 row per poll to SQLite, and serves a read-only JSON API (`/range`,
 `/history`) that this dashboard proxies.
 
